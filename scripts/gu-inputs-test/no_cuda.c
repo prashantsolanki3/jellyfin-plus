@@ -202,7 +202,7 @@ static void scenario(const char *name, const char *fail, const char *want_init, 
     AVFilterContext ctx = { 0 };
     GUInputs g = { 0 };
     AVFrame in = { 0 };
-    char msg[160];
+    char msg[1024];
     int i, ret, nonzero = 0;
 
     printf("-- %s\n", name);
