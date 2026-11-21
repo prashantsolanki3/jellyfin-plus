@@ -1,0 +1,166 @@
+# FORK-ONLY. This workflow lives in prashantsolanki3/jellyfin-plus and must NEVER be
+# offered upstream to sanchitd5/jellyfin-plus: it publishes a build of GPLv3-linked ffmpeg,
+# and the project's rule is "source and a script, never an artifact". The image goes to a
+# PRIVATE ghcr package, only ever pulled by the owner's own cluster. Do not cherry-pick this
+# file into an upstream PR branch; cut upstream branches from upstream/main.
+#
+# What it does: builds docker/intel/Dockerfile (Intel Arc image: patched ffmpeg, plugin,
+# patcher, fsr2-nocuda marker), runs the acceptance checks inside the built image, and only
+# if every check passes pushes it to ghcr.io/prashantsolanki3/jellyfin-plus-intel:<short-sha>
+# and prints the digest in the job summary, so a consumer can pin by digest.
+#
+# Runs on manual dispatch only. No push or pull_request trigger, because it publishes.
+# Secrets: none beyond the per-run GITHUB_TOKEN.
+name: build-arc-image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-arc-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/prashantsolanki3/jellyfin-plus-intel
+  DOCKERFILE: docker/intel/Dockerfile
+  # Where the Dockerfile puts things inside the image. Override here if docker/intel/Dockerfile changes.
+  FFMPEG_BIN: /usr/lib/jellyfin-ffmpeg-oidn/ffmpeg
+  FSR2_MARKER: /usr/lib/jellyfin-ffmpeg-oidn/fsr2-nocuda
+  PLUGIN_DLL_NAME: Jellyfin.Plugin.Plus.dll
+  PLUGIN_SEARCH_DIRS: /usr/lib/jellyfin-plus-dist /usr/lib/jellyfin-plus
+
+jobs:
+  build:
+    # Hard stop: a copy of this file that reaches any other repo does nothing.
+    if: github.repository == 'prashantsolanki3/jellyfin-plus'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        # The runner has about 14 GB free; the build tree is about 12 GB. Remove toolchains the
+        # build never uses (plain rm, no third-party action in the supply chain).
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null
+          df -h /
+
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Compute tag
+        id: tag
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image (loaded locally, not pushed)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/prashantsolanki3/jellyfin-plus
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=build-arc-image
+          cache-to: type=gha,mode=max,scope=build-arc-image
+
+      - name: Acceptance checks in the built image
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.tag.outputs.short }}
+        run: |
+          set -u
+          fail=0
+          bad() { echo "::error::acceptance FAILED: $*"; fail=1; }
+
+          # Every probe bypasses the image entrypoint (the stock one starts Jellyfin).
+
+          # ffmpeg itself must start (this also surfaces a missing shared library).
+          if ! filters=$(docker run --rm --entrypoint "$FFMPEG_BIN" "$REF" -hide_banner -filters 2>&1); then
+            bad "'$FFMPEG_BIN -filters' did not run"
+            echo "$filters" | tail -20
+            docker run --rm --entrypoint /bin/sh "$REF" -c "ldd '$FFMPEG_BIN' | grep 'not found' || true"
+            exit 1
+          fi
+          hwaccels=$(docker run --rm --entrypoint "$FFMPEG_BIN" "$REF" -hide_banner -hwaccels 2>&1) || bad "'-hwaccels' did not run"
+          encoders=$(docker run --rm --entrypoint "$FFMPEG_BIN" "$REF" -hide_banner -encoders 2>&1) || bad "'-encoders' did not run"
+
+          # whole-word match on its own column, so "ort" does not match "sort" or "report".
+          has() { grep -Eq "(^|[[:space:]])$2([[:space:]]|\$)" <<<"$1"; }
+
+          for f in fsr2 ort libplacebo; do
+            if has "$filters" "$f"; then echo "ok   filter $f"; else bad "filter '$f' missing from -filters"; fi
+          done
+          if has "$hwaccels" vaapi; then echo "ok   hwaccel vaapi"; else bad "hwaccel 'vaapi' missing from -hwaccels"; fi
+          for e in hevc_qsv h264_qsv; do
+            if has "$encoders" "$e"; then echo "ok   encoder $e"; else bad "encoder '$e' missing from -encoders"; fi
+          done
+
+          if docker run --rm --entrypoint /usr/bin/test "$REF" -f "$FSR2_MARKER"; then
+            echo "ok   marker $FSR2_MARKER"
+          else
+            bad "fsr2-nocuda marker missing at $FSR2_MARKER"
+          fi
+
+          read -ra dirs <<<"$PLUGIN_SEARCH_DIRS"
+          dll=$(docker run --rm --entrypoint /usr/bin/find "$REF" "${dirs[@]}" -name "$PLUGIN_DLL_NAME" -type f 2>/dev/null | head -1)
+          if [ -n "$dll" ]; then echo "ok   plugin dll $dll"; else bad "$PLUGIN_DLL_NAME not found under: $PLUGIN_SEARCH_DIRS"; fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::one or more acceptance checks failed; nothing was pushed"
+            exit 1
+          fi
+
+      - name: Log in to ghcr
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the image that was checked
+        id: push
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.tag.outputs.short }}
+        run: |
+          set -eu
+          # Push the exact local image the checks ran against (no rebuild in between).
+          docker push "$REF"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$REF")
+          digest=${digest##*@}
+          case "$digest" in
+            sha256:[0-9a-f]*) ;;
+            *) echo "::error::could not read the pushed digest"; exit 1 ;;
+          esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SHORT: ${{ steps.tag.outputs.short }}
+        run: |
+          {
+            echo "## jellyfin-plus Intel image pushed"
+            echo
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Tag: \`${IMAGE}:${SHORT}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo
+            echo "Pin by digest:"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Acceptance checks passed before the push: filters fsr2/ort/libplacebo, hwaccel vaapi, encoders hevc_qsv/h264_qsv, fsr2-nocuda marker, plugin DLL."
+          } >> "$GITHUB_STEP_SUMMARY"
