@@ -74,6 +74,46 @@ No bead was supplied (`beads_list` for the feature returned nothing), so the PR 
     "bash scripts/test-gpu-vendor.sh pass count is reported with 3 mutations shown to be caught, or the harness is reported NOT RUN with the reason if no jfbin directory exists. C tests are reported NOT RUN (no gcc).",
     "Nothing under .github/workflows/ and nothing in sanchitd5's repo is touched."
   ],
+  "ui_candidates": [
+    {
+      "name": "existing jellyfin-plus config page markup (reuse)",
+      "licence": "same as this repo (already shipped)",
+      "maintenance": "owned in this repo; GpuVendor and NeuralMaxSourceHeight use the same pattern",
+      "dark_mode": "yes, inherits the Jellyfin dashboard theme the page already renders in",
+      "coverage": "full: one checkbox with data-config/data-kind/data-default plus the load/save lines",
+      "size": "a few lines of markup and script, no new asset",
+      "chosen": true
+    },
+    {
+      "name": "Jellyfin's built-in emby-checkbox web component",
+      "licence": "GPL-2.0, ships with Jellyfin web",
+      "maintenance": "upstream Jellyfin; its internals change between server versions",
+      "dark_mode": "yes, themed by Jellyfin",
+      "coverage": "full for a checkbox, but the config page does not use it for its other settings",
+      "size": "no extra asset, but a second markup style on one page",
+      "chosen": false
+    },
+    {
+      "name": "a plain HTML input",
+      "licence": "none (browser built-in)",
+      "maintenance": "none",
+      "dark_mode": "no, unstyled against the dashboard theme",
+      "coverage": "full for a checkbox",
+      "size": "smallest, but looks out of place beside the other settings",
+      "chosen": false
+    },
+    {
+      "name": "pulling in any new UI library",
+      "licence": "unknown until picked",
+      "maintenance": "a new dependency to track",
+      "dark_mode": "would need theming",
+      "coverage": "far more than one checkbox needs",
+      "size": "large for one setting; the page is an embedded resource in the plugin DLL",
+      "chosen": false,
+      "rejected": "not needed for one checkbox"
+    }
+  ],
+  "ui_note": "Nothing new is added: no library, component or asset. The setting is one checkbox in the plugin's existing configuration page markup.",
   "reuse_check": [
     {
       "need": "Cached, hookable startup test-decode with fail-soft null result",
