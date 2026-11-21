@@ -51,7 +51,7 @@ static void check(int ok, const char *what)
 /* A repeatable texture with structure at every scale, evaluated at integer positions. */
 static float texture(int x, int y)
 {
-    unsigned h = (unsigned)(x * 73856093) ^ (unsigned)(y * 19349663);
+    unsigned h = ((unsigned)x * 73856093u) ^ ((unsigned)y * 19349663u);
     h = (h ^ (h >> 13)) * 0x5bd1e995u;
     return 0.5f + 0.25f * sinf(0.21f * x + 0.13f * y) + 0.15f * sinf(0.07f * x - 0.31f * y)
            + 0.10f * ((h & 0xffff) / 65535.0f - 0.5f);

@@ -532,8 +532,14 @@ static void gu_build_reactive(GUInputs *g)
             int sx, sy;
             gu_grid_sample(g, g->grid, x, y, &fx, &fy);
             sx = (int)lrintf(x + fx); sy = (int)lrintf(y + fy);
-            if (sx < 0) sx = 0; if (sx >= g->w) sx = g->w - 1;
-            if (sy < 0) sy = 0; if (sy >= g->h) sy = g->h - 1;
+            if (sx < 0)
+                sx = 0;
+            if (sx >= g->w)
+                sx = g->w - 1;
+            if (sy < 0)
+                sy = 0;
+            if (sy >= g->h)
+                sy = g->h - 1;
             /* the backward grid was produced with the roles swapped, so its
              * stored sign already means current -> previous once negated */
             gu_grid_sample(g, g->grid_bwd, sx, sy, &bx, &by);
@@ -574,10 +580,15 @@ typedef const OrtApiBase *(*gu_ort_base_fn)(void);
 static void gu_depth_close(GUInputs *g)
 {
     if (g->ort_api) {
-        if (g->ort_alloc && g->depth_in_name)
-            GU_ORT->AllocatorFree(g->ort_alloc, g->depth_in_name);
-        if (g->ort_alloc && g->depth_out_name)
-            GU_ORT->AllocatorFree(g->ort_alloc, g->depth_out_name);
+        OrtStatus *st;
+        if (g->ort_alloc && g->depth_in_name) {
+            st = GU_ORT->AllocatorFree(g->ort_alloc, g->depth_in_name);
+            if (st) GU_ORT->ReleaseStatus(st);
+        }
+        if (g->ort_alloc && g->depth_out_name) {
+            st = GU_ORT->AllocatorFree(g->ort_alloc, g->depth_out_name);
+            if (st) GU_ORT->ReleaseStatus(st);
+        }
         if (g->ort_sess)    GU_ORT->ReleaseSession(g->ort_sess);
         if (g->ort_opts)    GU_ORT->ReleaseSessionOptions(g->ort_opts);
         if (g->ort_meminfo) GU_ORT->ReleaseMemoryInfo(g->ort_meminfo);
@@ -803,8 +814,14 @@ static void gu_depth_stabilise(GUInputs *g)
             float vx = g->flow[k * 2], vy = g->flow[k * 2 + 1];
             int sx = (int)lrintf(x - vx), sy = (int)lrintf(y - vy);
             float prev;
-            if (sx < 0) sx = 0; if (sx >= g->w) sx = g->w - 1;
-            if (sy < 0) sy = 0; if (sy >= g->h) sy = g->h - 1;
+            if (sx < 0)
+                sx = 0;
+            if (sx >= g->w)
+                sx = g->w - 1;
+            if (sy < 0)
+                sy = 0;
+            if (sy >= g->h)
+                sy = g->h - 1;
             prev = g->depth_prev[(size_t)sy * g->w + sx];
             g->depth[k] = a * g->depth[k] + (1.0f - a) * prev;
         }
