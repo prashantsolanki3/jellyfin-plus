@@ -14,6 +14,7 @@ override, and each stub carries only the marker lines the script greps for. It p
 
 Exit status: 0 every check passed, 1 a check failed.
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -64,6 +65,11 @@ CUNNY = (LGPL + "// CuNNy (dp4a) by funnyplanter\n//!HOOK LUMA\n"
 CUNNY_FILES = ["CuNNy-fast-SOFT-Q.glsl", "CuNNy-4x16-SOFT-Q.glsl",
                "CuNNy-4x32-SOFT-Q.glsl", "CuNNy-4x16-DS-Q.glsl"]
 
+NIS_BASE = "https://gist.githubusercontent.com/agyild/7e8951915b2bf24526a9343d951db214/raw"
+NIS_REV = "05f00864228871ffd157daa9beb2db8fa7412cfa"
+NIS_SCALER_SHA = "bac778ec0108d272e4dad97794a3c257e65bbebd52aa762f95bce930cbd6b73c"
+NIS_SHARPEN_SHA = "3d51ac2a9da18284c1f77e46a019e783eac0c609924e6b32e8011889f54f9a12"
+
 FAILS = []
 
 
@@ -83,14 +89,21 @@ def read(path):
         return f.read()
 
 
-def stubs(root, fsr=FSR_STUB):
-    """Write every stub input under root and return the env that points install-shaders.sh at them."""
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def stubs(root, fsr=FSR_STUB, scaler=NIS_SCALER, sharpen=NIS_SHARPEN, scaler_sha=None, sharpen_sha=None):
+    """Write every stub input under root and return the env that points install-shaders.sh at them.
+
+    The NIS stubs are not the pinned files, so the expected sha256 is overridden to match them unless
+    a mutation passes a different one."""
     nis, cunny = os.path.join(root, "nis"), os.path.join(root, "cunny")
     os.makedirs(nis)
     os.makedirs(cunny)
     write(os.path.join(root, "FSR.glsl"), fsr)
-    write(os.path.join(nis, "NVScaler.glsl"), NIS_SCALER)
-    write(os.path.join(nis, "NVSharpen.glsl"), NIS_SHARPEN)
+    write(os.path.join(nis, "NVScaler.glsl"), scaler)
+    write(os.path.join(nis, "NVSharpen.glsl"), sharpen)
     for name in CUNNY_FILES:
         write(os.path.join(cunny, name), CUNNY)
     write(os.path.join(root, "sssr.glsl"), SSSR)
@@ -99,8 +112,26 @@ def stubs(root, fsr=FSR_STUB):
     env = dict(os.environ)
     env.update(FSR_GLSL=os.path.join(root, "FSR.glsl"), NIS_DIR=nis, CUNNY_DIR=cunny,
                SSSR_GLSL=os.path.join(root, "sssr.glsl"), KRIG_GLSL=os.path.join(root, "krig.glsl"),
-               RAVU_ZOOM_HOOK=os.path.join(root, "ravu.glsl"))
+               RAVU_ZOOM_HOOK=os.path.join(root, "ravu.glsl"),
+               NIS_SCALER_SHA256=scaler_sha or sha(scaler), NIS_SHARPEN_SHA256=sharpen_sha or sha(sharpen))
     return env
+
+
+def fake_curl(root, env):
+    """Put a curl on PATH that logs each URL and serves the NIS stub named by the URL's basename."""
+    bindir = os.path.join(root, "bin")
+    os.makedirs(bindir)
+    log = os.path.join(root, "curl.log")
+    script = os.path.join(bindir, "curl")
+    write(script, '#!/bin/bash\n'
+                  'url=$2; dest=$4\n'
+                  f'echo "$url" >> "{log}"\n'
+                  f'cp "{env["NIS_DIR"]}/$(basename "$url")" "$dest"\n')
+    os.chmod(script, 0o755)
+    env = dict(env)
+    env.pop("NIS_DIR")
+    env["PATH"] = bindir + os.pathsep + env["PATH"]
+    return env, log
 
 
 def install(env, out):
@@ -147,6 +178,41 @@ def main():
         env_m = stubs(os.path.join(mut, "in"), fsr=FSR_HEADER + easu_only)
         r = install(env_m, os.path.join(mut, "out"))
         check("mutation: no second //!HOOK block is refused", r.returncode != 0, f"rc={r.returncode}")
+
+        # NIS: the fetch is pinned to one gist revision, each file to its sha256, and the header is kept.
+        script = read(INSTALL)
+        check("NIS fetch is pinned to the verified gist revision", NIS_REV in script
+              and f"agyild/7e8951915b2bf24526a9343d951db214/raw/$NIS_REV" in script)
+        check("NIS sha256 pins are the verified values",
+              NIS_SCALER_SHA in script and NIS_SHARPEN_SHA in script)
+
+        net = os.path.join(tmp, "net")
+        env_n, log = fake_curl(net, stubs(os.path.join(net, "in")))
+        r = install(env_n, os.path.join(net, "out"))
+        check("NIS fetched over the network path installs", r.returncode == 0, r.stderr.strip()[-300:])
+        urls = read(log).split() if os.path.isfile(log) else []
+        want = [f"{NIS_BASE}/{NIS_REV}/{n}" for n in ("NVScaler.glsl", "NVSharpen.glsl")]
+        check("NIS URLs carry the pinned revision", urls == want, f"{urls}")
+        check("NVSharpen-0.25 and -0.65 are installed with the //!WHEN guard removed",
+              all(os.path.isfile(os.path.join(net, "out", f"NVSharpen-{s}.glsl"))
+                  and "!WHEN" not in read(os.path.join(net, "out", f"NVSharpen-{s}.glsl"))
+                  for s in ("0.25", "0.65")))
+
+        for label, kw in (
+                ("NVScaler with a v1.0.3 header", dict(scaler=NIS_SCALER.replace("v1.0.2", "v1.0.3"))),
+                ("NVSharpen with a v1.0.3 header", dict(sharpen=NIS_SHARPEN.replace("v1.0.2", "v1.0.3"))),
+                ("NVScaler with a wrong sha256", dict(scaler_sha="0" * 64)),
+                ("NVSharpen with a wrong sha256", dict(sharpen_sha="0" * 64))):
+            d = os.path.join(tmp, "mut-" + label.replace(" ", "-"))
+            r = install(stubs(os.path.join(d, "in"), **kw), os.path.join(d, "out"))
+            check(f"mutation: {label} is refused", r.returncode != 0, f"rc={r.returncode}")
+
+        # the header check must still fire when the sha256 is satisfied (a hash-matching wrong file).
+        bad = NIS_SCALER.replace("v1.0.2", "v1.0.3")
+        d = os.path.join(tmp, "mut-header-only")
+        r = install(stubs(os.path.join(d, "in"), scaler=bad, scaler_sha=sha(bad)), os.path.join(d, "out"))
+        check("mutation: a sha-matching file with the wrong header is refused",
+              r.returncode != 0 and "v1.0.2" in r.stderr, r.stderr.strip()[-200:])
 
         nolic = os.path.join(tmp, "nolic")
         os.makedirs(nolic)
