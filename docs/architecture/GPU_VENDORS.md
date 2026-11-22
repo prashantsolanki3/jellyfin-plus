@@ -460,7 +460,9 @@ run):
 | the provider file is not present | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the provider is not installed, ONNX Runtime's CPU provider runs, not measured for this chain |
 | the provider file is present but the binary does not list `openvino` (built before the device existed, or without `ORT_EP=openvino`), or that has not been confirmed yet | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the ort filter has no openvino device (rebuild with `ORT_EP=openvino`) or the check has not answered yet |
 
-The binary check (`UpscaleEngine.OrtOpenVinoState`) runs `ffmpeg -h filter=ort` once, off the request path:
+The binary check (`UpscaleEngine.OrtOpenVinoState`) runs `ffmpeg -h filter=ort` on the binary beside the
+configured `NeuralModelDirectory` (`ShaderLibrary.PatchedFfmpegPath(settings)`), and only for a session
+that names a neural level or has `NeuralMaxSourceHeight` set, once, off the request path:
 `Decide` only reads the cache and, when it is empty or expired, starts one background probe and treats the
 device as not confirmed meanwhile (an unknown option kills the stream, so unknown counts as missing, as
 `HasFilter` does). A yes is kept for the life of the process; a no or an inconclusive answer is asked again

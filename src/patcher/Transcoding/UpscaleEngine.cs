@@ -1420,7 +1420,6 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // One read of the capability serves every Intel and ort-device decision below.
                 GpuCapability gpu = CurrentGpu();
                 bool onIntel = IsIntel(gpu);
-                var neuralDevice = NeuralDeviceFor(gpu);
                 denoiseLevel = Withhold(plan, onIntel, "denoise", denoiseLevel, ShaderLibrary.IsNvidiaOnlyDenoise(denoiseLevel));
 
                 // ---- deblocking and deringing ---------------------------------------------
@@ -1475,6 +1474,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // dlpp-1..4 and vsr-rtcuda are NVIDIA libraries over CUDA. NeuralRequested above keeps
                 // what was asked for, so the record reads "asked for, did not run".
                 neuralLevel = Withhold(plan, onIntel, "neural", neuralLevel, ShaderLibrary.IsNvidiaOnlyNeural(neuralLevel));
+
+                // The device (and so the help probe behind it) is only asked about when a network can
+                // run: one was named, or the routing may choose one.
+                (string Arg, string Name, string Note, string Reason) neuralDevice =
+                    plan.NeuralRequested != "off" || (cfg.NeuralMaxSourceHeight > 0 && cfg.NeuralAllowed)
+                        ? NeuralDeviceFor(gpu)
+                        : (null, "cuda", null, null);
 
                 // NeuralMaxSourceHeight: the ONNX levels are for small sources. 0 skips this whole
                 // call, so a server that never set it takes exactly the path it always did.
@@ -2236,7 +2242,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return OrtOpenVinoProbeSource();
             }
 
-            string exe = ShaderLibrary.PatchedFfmpegPath();
+            // The binary beside the configured model directory, as the detector looks there too.
+            string exe = ShaderLibrary.PatchedFfmpegPath(Settings);
             lock (_ortLock)
             {
                 bool sameBinary = _ortProbed && string.Equals(_ortProbedPath, exe, StringComparison.Ordinal);

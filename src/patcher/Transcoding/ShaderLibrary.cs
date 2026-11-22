@@ -1627,11 +1627,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// installed. Derived from the directory the runtime assets already live in, so the path
         /// is stated once rather than spelled out at each use.
         /// </summary>
-        public static string PatchedFfmpegPath()
+        public static string PatchedFfmpegPath(UpscaleSettings cfg = null)
         {
             try
             {
-                string dir = Path.GetDirectoryName(NeuralModelDirectory);
+                string dir = Path.GetDirectoryName(NeuralModelDirectoryFor(cfg));
                 if (string.IsNullOrEmpty(dir))
                 {
                     return null;

@@ -1182,8 +1182,16 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("mixed box, intel chosen, provider present: openvino", mixedIntel.NeuralDevice == "openvino" && mixedIntel.NeuralFilter.Contains(":device=openvino,"));
 
             // Nothing neural ran: no device, no note, nothing in the record.
+            int probeCalls = 0;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => { probeCalls++; return true; };
             UpscaleEngine.Plan plain = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, "upscale", "1080");
             Check("Intel, no neural level: no device and no note", !plain.NeuralApplied && plain.NeuralDevice == null && plain.NeuralDeviceNote == null);
+            Equal("Intel, no neural level, no routing: the OpenVINO probe is not asked", "0", probeCalls.ToString());
+            DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, a neural level named: the probe is asked", "1", probeCalls.ToString());
+            DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Equal("Intel, NeuralMaxSourceHeight set: the probe is asked", "2", probeCalls.ToString());
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SessionRecord plainRecord = UpscaleEngine.Describe(null, plain, plain.Status, plain.Reason);
             Check("Intel, no neural level: the record has no device", plainRecord.NeuralDevice == null && plainRecord.NeuralDeviceNote == null && plainRecord.NeuralRouting == null);
 
@@ -1241,17 +1249,33 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Plan noProvider = DecideOn(NeuralMachine(false, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
             Check("Intel, no provider file, binary lists openvino: still cpu, for the provider reason", noProvider.NeuralDevice == "cpu" && noProvider.NeuralDeviceNote.Contains("OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed"));
 
+            // A binary that takes seconds to answer: the session is planned at once on the CPU, with
+            // the probe left running in the background, and the answer is used once it lands.
+            StubFfmpeg(listsOpenVino: true, delaySeconds: 5);
+            UpscaleEngine.ResetOrtProbe();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            UpscaleEngine.Plan slow = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            clock.Stop();
+            Check("Intel, slow probe, cold cache: the plan does not wait for the binary (" + clock.ElapsedMilliseconds + " ms)", clock.ElapsedMilliseconds < 2000);
+            Equal("Intel, slow probe, cold cache: the node asks for cpu", cpuNode, slow.NeuralFilter);
+            Check("Intel, slow probe, cold cache: the note says it is not confirmed", slow.NeuralDevice == "cpu" && slow.NeuralDeviceNote != null && slow.NeuralDeviceNote.Contains("has not been confirmed"), slow.NeuralDeviceNote);
+            UpscaleEngine.WarmOrtProbe().Wait();
+            UpscaleEngine.Plan slowDone = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, slow probe answered: the node asks for openvino", openvinoNode, slowDone.NeuralFilter);
+
             ResetNeuralHarness();
         }
 
         // A stand-in patched ffmpeg beside the model directory (where PatchedFfmpegPath looks) whose
-        // `-h filter=ort` prints the device list with or without openvino. Moved into place, not
-        // written in place, so a process is never started from a file that is still open for writing.
-        private static void StubFfmpeg(bool listsOpenVino)
+        // `-h filter=ort` prints the device list with or without openvino, after an optional delay.
+        // Moved into place, not written in place, so a process is never started from a file that is
+        // still open for writing.
+        private static void StubFfmpeg(bool listsOpenVino, int delaySeconds = 0)
         {
             string path = Path.Combine(NeuralRig(), "ffmpeg");
             string temp = path + ".tmp";
             string script = "#!/bin/sh\n"
+                + (delaySeconds > 0 ? "sleep " + delaySeconds + "\n" : string.Empty)
                 + "echo 'Filter ort'\n"
                 + "echo '  device <int> ..FV...... which device to run on (from 0 to 2) (default cuda)'\n"
                 + "echo '     cuda            0'\n"
