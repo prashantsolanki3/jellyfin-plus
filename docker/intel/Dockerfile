@@ -37,9 +37,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/dotnet:$PATH
 
 # What must exist before build-ffmpeg.sh's own preflight: the FSR2 library is built out of tree and the
-# script refuses to start without it. build-ffmpeg.sh installs the rest of its own apt list.
+# script refuses to start without it, and its Vulkan backend needs vulkan/vulkan.h. The rest is the
+# script's own intel apt list (scripts/test_bench_intel.py keeps the two equal), so its apt step is a no-op.
+# Not libshaderc-dev: the script builds shaderc from source, the distro one breaks nlmeans_vulkan.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git python3 build-essential glslang-tools nodejs npm \
+        pkg-config nasm yasm meson ninja-build cmake libx264-dev libxcb1-dev libvulkan-dev libva-dev libvpl-dev libdrm-dev \
  && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL "$DOTNET_SDK_URL" -o /tmp/dotnet.tar.gz \

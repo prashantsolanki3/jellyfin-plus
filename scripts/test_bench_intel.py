@@ -285,6 +285,36 @@ def test_mutants(tmp):
         check(f"mutant {name} is caught", rc != 0 or bool(plan_failures(out)))
 
 
+def build_apt_checks(df):
+    """The build stage's apt line carries every dev package build-ffmpeg.sh installs for the Intel build.
+
+    The FSR2 compile runs before the script's own apt step, and a header missing there (vulkan/vulkan.h)
+    failed the first CI build.
+    """
+    stage = re.search(r"^FROM \S+ AS build\n(.*?)(?=^FROM )", df, re.M | re.S)
+    check("the Dockerfile has a build stage", bool(stage))
+    body = stage.group(1) if stage else ""
+    apt = re.search(r"apt-get install[^\n]*?--no-install-recommends(.*?)&&\s*rm -rf", body, re.S)
+    pkgs = apt.group(1).replace("\\", " ").split() if apt else []
+    check("the build stage has an apt-get install line", bool(pkgs))
+    for pkg in ["libvulkan-dev", "libva-dev", "libvpl-dev", "libdrm-dev", "glslang-tools"]:
+        check(f"the build stage installs {pkg}", pkg in pkgs, str(pkgs))
+
+    script = open(os.path.join(HERE, "build-ffmpeg.sh")).read()
+    base = re.search(r"^APT_PKGS=\(([^)]*)\)", script, re.M)
+    intel = re.search(r"^if \[\[ \"\$GPU_VENDOR\" == \"intel\" \]\]; then\n\s+APT_PKGS\+=\(([^)]*)\)", script, re.M)
+    check("build-ffmpeg.sh APT_PKGS and its intel addition are found", bool(base) and bool(intel))
+    wanted = (base.group(1).split() if base else []) + (intel.group(1).split() if intel else [])
+    check("the script's apt list is not empty", len(wanted) >= 15, str(wanted))
+    missing = [p for p in wanted if p not in pkgs]
+    check("the build stage installs everything build-ffmpeg.sh apt-installs for intel", not missing, str(missing))
+
+    fetch = body.find("git fetch")
+    at = apt.start() if apt else -1
+    check("the apt install comes before the FSR2 fetch and compile", 0 <= at < fetch, f"{at} {fetch}")
+    check("the distro shaderc is not installed (it broke nlmeans_vulkan)", "libshaderc" not in " ".join(pkgs))
+
+
 def dockerfile_checks(tmp):
     df = open(DOCKERFILE).read()
     spec = open(SPEC).read()
@@ -308,6 +338,8 @@ def dockerfile_checks(tmp):
     check("Dockerfile publishes nothing and sets no USER", not re.search(r"docker push|^USER ", df, re.M))
     check("build-ffmpeg.sh is not edited by the image", "sed -i" not in df)
     check("NVIDIA build variables absent", not re.search(r"GPU_VENDOR=nvidia|WITH_DLSS|WITH_OPTIX", df))
+
+    build_apt_checks(df)
 
     ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
     need = ["scripts", "src", "web", "web/src", "shim", "assets", "ffmpeg", "docker", ".", "web/theme", "patches"]
