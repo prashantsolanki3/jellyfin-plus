@@ -797,7 +797,9 @@ Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API 
 
 **Acceptance, enforced by the build.** `ldd` of the patched ffmpeg shows no `not found`; `-filters`
 lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwaccels` lists `vaapi`;
-`-encoders` lists `h264_qsv`; the stock ffmpeg is byte-identical to the base's (`cmp`); the web
+`-encoders` lists `h264_qsv`; the stock ffmpeg is byte-identical to the base's (`cmp`); the shim
+answers `-version` with an `ffmpeg version` line, the exact call Jellyfin makes at start-up (the shim
+is a `python3` script and the base has no python3, so the final stage installs it); the web
 inject, patcher and plugin files are in place. A failed check fails the build.
 
 **Known gaps (not pinned).** The shared scripts fetch FFmpeg, OIDN, ONNX Runtime, shaderc and
