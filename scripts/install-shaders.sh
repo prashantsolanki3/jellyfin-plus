@@ -286,7 +286,7 @@ fetch_fsrcnnx() {
     fetch_pinned "$name" "$FSRCNNX_BASE/$name" "$2" "${FSRCNNX_DIR:-}"
     grep -q 'Copyright (C) 2017-2021 igv' "$TMP/$name" \
         || { echo "$name is not igv's FSRCNNX" >&2; exit 1; }
-    grep -q 'GNU Lesser General Public License' "$TMP/$name" \
+    grep -q 'GNU Lesser General Public' "$TMP/$name" \
         || { echo "LGPL header missing from $name" >&2; exit 1; }
     install -m 0644 "$TMP/$name" "$DIR/$name"
 }
