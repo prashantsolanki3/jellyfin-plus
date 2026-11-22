@@ -166,9 +166,16 @@ keeps the code path that existed before the setting did:
   lists no `*_qsv` encoder the choice is `libx264` / `libx265` / `libsvtav1`, and the record's
   `EncoderFamily` reads `software`. When Jellyfin already chose a QSV or software encoder (its own
   hardware acceleration is QSV) and the setting is auto or NVENC, Jellyfin's choice is kept; one that
-  cannot take the chain (`*_vaapi`, `*_nvenc`) is replaced. `GuardAv1` test-encodes one frame with
-  `av1_qsv` (once, remembered) and swaps to `hevc_qsv`, or `h264_qsv` when the client cannot take
-  HEVC, if it fails.
+  cannot take the chain (`*_vaapi`, `*_nvenc`) is replaced. With neither a `*_qsv` nor a software
+  encoder listed the engine picks nothing and Jellyfin's own encoder stands (the reason says so).
+  `GuardAv1` reads the result of a one-frame `av1_qsv` test encode that runs in the background
+  (started at plugin start-up, on the detected render node, never on the transcode path); a failure
+  swaps to `hevc_qsv`, or `h264_qsv` when the client cannot take HEVC. The answer is cached for 1 h
+  when usable, 5 min when it failed and 1 min when inconclusive; until it exists `av1_qsv` is left
+  alone. The encoder list is read at start-up too, so the capability record and `Gpu/Load` never
+  spawn ffmpeg, and report the unresolved `qsv` family until it is read. An optional
+  `TranscodeManager.StartFfMpeg` prefix removes VA-API-only options (`-init_hw_device vaapi`,
+  `-filter_hw_device`, `-hwaccel vaapi`, `-rc_mode`, `-sei`) from a swapped session's command line.
 - **The end of the chain.** The GPU-resident encode (`hwmap=derive_device=cuda`) is a Vulkan-to-CUDA
   map and exists only for NVENC, so on Intel `BuildChain` always ends in `hwdownload,format=yuv420p`
   whatever `GpuResidentEncode` says (the encoder's `nv12` is reached by the conversion ffmpeg
