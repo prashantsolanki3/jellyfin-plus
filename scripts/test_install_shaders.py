@@ -71,7 +71,11 @@ CUNNY_FILES = ["CuNNy-fast-SOFT-Q.glsl", "CuNNy-4x16-SOFT-Q.glsl",
 FSRCNNX_FILES = {"FSRCNNX_x2_8-0-4-1.glsl": "FSRCNNX_8_SHA256", "FSRCNNX_x2_16-0-4-1.glsl": "FSRCNNX_16_SHA256"}
 ANIME4K_FILES = {"Anime4K_Upscale_CNN_x2_S.glsl": ("S", "ANIME4K_S_SHA256"),
                  "Anime4K_Upscale_CNN_x2_M.glsl": ("M", "ANIME4K_M_SHA256")}
-FSRCNNX = ("// Copyright (C) 2017-2021 igv\n// GNU Lesser General Public License\n"
+# The real header wraps "GNU Lesser General Public" / "License" across lines 4-5.
+FSRCNNX = ("// Copyright (C) 2017-2021 igv\n//\n"
+           "// This program is free software; you can redistribute it and/or\n"
+           "// modify it under the terms of the GNU Lesser General Public\n"
+           "// License as published by the Free Software Foundation; either\n"
            "//!HOOK LUMA\nvoid hook() {}\n")
 
 
