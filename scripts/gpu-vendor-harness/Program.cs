@@ -1122,6 +1122,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "libplacebo", "nlmeans_vulkan");
 
             string golden = "format=gbrpf32le,ort=model=" + X2() + ",format=yuv420p";
@@ -1202,7 +1203,64 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Plan dlpp = DecideOn(NeuralMachine(false, "renderD128", "0x10de"), rig, 1280, 720, "upscale", "1080", "neural", "dlpp-2");
             Check("NVIDIA, dlpp-2: CUDA-native, no ort device", dlpp.UsesCudaNeural && dlpp.NeuralDevice == null);
 
+            // The provider file is there, but the patched ffmpeg has to list the device too. The real probe runs
+            // here against a stub binary beside the model directory, with no seam: one that lists openvino, one that does not.
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            UpscaleEngine.ResetOrtProbe();
+            string openvinoNode = "format=gbrpf32le,ort=model=" + X2() + ":device=openvino,format=yuv420p";
+            string cpuNode = "format=gbrpf32le,ort=model=" + X2() + ":device=cpu,format=yuv420p";
+
+            StubFfmpeg(listsOpenVino: false);
+            UpscaleEngine.Plan cold = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, probe not answered yet: the node asks for cpu, not openvino", cpuNode, cold.NeuralFilter);
+            Check("Intel, provider present, probe not answered yet: the note says it is not confirmed",
+                cold.NeuralDevice == "cpu" && cold.NeuralDeviceNote != null && cold.NeuralDeviceNote.Contains("has not been confirmed"), cold.NeuralDeviceNote);
+            UpscaleEngine.WarmOrtProbe().Wait();
+
+            UpscaleEngine.Plan stale = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, binary without openvino: the node asks for cpu", cpuNode, stale.NeuralFilter);
+            Check("Intel, provider present, binary without openvino: the note says rebuild with ORT_EP=openvino",
+                stale.NeuralDevice == "cpu" && stale.NeuralDeviceNote != null && stale.NeuralDeviceNote.Contains("no openvino device") && stale.NeuralDeviceNote.Contains("ORT_EP=openvino"), stale.NeuralDeviceNote);
+            SessionRecord staleRecord = UpscaleEngine.Describe(null, stale, stale.Status, stale.Reason);
+            Check("Intel, binary without openvino: the summary says CPU provider and why", staleRecord.Summary.Contains("the CPU provider (the patched ffmpeg's ort filter has no openvino device"), staleRecord.Summary);
+            UpscaleEngine.Plan staleRouted = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Check("Intel, binary without openvino, 480, 360p: no network is chosen, and it says why",
+                staleRouted.Act && !staleRouted.NeuralApplied && staleRouted.NeuralRouting != null
+                && staleRouted.NeuralRouting.Contains("no neural level was chosen") && staleRouted.NeuralRouting.Contains("no openvino device") && staleRouted.NeuralRouting.Contains("far from real time"), staleRouted.NeuralRouting);
+            UpscaleEngine.Plan nvidiaStale = DecideOn(NeuralMachine(true, "renderD128", "0x10de"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("NVIDIA, binary without openvino: the node is the one it always was", golden, nvidiaStale.NeuralFilter);
+
+            StubFfmpeg(listsOpenVino: true);
+            UpscaleEngine.ResetOrtProbe();
+            UpscaleEngine.WarmOrtProbe().Wait();
+            UpscaleEngine.Plan fresh = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, binary lists openvino: the node asks for openvino", openvinoNode, fresh.NeuralFilter);
+            Check("Intel, provider present, binary lists openvino: no note", fresh.NeuralDevice == "openvino" && fresh.NeuralDeviceNote == null);
+
+            // Without the provider file the binary is not asked at all: the CPU, for the provider reason.
+            UpscaleEngine.Plan noProvider = DecideOn(NeuralMachine(false, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Check("Intel, no provider file, binary lists openvino: still cpu, for the provider reason", noProvider.NeuralDevice == "cpu" && noProvider.NeuralDeviceNote.Contains("OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed"));
+
             ResetNeuralHarness();
+        }
+
+        // A stand-in patched ffmpeg beside the model directory (where PatchedFfmpegPath looks) whose
+        // `-h filter=ort` prints the device list with or without openvino. Moved into place, not
+        // written in place, so a process is never started from a file that is still open for writing.
+        private static void StubFfmpeg(bool listsOpenVino)
+        {
+            string path = Path.Combine(NeuralRig(), "ffmpeg");
+            string temp = path + ".tmp";
+            string script = "#!/bin/sh\n"
+                + "echo 'Filter ort'\n"
+                + "echo '  device <int> ..FV...... which device to run on (from 0 to 2) (default cuda)'\n"
+                + "echo '     cuda            0'\n"
+                + "echo '     cpu             1'\n"
+                + (listsOpenVino ? "echo '     openvino        2'\n" : string.Empty)
+                + "exit 0\n";
+            File.WriteAllText(temp, script);
+            File.SetUnixFileMode(temp, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.Move(temp, path, overwrite: true);
         }
 
         private static void ResetNeuralHarness()
@@ -1211,6 +1269,9 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            UpscaleEngine.ResetOrtProbe();
+            File.Delete(Path.Combine(NeuralRig(), "ffmpeg"));
             UpscaleEngine.Settings = new UpscaleSettings();
         }
 
@@ -1220,6 +1281,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
 
             Equal("the setting defaults to 0 in the patcher mirror", "0", new UpscaleSettings().NeuralMaxSourceHeight.ToString());
