@@ -91,6 +91,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             NvidiaOnlyLevels();
             NeuralDevice();
             NeuralRouting();
+            AutoNeuralCache();
             Fdinfo();
             IdleResidency();
             LoadRoute();
@@ -1297,6 +1298,78 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.ResetOrtProbe();
             File.Delete(Path.Combine(NeuralRig(), "ffmpeg"));
             UpscaleEngine.Settings = new UpscaleSettings();
+        }
+
+        // The auto-picked level is looked up once per directory per TTL, not stat'ed on every plan.
+        private static void AutoNeuralCache()
+        {
+            int stats = 0;
+            var present = new HashSet<string>(StringComparer.Ordinal);
+            long now = 1000;
+            ShaderLibrary.WeightFileExistsSource = p => { stats++; return present.Contains(p); };
+            ShaderLibrary.AutoNeuralClockSource = () => now;
+            ShaderLibrary.ResetAutoNeuralCache();
+            try
+            {
+                var cfg = new UpscaleSettings { NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                present.Add(ShaderLibrary.NeuralModelPath("realesr-general-x4", cfg));
+
+                string first = ShaderLibrary.AutoNeuralLevel(cfg);
+                int afterFirst = stats;
+                Check("auto neural cache: the first lookup stats the weights and picks the cheapest installed", first == "realesr-general-x4" && afterFirst > 0, first + " stats=" + afterFirst);
+
+                for (int i = 0; i < 50; i++)
+                {
+                    ShaderLibrary.AutoNeuralLevel(cfg);
+                }
+
+                Check("auto neural cache: 50 further lookups inside the TTL stat nothing", stats == afterFirst, "stats=" + stats + " first=" + afterFirst);
+
+                present.Add(ShaderLibrary.NeuralModelPath("realesr-anime-x2", cfg));
+                Equal("auto neural cache: a weight installed inside the TTL is not seen yet", "realesr-general-x4", ShaderLibrary.AutoNeuralLevel(cfg));
+
+                now += 31000;
+                Equal("auto neural cache: past the TTL it looks again and sees it", "realesr-anime-x2", ShaderLibrary.AutoNeuralLevel(cfg));
+                Check("auto neural cache: past the TTL it did stat again", stats > afterFirst);
+
+                int before = stats;
+                var other = new UpscaleSettings { NeuralModelDirectory = "/nonexistent/auto-neural-cache-other" };
+                Check("auto neural cache: another directory is its own entry (none installed there)", ShaderLibrary.AutoNeuralLevel(other) == null && stats > before);
+
+                // Through the engine: planning a small source repeatedly stats the weights once.
+                before = stats;
+                UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+                UpscaleEngine.DrmVulkanProbeSource = n => true;
+                UpscaleEngine.Av1QsvProbeSource = () => true;
+                UpscaleEngine.OrtOpenVinoProbeSource = () => true;
+                SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
+                var routed = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto", NeuralMaxSourceHeight = 480, NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                // A session that names the level never goes through the auto pick, so its stat count is
+                // the cost of planning alone; an auto-picked session must cost exactly the same.
+                DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080", "neural", "realesr-anime-x2");
+                int named = stats - before;
+                bool flat = true;
+                UpscaleEngine.Plan p = null;
+                for (int i = 0; i < 20; i++)
+                {
+                    before = stats;
+                    p = DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080");
+                    flat &= stats - before == named;
+                }
+
+                Check("auto neural cache: an auto-picked Decide stats no more files than one that names the level", flat && p.NeuralLevel == "realesr-anime-x2" && p.NeuralRouting != null && p.NeuralRouting.Contains("was chosen"), "named=" + named + " last=" + (stats - before) + " " + p.NeuralRouting);
+            }
+            finally
+            {
+                ShaderLibrary.WeightFileExistsSource = null;
+                ShaderLibrary.AutoNeuralClockSource = null;
+                ShaderLibrary.ResetAutoNeuralCache();
+                UpscaleEngine.EncoderListSource = null;
+                UpscaleEngine.DrmVulkanProbeSource = null;
+                UpscaleEngine.Av1QsvProbeSource = null;
+                UpscaleEngine.OrtOpenVinoProbeSource = null;
+                UpscaleEngine.Settings = new UpscaleSettings();
+            }
         }
 
         // NeuralMaxSourceHeight: what it does for each source height, and that 0 does nothing.
