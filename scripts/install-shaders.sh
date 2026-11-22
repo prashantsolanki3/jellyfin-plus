@@ -38,7 +38,7 @@ grep -q 'Permission is hereby granted, free of charge' "$TMP/FSR.glsl" \
     || { echo "MIT licence header missing from the fetched file" >&2; exit 1; }
 
 mkdir -p "$DIR"
-bash "$HERE/make-rcas.sh" "$TMP/FSR.glsl" "$TMP"
+bash "$HERE/../shaders/make-rcas.sh" "$TMP/FSR.glsl" "$TMP"
 install -m 0644 "$TMP"/RCAS-2.0.glsl "$TMP"/RCAS-1.7.glsl "$TMP"/RCAS-1.4.glsl "$DIR/"
 
 # ---------------------------------------------------------------------------------------------
