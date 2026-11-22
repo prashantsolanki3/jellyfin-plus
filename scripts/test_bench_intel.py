@@ -452,6 +452,7 @@ def dockerfile_checks(tmp):
     build_apt_checks(df)
     local_libs_checks(df)
     shim_interpreter_checks(df)
+    entrypoint_checks(df)
     web_step_checks(df)
 
     ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
@@ -460,15 +461,78 @@ def dockerfile_checks(tmp):
     for rel in ["shim/jellyfin-ffmpeg-upscale", "scripts/bench-intel.sh", "scripts/ffmpeg-vendor.sh", "scripts/build-ffmpeg.sh",
                 "scripts/install-shaders.sh", "scripts/jellyfin-plus-webinject", "scripts/build-web-panel.sh",
                 "ffmpeg/gen_perm.py", "ffmpeg/fsr2compat.h", "web/theme/jellyfinplus.css", "web/package-lock.json",
-                "assets/jellyfinplus.png", "assets/plugin-meta.json", "docker/intel/stage-plugin.sh"]:
+                "assets/jellyfinplus.png", "assets/plugin-meta.json", "docker/intel/stage-plugin.sh",
+                "docker/intel/entrypoint.py", "docker/intel/accept-plugin.sh", "scripts/test_entrypoint.py"]:
         check(f"{rel} exists", os.path.isfile(os.path.join(REPO, rel)))
-    for rel in ["scripts/bench-intel.sh", "docker/intel/stage-plugin.sh"]:
+    for rel in ["scripts/bench-intel.sh", "docker/intel/stage-plugin.sh", "docker/intel/accept-plugin.sh"]:
         p = subprocess.run([BASH, "-n", os.path.join(REPO, rel)], capture_output=True, text=True)
         check(f"bash -n {rel}", p.returncode == 0, p.stderr)
     check("the spec page has section 5.8", "### 5.8 " in spec)
 
     out = subprocess.run([BASH, "-c", f". {VENDOR}; ffmpeg_required_filters intel"], capture_output=True, text=True).stdout.split()
     check("the Intel filter list the image checks is oidn ort", out == ["oidn", "ort"], str(out))
+
+
+def entrypoint_failures(df):
+    """What lets an image ship that starts Jellyfin without the plugin (the first Arc image did).
+
+    The plugin is only staged in /usr/lib/jellyfin-plus-dist; Jellyfin loads from $JELLYFIN_DATA_DIR/plugins.
+    So the final stage must set the seeding wrapper as ENTRYPOINT, copy it executable, and end with a RUN
+    that starts the server headless and requires the plugin to load, after everything it depends on.
+    """
+    bad = []
+    final = df.rpartition("\nFROM ")[2]
+    wrapper = "/usr/local/bin/jellyfin-plus-entrypoint"
+    if not re.search(r"^ENTRYPOINT \[\"" + re.escape(wrapper) + r"\"\]$", final, re.M):
+        bad.append("the final stage does not set the seeding wrapper as ENTRYPOINT (exec form, no args)")
+    if re.search(r"^CMD ", final, re.M):
+        bad.append("a CMD would be passed to Jellyfin as arguments")
+    copy = re.search(r"^COPY --chmod=0755 docker/intel/entrypoint\.py " + re.escape(wrapper) + r"$", final, re.M)
+    if not copy:
+        bad.append("the wrapper is not copied executable to " + wrapper)
+    accept = re.search(r"^RUN --mount=type=bind,source=docker/intel/accept-plugin\.sh,target=(\S+) \\\n\s+bash \1 " + re.escape(wrapper) + r"$",
+                       final, re.M)
+    if not accept:
+        bad.append("the final stage has no acceptance RUN of accept-plugin.sh against the wrapper")
+    plugin_copy = final.find("COPY --from=build /out/plugin-dist /usr/lib/jellyfin-plus-dist")
+    patcher_copy = final.find("COPY --from=build /out/patcher /usr/lib/jellyfin-plus\n")
+    ffmpeg_accept = final.find("RUN --mount=type=bind,from=base-pkgs")
+    if accept and copy:
+        if not 0 <= patcher_copy < accept.start():
+            bad.append("the acceptance RUN runs before the patcher is copied in")
+        if not 0 <= plugin_copy < copy.start() < accept.start():
+            bad.append("order must be the plugin COPY, the wrapper COPY, then the acceptance RUN")
+        if not 0 <= ffmpeg_accept < accept.start():
+            bad.append("the acceptance RUN runs before the ffmpeg acceptance RUN")
+    return bad
+
+
+def entrypoint_checks(df):
+    check("the final image seeds the plugin through an ENTRYPOINT wrapper and proves it loads", not entrypoint_failures(df),
+          str(entrypoint_failures(df)))
+    no_ep = df.replace('ENTRYPOINT ["/usr/local/bin/jellyfin-plus-entrypoint"]\n', "")
+    check("mutant: no ENTRYPOINT is caught", bool(entrypoint_failures(no_ep)))
+    base_ep = df.replace('ENTRYPOINT ["/usr/local/bin/jellyfin-plus-entrypoint"]', 'ENTRYPOINT ["/jellyfin/jellyfin"]')
+    check("mutant: the base ENTRYPOINT is caught", bool(entrypoint_failures(base_ep)))
+    shell_form = df.replace('ENTRYPOINT ["/usr/local/bin/jellyfin-plus-entrypoint"]', "ENTRYPOINT /usr/local/bin/jellyfin-plus-entrypoint")
+    check("mutant: a shell-form ENTRYPOINT is caught", bool(entrypoint_failures(shell_form)))
+    not_exec = df.replace("COPY --chmod=0755 docker/intel/entrypoint.py", "COPY docker/intel/entrypoint.py")
+    check("mutant: a wrapper that is not executable is caught", bool(entrypoint_failures(not_exec)))
+    no_accept = re.sub(r"\nRUN --mount=type=bind,source=docker/intel/accept-plugin\.sh.*?jellyfin-plus-entrypoint\n", "\n", df, flags=re.S)
+    check("mutant: no acceptance RUN is caught", bool(entrypoint_failures(no_accept)) and no_accept != df)
+    with_cmd = df.replace("ENTRYPOINT [", 'CMD ["--x"]\nENTRYPOINT [', 1)
+    check("mutant: a CMD is caught", bool(entrypoint_failures(with_cmd)))
+    early = (df.replace(re.search(r"\n# The plugin acceptance:.*?jellyfin-plus-entrypoint\n", df, re.S).group(0), "\n")
+               .replace("COPY --from=build /out/patcher /usr/lib/jellyfin-plus\n",
+                        "RUN --mount=type=bind,source=docker/intel/accept-plugin.sh,target=/tmp/accept-plugin.sh \\\n"
+                        "    bash /tmp/accept-plugin.sh /usr/local/bin/jellyfin-plus-entrypoint\n"
+                        "COPY --from=build /out/patcher /usr/lib/jellyfin-plus\n", 1))
+    check("mutant: an acceptance RUN before the plugin is in place is caught", bool(entrypoint_failures(early)))
+
+    script = open(os.path.join(REPO, "docker", "intel", "accept-plugin.sh")).read()
+    check("the acceptance script greps for the plugin's load line", "Loaded plugin: Jellyfin Plus" in script)
+    check("the acceptance script asserts the plugin dir was seeded", "plugins/JellyfinPlus_" in script)
+    check("the acceptance script stops the server it started", "kill " in script and "rm -rf" in script)
 
 
 def web_step(df):
