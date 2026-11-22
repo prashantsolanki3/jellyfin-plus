@@ -592,6 +592,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private static readonly ConcurrentDictionary<string, Verdict> _verdicts =
             new ConcurrentDictionary<string, Verdict>();
 
+        /// <summary>Replaces the decision with a ready plan (Plan.Act is the verdict). For the tests; nothing in production sets it.</summary>
+        internal static Func<EncodingJobInfo, UpscaleEngine.Plan> PlanSource { get; set; }
+
         /// <summary>Nothing removes a verdict on its own, so the table is dropped when it grows.</summary>
         private const int VerdictLimit = 256;
 
@@ -601,6 +604,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         private static Verdict VerdictFor(EncodingJobInfo state)
         {
+            if (PlanSource != null)
+            {
+                UpscaleEngine.Plan given = PlanSource(state);
+                return new Verdict { Plan = given, Act = given.Act, Status = given.Status, Reason = given.Reason };
+            }
+
             string key = UpscaleEngine.SessionKey(state);
             if (!string.IsNullOrEmpty(key) && _verdicts.TryGetValue(key, out var cached))
             {
@@ -739,7 +748,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// server: removes the VA-API-only options a swapped-in QSV or software encoder would
         /// reject. Always a no-op off Intel, and on a line with nothing to strip.
         /// </summary>
-        private static void StartFfMpegStripPrefix(EncodingJobInfo state, ref string commandLineArguments)
+        internal static void StartFfMpegStripPrefix(EncodingJobInfo state, ref string commandLineArguments)
         {
             try
             {
@@ -915,7 +924,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// configured encoder ffmpeg does not have or the session did not declare playable, so a
         /// misconfiguration degrades to the negotiated codec instead of to a black screen.
         /// </summary>
-        private static void VideoEncoderPostfix(EncodingJobInfo state, ref string __result)
+        internal static void VideoEncoderPostfix(EncodingJobInfo state, ref string __result)
         {
             try
             {

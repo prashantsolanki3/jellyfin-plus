@@ -91,7 +91,12 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             LoadRoute();
             CapabilityJson();
             VaapiStrip();
+            StripPrefix();
+            NullEncoderBranches();
             IntelProbes();
+
+            // Last: it runs the real PatcherHost.Apply, which installs the Harmony patches for the rest of the process.
+            PatchWiring();
 
             Console.WriteLine();
             Console.WriteLine(_passed + " passed, " + _failed + " failed");
@@ -634,8 +639,11 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             string first = UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
             timer.Stop();
             Check("AV1 guard returns while the probe is still running", timer.ElapsedMilliseconds < 1000 && !UpscaleEngine.Av1QsvProbeTask.IsCompleted, timer.ElapsedMilliseconds + " ms");
-            Equal("no answer yet: av1_qsv is left alone", "av1_qsv", first);
-            Check("no answer yet: nothing swapped, no reason", reason == null);
+            Equal("no answer yet: av1_qsv is guarded as before (hevc_qsv), not left to fail at open", "hevc_qsv", first);
+            Check("no answer yet: the reason says the test encode has not finished", reason != null && reason.Contains("has not finished yet"), reason);
+            Equal("no answer yet, the session cannot take HEVC: h264_qsv", "h264_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "h264"), "av1_qsv", out reason));
+            Equal("no answer yet: another encoder is untouched", "hevc_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "hevc_qsv", out reason));
+            Check("no answer yet: ...and has no reason", reason == null);
             Check("the probe started in the background", WaitUntil(() => runs == 1));
             UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
             UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
@@ -646,6 +654,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             gate.Set();
             Check("the probe finishes", UpscaleEngine.Av1QsvProbeTask.Wait(5000));
             Equal("a failed probe swaps to hevc_qsv", "hevc_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason));
+            Check("a failed probe: the reason is the test-encode failure, not 'not finished'", reason != null && reason.StartsWith("a test encode with av1_qsv failed"), reason);
             Equal("a failed probe is not re-run inside its time-to-live", "1", runs.ToString());
 
             now += UpscaleEngine.Av1QsvFailedTtl - TimeSpan.FromSeconds(1);
@@ -693,12 +702,21 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 UpscaleEngine.Av1QsvProbeArgs("/dev/dri/renderD129"));
 
             // The record and the load route read the encoder list without asking ffmpeg for it.
+            // On a COLD cache (nothing probed, nothing remembered), so the test does not lean on an
+            // earlier test having left the list behind: any path that asked ffmpeg would count.
             UpscaleEngine.EncoderListSource = null;
-            int spawned = UpscaleEngine.EncoderProbeRuns;
+            UpscaleEngine.ResetEncoderProbe();
             string family = UpscaleEngine.Capability().EncoderFamily;
             UpscaleEngine.Capability();
-            Equal("Capability() does not read the encoder list from ffmpeg", spawned.ToString(), UpscaleEngine.EncoderProbeRuns.ToString());
+            Equal("Capability() on a cold cache does not read the encoder list from ffmpeg", "0", UpscaleEngine.EncoderProbeRuns.ToString());
             Equal("...and reports the unresolved family until it is warmed", "qsv", family);
+            PatcherHost.GpuJson();
+            Equal("PatcherHost.GpuJson (the load route's source) on a cold cache does not read it either", "0", UpscaleEngine.EncoderProbeRuns.ToString());
+
+            // The warm-up is what reads it: on the same cold cache, WarmProbes is the one call that asks ffmpeg.
+            Check("warm-up on a cold cache completes", UpscaleEngine.WarmProbes().Wait(20000));
+            Equal("...and it read the encoder list from ffmpeg once", "1", UpscaleEngine.EncoderProbeRuns.ToString());
+            UpscaleEngine.Av1QsvProbeTask?.Wait(5000);
 
             // The warm-up reads the list (off the caller) and starts the probe only when av1_qsv is listed.
             UpscaleEngine.ResetAv1QsvProbe();
@@ -761,6 +779,147 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             // Nits: the software test is the names the chain can pick, not any "lib" encoder.
             Check("a libvpx encoder does not fit the chain", !UpscaleEngine.EncoderFitsIntelChain("libvpx-vp9") && !UpscaleEngine.EncoderFitsIntelChain("libaom-av1"));
             Check("libx264, libx265 and libsvtav1 fit the chain, in any case", UpscaleEngine.EncoderFitsIntelChain("libx264") && UpscaleEngine.EncoderFitsIntelChain("LIBX265") && UpscaleEngine.EncoderFitsIntelChain("libsvtav1"));
+        }
+
+        // A job that carries a play session id, so the encoder the patch notes can be read back.
+        private static EncodingJobInfo SessionJob(string session, string negotiated, params string[] supported)
+        {
+            return new FakeJob
+            {
+                BaseRequest = new StreamingRequestDto { PlaySessionId = session, VideoCodec = negotiated },
+                SupportedVideoCodecs = supported,
+            };
+        }
+
+        // Review item 3: what the StartFfMpeg prefix does with a command line, with the decision
+        // handed in as a ready plan. The fixture line is reconstructed from source, not captured.
+        private static void StripPrefix()
+        {
+            string line = Fixture("jellyfin-vaapi-commandline.txt").Trim();
+            string swapped = line.Replace("-codec:v:0 hevc_vaapi", "-codec:v:0 hevc_qsv");
+            string expected = UpscaleEngine.StripVaapiOnlyArguments(swapped);
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true };
+
+            OnIntel("auto", "auto", FullList);
+            string args = swapped;
+            UpscalePatches.StartFfMpegStripPrefix(Job("hevc", "hevc"), ref args);
+            Check("StartFfMpeg prefix, Intel and acting: the VA-API-only options are stripped", args != swapped && args == expected && !args.Contains("-init_hw_device") && !args.Contains("-rc_mode"), args);
+
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = false };
+            args = swapped;
+            UpscalePatches.StartFfMpegStripPrefix(Job("hevc", "hevc"), ref args);
+            Equal("StartFfMpeg prefix, a session the plugin does not act on: the line is untouched", swapped, args);
+
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true };
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            args = swapped;
+            UpscalePatches.StartFfMpegStripPrefix(Job("hevc", "hevc"), ref args);
+            Equal("StartFfMpeg prefix on NVIDIA: the line is untouched", swapped, args);
+
+            UpscalePatches.PlanSource = null;
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+        }
+
+        // Review item 4: the two places the patch leaves Jellyfin's own encoder alone because the
+        // engine has none to offer. Before this, nothing reached either branch.
+        private static void NullEncoderBranches()
+        {
+            // A stream copy that the plugin would replace, with no QSV or software encoder in ffmpeg.
+            OnIntel("auto", "auto", "hevc_vaapi");
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true, ClientOptIn = true };
+            string result = "copy";
+            UpscalePatches.VideoEncoderPostfix(SessionJob("harness-copy-null", "hevc", "hevc"), ref result);
+            Equal("stream copy with no usable encoder: the copy stands", "copy", result);
+            Tuple<string, string> noted = UpscaleEngine.NotedEncoder("harness-copy-null");
+            Check("stream copy with no usable encoder: the session notes why", noted != null && noted.Item1 == "copy" && noted.Item2.Contains("kept the stream copy"), noted == null ? "nothing noted" : noted.Item2);
+
+            // The same copy with a QSV encoder listed IS replaced, so the null case is not a no-op for every input.
+            OnIntel("auto", "auto", FullList);
+            result = "copy";
+            UpscalePatches.VideoEncoderPostfix(SessionJob("harness-copy-qsv", "hevc", "hevc"), ref result);
+            Equal("stream copy with hevc_qsv listed: replaced by it", "hevc_qsv", result);
+
+            // Jellyfin picked a VA-API encoder, which cannot take the chain, and the engine has nothing to put there.
+            OnIntel("auto", "auto", "hevc_vaapi");
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true };
+            result = "hevc_vaapi";
+            bool handled = UpscalePatches.ApplyIntelEncoder(SessionJob("harness-vaapi-null", "hevc", "hevc"), UpscaleEngine.Settings, ref result);
+            Check("Jellyfin's VA-API encoder and none to replace it: handled, and kept", handled && result == "hevc_vaapi", result);
+            noted = UpscaleEngine.NotedEncoder("harness-vaapi-null");
+            Check("...and the session notes that it kept Jellyfin's encoder", noted != null && noted.Item2.Contains("kept Jellyfin's hevc_vaapi"), noted == null ? "nothing noted" : noted.Item2);
+
+            // Controls: a session the plugin does not act on is left alone without a note, and one it does act on is replaced.
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = false };
+            result = "hevc_vaapi";
+            handled = UpscalePatches.ApplyIntelEncoder(SessionJob("harness-vaapi-idle", "hevc", "hevc"), UpscaleEngine.Settings, ref result);
+            Check("a session the plugin does not act on: kept, no note", handled && result == "hevc_vaapi" && UpscaleEngine.NotedEncoder("harness-vaapi-idle") == null, result);
+            OnIntel("auto", "auto", FullList);
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true };
+            result = "hevc_vaapi";
+            handled = UpscalePatches.ApplyIntelEncoder(SessionJob("harness-vaapi-swap", "hevc", "hevc"), UpscaleEngine.Settings, ref result);
+            Check("Jellyfin's VA-API encoder with hevc_qsv listed: replaced by it", handled && result == "hevc_qsv", result);
+
+            UpscalePatches.PlanSource = null;
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+        }
+
+        // Review items 2 and 3: the real PatcherHost.Apply, against the real Jellyfin assemblies. It
+        // installs the Harmony patches for good, so it runs last.
+        private static void PatchWiring()
+        {
+            // Item 3: the strip prefix is bound to the real StartFfMpeg signature.
+            Type manager = HarmonyLib.AccessTools.TypeByName("MediaBrowser.MediaEncoding.Transcoding.TranscodeManager");
+            System.Reflection.MethodInfo start = manager == null ? null : HarmonyLib.AccessTools.Method(manager, "StartFfMpeg");
+            Check("TranscodeManager.StartFfMpeg exists in the server's assembly", start != null);
+            if (start == null)
+            {
+                return;
+            }
+
+            System.Reflection.ParameterInfo[] parameters = start.GetParameters();
+            string signature = string.Join(", ", parameters.Select(p => p.ParameterType.Name + " " + p.Name));
+            System.Reflection.ParameterInfo stateParam = parameters.FirstOrDefault(p => p.Name == "state");
+            System.Reflection.ParameterInfo argsParam = parameters.FirstOrDefault(p => p.Name == "commandLineArguments");
+            Check("StartFfMpeg takes a job state and the command-line string the prefix names",
+                stateParam != null && typeof(EncodingJobInfo).IsAssignableFrom(stateParam.ParameterType) && argsParam != null && argsParam.ParameterType == typeof(string), signature);
+            System.Reflection.MethodInfo prefix = typeof(UpscalePatches).GetMethod("StartFfMpegStripPrefix", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            Check("the strip prefix's own parameters are all in StartFfMpeg's signature",
+                prefix != null && prefix.GetParameters().All(p => parameters.Any(q => q.Name == p.Name)), signature);
+
+            // Item 2: a cold encoder cache, an Intel server, and the entry point the plugin calls.
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.ResetEncoderProbe();
+            UpscaleEngine.ResetAv1QsvProbe();
+            UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.Av1QsvRunner = _ => null;
+
+            string status = null;
+            try
+            {
+                status = PatcherHost.Apply(null, "{\"GpuVendor\":\"auto\"}");
+            }
+            catch (Exception ex)
+            {
+                Check("PatcherHost.Apply runs against the server's assemblies", false, ex.GetType().Name + ": " + ex.Message);
+            }
+
+            Check("PatcherHost.Apply starts the warm-up: the encoder list is read off the caller", WaitUntil(() => UpscaleEngine.EncoderProbeRuns > 0), "EncoderProbeRuns " + UpscaleEngine.EncoderProbeRuns);
+
+            Check("Apply reports the patches active", status != null && status.StartsWith("active"), status);
+            Check("Apply reports the strip installed, not unavailable", status != null && status.Contains("Intel VA-API argument strip") && !status.Contains("Intel VA-API argument strip (not needed"), status);
+            HarmonyLib.Patches installed = HarmonyLib.Harmony.GetPatchInfo(start);
+            Check("StartFfMpeg carries the strip prefix",
+                installed != null && installed.Prefixes.Any(p => p.PatchMethod.Name == "StartFfMpegStripPrefix"),
+                installed == null ? "no patches" : string.Join(", ", installed.Prefixes.Select(p => p.PatchMethod.Name)));
+
+            UpscaleEngine.Av1QsvRunner = null;
+            UpscaleEngine.ResetAv1QsvProbe();
+            GpuDetector.UseEnvironment(null);
         }
 
         private static string Fixture(string name) => File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "fixtures", name));
@@ -992,6 +1151,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             // An Intel server: no nvidia-smi, nvencSessions null, the load from the kernel.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.ResetEncoderProbe();
             var cold = System.Diagnostics.Stopwatch.StartNew();
             JsonElement intelCold = LoadJson(controller);
             cold.Stop();
@@ -1002,6 +1163,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 cold.ElapsedMilliseconds + " ms; " + intelCold);
             Check("load route, Intel: the cold poll started a background refresh", !Jellyfin.Plugin.Plus.GpuLoadController.IntelRefreshTask.IsCompleted || Jellyfin.Plugin.Plus.GpuLoadController.IntelRefreshTask.IsCompletedSuccessfully);
             Jellyfin.Plugin.Plus.GpuLoadController.IntelRefreshTask.GetAwaiter().GetResult();
+            Equal("load route, Intel, cold encoder cache: the route never ran ffmpeg for the encoder list", "0", UpscaleEngine.EncoderProbeRuns.ToString());
 
             // The refresh stored its figure: the next poll inside the window reads it without a new walk.
             var warm = controller.GetLoad().GetAwaiter().GetResult();

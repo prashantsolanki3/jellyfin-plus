@@ -267,7 +267,9 @@ namespace Jellyfin.Plugin.Plus
         /// xe divides its summed busy cycles by the cycles that elapsed. Devices are kept apart,
         /// and the figure reported is the busiest class on the busiest device, clamped to 0-100.
         /// An i915 class with no capacity line whose raw figure is over 110% is left out (see
-        /// <see cref="UnnormalisedCeiling"/>).
+        /// <see cref="UnnormalisedCeiling"/>), and so is an xe class with no elapsed cycles; when
+        /// any class is left out the headline BusyPercent is null, because that class may be the
+        /// busiest one. The classes that could be measured stay in BusyByClass.
         /// </summary>
         public static DrmLoadResult Compute(Dictionary<string, DrmClient> previous, Dictionary<string, DrmClient> current, double elapsedSeconds)
         {
@@ -327,6 +329,8 @@ namespace Jellyfin.Plugin.Plus
                 }
             }
 
+            // A class left out as unmeasurable may be the busiest one, so the headline is then unknown.
+            bool anyUnmeasured = false;
             foreach (KeyValuePair<string, double> kv in busy)
             {
                 // i915 is measured against wall time; xe against the cycles that elapsed. An xe
@@ -337,6 +341,7 @@ namespace Jellyfin.Plugin.Plus
                 {
                     if (!cycles.TryGetValue(kv.Key, out denominator) || denominator <= 0)
                     {
+                        anyUnmeasured = true;
                         continue;
                     }
                 }
@@ -352,6 +357,7 @@ namespace Jellyfin.Plugin.Plus
                     // i915 prints a capacity line only for a class with more than one engine, so a
                     // figure this far over 100% with no line is a multi-engine class that cannot be
                     // normalised. Clamping it would report a busy GPU that may be half idle.
+                    anyUnmeasured = true;
                     continue;
                 }
 
@@ -364,7 +370,7 @@ namespace Jellyfin.Plugin.Plus
             }
 
             result.VideoClients = videoClients.Count;
-            result.BusyPercent = result.BusyByClass.Count == 0 ? (double?)null : result.BusyByClass.Values.Max();
+            result.BusyPercent = anyUnmeasured || result.BusyByClass.Count == 0 ? (double?)null : result.BusyByClass.Values.Max();
             return result;
         }
     }

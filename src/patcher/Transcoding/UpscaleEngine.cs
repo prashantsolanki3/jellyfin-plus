@@ -241,6 +241,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private static readonly ConcurrentDictionary<string, Tuple<string, string>> _encoderBySession =
             new ConcurrentDictionary<string, Tuple<string, string>>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>The (encoder, reason) parked for a session, or null. For the tests.</summary>
+        internal static Tuple<string, string> NotedEncoder(string playSessionId)
+            => !string.IsNullOrEmpty(playSessionId) && _encoderBySession.TryGetValue(playSessionId, out var noted) ? noted : null;
+
         /// <summary>Parks the encoder this plugin chose for a session, and backfills any record already made.</summary>
         public static void NoteEncoder(string playSessionId, string encoder, string reason)
         {
@@ -2196,6 +2200,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>How many times the encoder list was actually read from ffmpeg. The tests assert it does not move on a request path.</summary>
         internal static int EncoderProbeRuns;
 
+        /// <summary>Forgets the encoder list and that it was ever read, so a test starts from a cold cache. For the tests.</summary>
+        internal static void ResetEncoderProbe()
+        {
+            lock (_encodersLock)
+            {
+                _encoders = null;
+                _encodersProbed = false;
+                EncoderProbeRuns = 0;
+            }
+        }
+
         /// <summary>
         /// The encoder list as far as it is already known, never spawning ffmpeg: null until the
         /// start-up warm-up (or the first transcode) has read it, and null when it could not be
@@ -2792,20 +2807,29 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// The Intel counterpart: av1_qsv is listed by any build that compiles it, but only an Arc
         /// or newer GPU can open it, and it fails at open, which kills the transcode. So one frame
         /// is test-encoded in the background (the answer is cached with a time-to-live) and a
-        /// failure swaps to hevc_qsv, or h264_qsv when the session cannot take HEVC. No answer yet,
-        /// or an inconclusive probe, leaves the choice alone.
+        /// failure swaps to hevc_qsv, or h264_qsv when the session cannot take HEVC. While the very
+        /// first test encode has not finished the swap is made too (an av1_qsv that cannot open is
+        /// a dead stream, and HEVC plays); an inconclusive probe leaves the choice alone.
         /// </summary>
         private static string GuardAv1Intel(EncodingJobInfo state, string encoder, out string reason)
         {
             reason = null;
-            if (!string.Equals(encoder, "av1_qsv", StringComparison.OrdinalIgnoreCase) || Av1QsvUsable() != false)
+            if (!string.Equals(encoder, "av1_qsv", StringComparison.OrdinalIgnoreCase))
+            {
+                return encoder;
+            }
+
+            bool? usable = Av1QsvUsable(out bool pending);
+            if (usable != false && !pending)
             {
                 return encoder;
             }
 
             var supported = SupportedCodecs(state);
             string swap = supported.Count == 0 || supported.Contains("hevc") ? "hevc_qsv" : "h264_qsv";
-            reason = "a test encode with av1_qsv failed on this GPU, used " + swap + " instead of av1_qsv";
+            reason = pending
+                ? "the av1_qsv test encode has not finished yet, used " + swap + " instead of av1_qsv"
+                : "a test encode with av1_qsv failed on this GPU, used " + swap + " instead of av1_qsv";
             return swap;
         }
 
@@ -2851,10 +2875,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// Whether av1_qsv can open on this GPU, from the last one-frame test encode. This never
         /// runs ffmpeg: it sits on the transcode path, so it answers from the cache and, when the
         /// answer is missing or past its time-to-live, starts ONE background probe. Null (nothing
-        /// known yet, or the probe was inconclusive) leaves the encoder choice alone.
+        /// known yet, or the probe was inconclusive) leaves the encoder choice alone. pending is
+        /// true only until the first probe has produced any answer at all, when the caller guards
+        /// as it did when the probe ran inline.
         /// </summary>
-        private static bool? Av1QsvUsable()
+        private static bool? Av1QsvUsable(out bool pending)
         {
+            pending = false;
             if (Av1QsvProbeSource != null)
             {
                 return Av1QsvProbeSource();
@@ -2876,6 +2903,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 StartAv1Probe();
             }
 
+            pending = !known;
             return known ? value : null;
         }
 

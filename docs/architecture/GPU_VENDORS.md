@@ -245,8 +245,12 @@ plugin start-up (and again when its answer lapses), opens the QSV device on the 
 (`-init_hw_device vaapi=va:<node> -init_hw_device qsv=qs@va`, the form Jellyfin's own QSV lines use;
 not run against hardware) and is single-flight; the transcode path only reads its cached answer. A
 usable answer is kept 1 h, a failure 5 min and an inconclusive try (no ffmpeg, a timeout) 1 min, so a
-busy GPU or a timeout does not pin the choice. Until there is an answer, and when it is inconclusive,
-the choice is left alone, as the NVIDIA guard does.
+busy GPU or a timeout does not pin the choice. Until the first answer exists the guard swaps to
+`hevc_qsv` (or `h264_qsv`) as if the test had failed, and the reason says it has not finished: the
+old guard ran the test inline, so a first AV1 session on a GPU without an AV1 encoder never reached
+`av1_qsv`, and the swap-while-pending keeps that. The cost is that a first AV1 session on an Arc card in
+the seconds after start-up gets HEVC; the next one gets AV1. An inconclusive answer (no ffmpeg, a
+timeout) leaves `av1_qsv` alone, as the NVIDIA guard does.
 
 **No encoder.** With neither a `*_qsv` nor a software encoder in ffmpeg's list, `ChooseEncoder`
 returns nothing and Jellyfin's own choice stands; it no longer names a `*_qsv` encoder that would fail
@@ -258,9 +262,13 @@ inside the methods this plugin already hooks (a read of `EncodingHelper` on rele
 `TranscodeManager.StartFfMpeg` removes `-init_hw_device vaapi=...`, the `-filter_hw_device` and
 `-hwaccel_device` that name it, `-hwaccel vaapi`, `-hwaccel_output_format vaapi`, `-rc_mode` and `-sei`
 from the command line of a session on the Intel path whose encoder is QSV or software. A line that
-still names a VA-API encoder, or opens a QSV device itself, is left whole. The parameter names of
-`StartFfMpeg` are written from memory of the source; if one differs Harmony throws at patch time and
-the patch is reported as failed, which leaves command lines as they were.
+still names a VA-API encoder, or opens a QSV device itself, is left whole. If a parameter name of
+`StartFfMpeg` differs Harmony throws at patch time and the patch is reported as failed, which leaves
+command lines as they were. The harness checks the prefix against the real `StartFfMpeg` in the
+server's assembly (`state` and `commandLineArguments` exist, with the right types), runs
+`PatcherHost.Apply` and asserts the prefix is installed. The command-line fixture is reconstructed
+from Jellyfin's source, not captured from a session, and a served segment on a real Arc is not
+verified.
 
 **Not done here.** The Vulkan device is still `vk:0` (PR 3), so on a box with two GPUs the QSV
 session opens whichever device the QSV runtime picks, not necessarily the one in the record. The
@@ -291,8 +299,10 @@ Busy percentage is the change between two samples: i915 divides the summed busy 
 class by `elapsed x capacity`; xe divides the summed busy cycles by the change in
 `drm-total-cycles`. `gpuBusyPercent` is the busiest class (clamped to 0-100). An i915 class that
 prints no capacity line is taken as one engine; when its figure is then over 110% it is a multi-engine
-class that cannot be normalised and is left out (null if it was the only class) instead of being
-reported as 100. A two-engine class at or under 100% of one engine with no capacity line is
+class that cannot be normalised and is left out of the per-class figures instead of being reported
+as 100. A class left out (that, or an xe class with no elapsed cycles) may be the busiest one, so
+`gpuBusyPercent` is then null, not the busiest of the others: a real i915 file lists every engine
+class, and reading the idle ones as the answer would show a busy encode as 0%. A two-engine class at or under 100% of one engine with no capacity line is
 indistinguishable from a one-engine class and is reported as measured. `encoderSessions` is
 the number of distinct clients whose video-engine time moved in the window, which on this plugin's
 chain (software decode) is encode; a hardware-decoding client would count too, and the doc says so.
