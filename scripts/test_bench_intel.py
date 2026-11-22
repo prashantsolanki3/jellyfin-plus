@@ -285,6 +285,96 @@ def test_mutants(tmp):
         check(f"mutant {name} is caught", rc != 0 or bool(plan_failures(out)))
 
 
+def build_apt_checks(df):
+    """The build stage's apt line carries every dev package build-ffmpeg.sh installs for the Intel build.
+
+    The FSR2 compile runs before the script's own apt step, and a header missing there (vulkan/vulkan.h)
+    failed the first CI build.
+    """
+    stage = re.search(r"^FROM \S+ AS build\n(.*?)(?=^FROM )", df, re.M | re.S)
+    check("the Dockerfile has a build stage", bool(stage))
+    body = stage.group(1) if stage else ""
+    apt = re.search(r"apt-get install[^\n]*?--no-install-recommends(.*?)&&\s*rm -rf", body, re.S)
+    pkgs = apt.group(1).replace("\\", " ").split() if apt else []
+    check("the build stage has an apt-get install line", bool(pkgs))
+    for pkg in ["libvulkan-dev", "libva-dev", "libvpl-dev", "libdrm-dev", "glslang-tools"]:
+        check(f"the build stage installs {pkg}", pkg in pkgs, str(pkgs))
+
+    script = open(os.path.join(HERE, "build-ffmpeg.sh")).read()
+    base = re.search(r"^APT_PKGS=\(([^)]*)\)", script, re.M)
+    intel = re.search(r"^if \[\[ \"\$GPU_VENDOR\" == \"intel\" \]\]; then\n\s+APT_PKGS\+=\(([^)]*)\)", script, re.M)
+    check("build-ffmpeg.sh APT_PKGS and its intel addition are found", bool(base) and bool(intel))
+    wanted = (base.group(1).split() if base else []) + (intel.group(1).split() if intel else [])
+    check("the script's apt list is not empty", len(wanted) >= 15, str(wanted))
+    missing = [p for p in wanted if p not in pkgs]
+    check("the build stage installs everything build-ffmpeg.sh apt-installs for intel", not missing, str(missing))
+
+    fetch = body.find("git fetch")
+    at = apt.start() if apt else -1
+    check("the apt install comes before the FSR2 fetch and compile", 0 <= at < fetch, f"{at} {fetch}")
+    check("the distro shaderc is not installed (it broke nlmeans_vulkan)", "libshaderc" not in " ".join(pkgs))
+
+    check("every -dev package has a runtime pair listed", not unpaired_dev(pkgs + wanted, DEV_RUNTIME),
+          str(unpaired_dev(pkgs + wanted, DEV_RUNTIME)))
+    check("mutant: a -dev package with no runtime pair is caught", unpaired_dev(pkgs + ["libnew-dev"], DEV_RUNTIME) == ["libnew-dev"])
+
+
+# Each -dev package of the build stage and the runtime package the final stage gets for it. The final
+# stage installs the ldd-derived runtime-packages.txt, so these arrive by themselves; None is a build tool.
+DEV_RUNTIME = {
+    "libvulkan-dev": "libvulkan1",
+    "libva-dev": "libva2",
+    "libvpl-dev": "libvpl2",
+    "libdrm-dev": "libdrm2",
+    "libx264-dev": "libx264-164",
+    "libxcb1-dev": "libxcb1",
+    "glslang-tools": None,
+}
+
+
+def unpaired_dev(pkgs, table):
+    return sorted({p for p in pkgs if p.endswith("-dev") and p not in table})
+
+
+def local_libs_failures(df):
+    """What keeps a source-built shared library (shaderc, under /usr/local) out of the final image.
+
+    dpkg -S finds no package for it, so runtime-packages.txt cannot name it: the build stage must copy it
+    and the final stage must put it where ldconfig looks, before the ldd 'not found' check.
+    """
+    bad = []
+    build, _, final = df.partition("AS build")[2].rpartition("\nFROM ")
+    if not re.search(r"/usr/local/\*\).*?/out/local-libs/", build, re.S):
+        bad.append("the build stage does not copy /usr/local libraries to /out/local-libs")
+    # stdout of that loop is the package list: a stray echo would land in runtime-packages.txt and break apt
+    if re.search(r'echo "local: [^"]*"', build) and not re.search(r'echo "local: [^"]*" >&2', build):
+        bad.append("the local-lib message goes to stdout, into runtime-packages.txt")
+    copy = final.find("COPY --from=build /out/local-libs/ /usr/local/lib/")
+    ldconfig = final.find("ldconfig")
+    gate = final.find("grep 'not found'")
+    if copy < 0:
+        bad.append("the final stage does not copy /out/local-libs to /usr/local/lib")
+    if ldconfig < 0:
+        bad.append("the final stage does not run ldconfig")
+    if not 0 <= copy < ldconfig < gate:
+        bad.append(f"order must be COPY, ldconfig, then the not-found check ({copy} {ldconfig} {gate})")
+    return bad
+
+
+def local_libs_checks(df):
+    check("the source-built /usr/local libraries reach the final image", not local_libs_failures(df), str(local_libs_failures(df)))
+    no_copy = df.replace("COPY --from=build /out/local-libs/ /usr/local/lib/", "")
+    check("mutant: no copy of the local libraries is caught", bool(local_libs_failures(no_copy)))
+    no_ldconfig = df.replace("ldconfig", "true")
+    check("mutant: no ldconfig is caught", bool(local_libs_failures(no_ldconfig)))
+    late = df.replace("RUN ldconfig\n", "") + "\nRUN ldconfig\n"
+    check("mutant: ldconfig after the not-found check is caught", bool(local_libs_failures(late)))
+    stdout_echo = df.replace('echo "local: $n" >&2', 'echo "local: $n"')
+    check("mutant: a message on stdout (into runtime-packages.txt) is caught", bool(local_libs_failures(stdout_echo)))
+    no_build = df.replace("/out/local-libs/", "/out/x/")
+    check("mutant: a build stage that copies nothing is caught", bool(local_libs_failures(no_build)))
+
+
 def dockerfile_checks(tmp):
     df = open(DOCKERFILE).read()
     spec = open(SPEC).read()
@@ -309,6 +399,10 @@ def dockerfile_checks(tmp):
     check("build-ffmpeg.sh is not edited by the image", "sed -i" not in df)
     check("NVIDIA build variables absent", not re.search(r"GPU_VENDOR=nvidia|WITH_DLSS|WITH_OPTIX", df))
 
+    build_apt_checks(df)
+    local_libs_checks(df)
+    web_step_checks(df)
+
     ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
     need = ["scripts", "src", "web", "web/src", "shim", "assets", "ffmpeg", "docker", ".", "web/theme", "patches"]
     check("dockerignore keeps what the build needs", not [n for n in need if n in ignore], str(ignore))
@@ -326,12 +420,76 @@ def dockerfile_checks(tmp):
     check("the Intel filter list the image checks is oidn ort", out == ["oidn", "ort"], str(out))
 
 
+def web_step(df):
+    """The build stage's RUN that builds the client and injects it (the one that failed silently in CI)."""
+    for m in re.finditer(r"^RUN (?:[^\n]*\\\n)*[^\n]*", df, re.M):
+        if "jellyfin-plus-webinject" in m.group(0):
+            return m.group(0)
+    return ""
+
+
+def web_step_checks(df):
+    step = web_step(df)
+    check("the Dockerfile has the web build and inject step", "jellyfin-plus-webinject" in step)
+    check("the web step starts with set -eux so a failure names its command",
+          bool(re.match(r"RUN set -[a-z]*e[a-z]*x[a-z]*;", step) or re.match(r"RUN set -[a-z]*x[a-z]*e[a-z]*;", step)), step[:60])
+    check("the web step echoes which phase it is in", len(re.findall(r"\becho\b", step)) >= 3, step)
+
+    # JP_SRC / JP_THEME_SRC must name the files the step installs just before it injects.
+    installed = re.findall(r"install -m 0644 \S+ ([^\s;]+)", step)
+    src = re.search(r"JP_SRC=(\S+)", step)
+    theme = re.search(r"JP_THEME_SRC=(\S+)", step)
+    check("JP_SRC is the installed client bundle", bool(src) and src.group(1) in installed, f"{installed}")
+    check("JP_THEME_SRC is the installed theme css", bool(theme) and theme.group(1) in installed, f"{installed}")
+    check("the step injects into $JELLYFIN_WEB", 'JP_WEB="$JELLYFIN_WEB"' in step)
+    check("the step runs after stage-plugin.sh creates /out/patcher",
+          0 <= df.find("stage-plugin.sh /src") < df.find(step[:40]) if step else False)
+
+
+def test_webinject_without_dpkg_package(tmp):
+    """The injector must not abort silently when jellyfin-web is a plain tree, not a dpkg package.
+
+    In the image build stage dpkg-query exits 1 for jellyfin-web; under set -e + pipefail that killed the
+    script before any output (Arc image build, step 12/13).
+    """
+    web = os.path.join(tmp, "web")
+    os.makedirs(os.path.join(web, "themes", "dark"))
+    open(os.path.join(web, "index.html"), "w").write(
+        '<html><head><title>x</title><script defer="defer" src="main.js"></script></head><body></body></html>')
+    open(os.path.join(web, "config.json"), "w").write('{"themes": []}')
+    open(os.path.join(web, "themes", "dark", "theme.css"), "w").write("")
+    src = os.path.join(tmp, "src.js")
+    open(src, "w").write("// bundle\n")
+    css = os.path.join(tmp, "theme.css")
+    open(css, "w").write("/* theme */\n")
+
+    stubs = os.path.join(tmp, "stubs")
+    os.makedirs(stubs)
+    p = os.path.join(stubs, "dpkg-query")
+    open(p, "w").write("#!/bin/sh\nexit 1\n")
+    os.chmod(p, 0o755)
+
+    env = clean_env({"JP_WEB": web, "JP_SRC": src, "JP_THEME_SRC": css}, path=stubs)
+    env.pop("JP_CONF_MD5", None)
+    rc, out, err = run(os.path.join(HERE, "jellyfin-plus-webinject"), [], env)
+    check("webinject exits 0 when dpkg-query fails", rc == 0, f"rc={rc} out={out!r} err={err!r}")
+    check("webinject reports the index.html hook", "index.html hooked" in out, out)
+    check("webinject installed jellyfin-plus.js", os.path.isfile(os.path.join(web, "jellyfin-plus.js")))
+    html = open(os.path.join(web, "index.html")).read()
+    check("index.html carries the script tag", "jellyfin-plus.js?v=" in html)
+    check("the theme was installed", os.path.isfile(os.path.join(web, "themes", "jellyfinplus", "theme.css")), out)
+
+    # the apt hook's pre-dpkg call reads the same md5, so it must not die either
+    rc, out, err = run(os.path.join(HERE, "jellyfin-plus-webinject"), ["--restore-conffile"], env)
+    check("--restore-conffile exits 0 when dpkg-query fails", rc == 0, f"rc={rc} err={err!r}")
+
+
 def main():
     if not BASH:
         print("no bash")
         return 1
     with tempfile.TemporaryDirectory() as tmp:
-        for part in (test_plan_and_refusals, test_stub_run, test_mutants):
+        for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
             part(sub)

@@ -793,7 +793,7 @@ Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API 
 | Base image | `docker.io/jellyfin/jellyfin:12.4.20261026-211555@sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771` |
 | FidelityFX-FSR2 | commit `1680d1edd5c034f88ebbbb793d8b88f8842cf804` (a git commit id is a content hash; the build checks `git rev-parse HEAD`) |
 | .NET 10 SDK | `10.0.404` tarball, checked against its published sha512 (`DOTNET_SDK_SHA512`) |
-| Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage |
+| Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage; a library the build puts under `/usr/local` (shaderc, which has no package) is copied to `/usr/local/lib` and `ldconfig` runs before the acceptance check |
 
 **Acceptance, enforced by the build.** `ldd` of the patched ffmpeg shows no `not found`; `-filters`
 lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwaccels` lists `vaapi`;
@@ -801,8 +801,9 @@ lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwacc
 inject, patcher and plugin files are in place. A failed check fails the build.
 
 **Known gaps (not pinned).** The shared scripts fetch FFmpeg, OIDN, ONNX Runtime, shaderc and
-libplacebo sources, the shader files (`install-shaders.sh`), apt packages and NuGet packages from
-mutable URLs without a hash; this image inherits that and does not edit those scripts. The in-image
+libplacebo sources, the unpinned shader files (`install-shaders.sh`: FSR, SSimSuperRes,
+KrigBilateral, ravu, CuNNy; the FSRCNNX, Anime4K and NIS files are pinned and hashed), apt packages
+and NuGet packages from mutable URLs without a hash; this image inherits that and does not edit those scripts. The in-image
 checks above are what stands in for a pin. FFmpeg 8.1.2's sha256 exists only in
 `scripts/test-vf-ort.sh`. Reusing it in `build-ffmpeg.sh` is a separate change. The binary links
 GPL components: it stays in the owner's registry and is never published.
