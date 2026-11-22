@@ -26,6 +26,12 @@
   fail, independent of `_encodersProbed`.
 - Live checks: none apply (no running service is touched).
 
+## Follow-up (this round)
+- `PatchWiring` resolves `TranscodeManager` with `typeof`, so the wiring checks no longer return early.
+- `UpscalePatches.cs` strip hook uses `typeof(TranscodeManager)`, so it no longer depends on the swap block having loaded the assembly. The wiring check "StartFfMpeg carries the strip prefix" still proves the hook installs; a test that fails on ordering cannot be written in-process, because `typeof` already loads the assembly, and the production code no longer has an order dependence to test.
+- New harness case for an xe class with no elapsed cycles beside a measured one (vcs kept at 50.0, rcs dropped, headline null); read against `DrmFdinfo.Compute`, it should pass.
+- `pre-commit run` fails here: `.pre-commit-config.yaml` is not a file in this checkout. Not run.
+
 ## Not verified
 - Compilation and the whole harness, including `PatchWiring` (it installs the real Harmony patches
   against the server's DLLs and assumes the real `StartFfMpeg` carries `state` and `commandLineArguments`).

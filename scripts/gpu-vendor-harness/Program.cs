@@ -872,8 +872,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         private static void PatchWiring()
         {
             // Item 3: the strip prefix is bound to the real StartFfMpeg signature.
-            Type manager = HarmonyLib.AccessTools.TypeByName("MediaBrowser.MediaEncoding.Transcoding.TranscodeManager");
-            System.Reflection.MethodInfo start = manager == null ? null : HarmonyLib.AccessTools.Method(manager, "StartFfMpeg");
+            Type manager = typeof(MediaBrowser.MediaEncoding.Transcoding.TranscodeManager);
+            System.Reflection.MethodInfo start = HarmonyLib.AccessTools.Method(manager, "StartFfMpeg");
             Check("TranscodeManager.StartFfMpeg exists in the server's assembly", start != null);
             if (start == null)
             {
@@ -1007,6 +1007,13 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("a zero or negative window measures nothing", DrmFdinfo.Compute(Samples("fdinfo-xe-t0.txt"), Samples("fdinfo-xe-t1.txt"), 0).BusyPercent == null);
             Check("an xe class with no elapsed cycles is left out, not read as 0",
                 DrmFdinfo.Compute(Samples("fdinfo-xe-t1.txt"), Samples("fdinfo-xe-t1.txt"), 1.0).BusyPercent == null);
+            // One xe class measured, another busy with no elapsed cycles: the unmeasured one may be the busiest.
+            DrmClient xeMixedBefore = DrmFdinfo.Parse("drm-driver:\txe\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t9\ndrm-total-cycles-vcs:\t0\ndrm-cycles-vcs:\t0\ndrm-total-cycles-rcs:\t100\ndrm-cycles-rcs:\t0\n");
+            DrmClient xeMixedNow = DrmFdinfo.Parse("drm-driver:\txe\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t9\ndrm-total-cycles-vcs:\t1000\ndrm-cycles-vcs:\t500\ndrm-total-cycles-rcs:\t100\ndrm-cycles-rcs:\t50\n");
+            DrmLoadResult xeMixed = DrmFdinfo.Compute(new Dictionary<string, DrmClient> { [xeMixedBefore.Key] = xeMixedBefore }, new Dictionary<string, DrmClient> { [xeMixedNow.Key] = xeMixedNow }, 1.0);
+            Check("an xe class with no elapsed cycles beside a measured one: the measured class is kept, the headline is null",
+                xeMixed.BusyByClass.ContainsKey("video") && xeMixed.BusyByClass["video"] == 50.0 && !xeMixed.BusyByClass.ContainsKey("render") && xeMixed.BusyPercent == null,
+                string.Join(",", xeMixed.BusyByClass) + " headline " + xeMixed.BusyPercent);
             Check("a counter that went backwards is skipped", DrmFdinfo.Compute(Samples("fdinfo-i915-encode-t1.txt"), Samples("fdinfo-i915-encode-t0.txt"), 1.0).VideoClients == 0);
             Check("a null sample measures nothing", DrmFdinfo.Compute(null, Samples("fdinfo-xe-t1.txt"), 1.0).BusyPercent == null);
             DrmClient hot = DrmFdinfo.Parse("drm-driver:\ti915\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t1\ndrm-engine-video:\t9000000000 ns\n");

@@ -186,11 +186,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
             // Intel: drop VA-API-only options from the command line of a swapped encoder. Resolved
             // by name, and a parameter name Jellyfin renamed makes Harmony throw here, which only
-            // loses this safety net.
+            // loses this safety net. typeof, not TypeByName: that only finds the type once the swap
+            // block above has loaded its assembly.
             try
             {
-                Type manager = AccessTools.TypeByName("MediaBrowser.MediaEncoding.Transcoding.TranscodeManager");
-                MethodInfo start = manager == null ? null : AccessTools.Method(manager, "StartFfMpeg");
+                MethodInfo start = AccessTools.Method(typeof(MediaBrowser.MediaEncoding.Transcoding.TranscodeManager), "StartFfMpeg");
                 if (start == null)
                 {
                     failed.Add("Intel VA-API argument strip (not needed unless a VA-API option survives the encoder swap)");
