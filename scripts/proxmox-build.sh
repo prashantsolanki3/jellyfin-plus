@@ -16,6 +16,7 @@
 #
 # GPU_VENDOR=intel with --with-ffmpeg builds the Intel Arc variant (scripts/build-ffmpeg.sh has the
 # details); the filters it must carry come from scripts/ffmpeg-vendor.sh, the one list both scripts read.
+# It refuses to replace a binary that carries optix (an NVIDIA build) unless ALLOW_VENDOR_SWITCH=1.
 #
 # Ordering is the whole point. Everything that can fail happens before anything the running
 # server can see, and the client script is published only after the server half is live, because
@@ -49,7 +50,7 @@ for arg in "$@"; do
         --with-shaders)     WITH_SHADERS=1 ;;
         --no-activate)      ACTIVATE=0 ;;
         --keep-transcodes)  KEEP_TRANSCODES=1 ;;
-        -h|--help)          sed -n '2,22p' "$0"; exit 0 ;;
+        -h|--help)          sed -n '2,23p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -84,6 +85,7 @@ fi
 echo "==> building $(git -C "$REPO_DIR" log -1 --format='%h %s')"
 
 cd "$REPO_DIR"
+. ./scripts/plugin-meta.sh
 
 # ---- 2. shaders (optional) ------------------------------------------------------------------
 if [ "$WITH_SHADERS" = "1" ]; then
@@ -114,6 +116,8 @@ if [ "$WITH_FFMPEG" = "1" ]; then
         echo "==> FAILED: GPU_VENDOR must be nvidia or intel, not '$GPU_VENDOR'" >&2
         exit 1
     fi
+    # Before the snapshot and the build: a mistyped GPU_VENDOR=intel must not replace an NVIDIA binary.
+    ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PATCHED_FFMPEG" || exit 1
     # The NVIDIA-only filters default on for nvidia and off for intel, where build-ffmpeg.sh refuses them.
     # fsr2 is off on intel too, but build-ffmpeg.sh allows it there (it needs the out-of-tree FSR2 SDK build).
     nv_default=1
@@ -253,17 +257,7 @@ mv "$STAGE_NEW" "$STAGE"
 if [ ! -d "$PLUGIN_DIR" ]; then
     echo "==> first install: creating $PLUGIN_DIR"
     mkdir -p "$PLUGIN_DIR"
-    cat > "$PLUGIN_DIR/meta.json" <<META
-{
-  "guid": "6f2a9c31-4d7b-4e2a-9d15-8a1c0b7e3f44",
-  "name": "Jellyfin Plus",
-  "version": "$PLUGIN_VERSION",
-  "targetAbi": "12.3.0.0",
-  "owner": "",
-  "overview": "GPU video enhancement plus search, filtering and library quality-of-life improvements for Jellyfin.",
-  "category": "General"
-}
-META
+    plugin_first_meta "$PLUGIN_VERSION" > "$PLUGIN_DIR/meta.json"
     cp -a "$STAGE/Jellyfin.Plugin.Plus.dll" "$STAGE/Jellyfin.Plugin.Plus.deps.json" "$PLUGIN_DIR/"
     cp -a "$STAGE/Jellyfin.Plugin.Plus.Patcher.dll" "$STAGE/0Harmony.dll" "$PATCH_DIR/"
     chown -R jellyfin:jellyfin "$PLUGIN_DIR"
@@ -273,7 +267,7 @@ fi
 # are built against (targetAbi is the OLDEST server that loads the plugin, so 12.1.0.0 would still load
 # on 12.3; this keeps a 12.3 build from being offered to a 12.1 server).
 if [ -f "$PLUGIN_DIR/meta.json" ]; then
-    sed -i 's/"targetAbi": *"12\.1\.0\.0"/"targetAbi": "12.3.0.0"/' "$PLUGIN_DIR/meta.json"
+    sed -i "s/\"targetAbi\": *\"12\\.1\\.0\\.0\"/\"targetAbi\": \"$PLUGIN_TARGET_ABI\"/" "$PLUGIN_DIR/meta.json"
 fi
 
 # The dashboard's plugin page: description, overview, owner and image come from meta.json
