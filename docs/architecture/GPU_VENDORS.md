@@ -801,8 +801,9 @@ lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwacc
 inject, patcher and plugin files are in place. A failed check fails the build.
 
 **Known gaps (not pinned).** The shared scripts fetch FFmpeg, OIDN, ONNX Runtime, shaderc and
-libplacebo sources, the shader files (`install-shaders.sh`), apt packages and NuGet packages from
-mutable URLs without a hash; this image inherits that and does not edit those scripts. The in-image
+libplacebo sources, the unpinned shader files (`install-shaders.sh`: FSR, SSimSuperRes,
+KrigBilateral, ravu, CuNNy; the FSRCNNX, Anime4K and NIS files are pinned and hashed), apt packages
+and NuGet packages from mutable URLs without a hash; this image inherits that and does not edit those scripts. The in-image
 checks above are what stands in for a pin. FFmpeg 8.1.2's sha256 exists only in
 `scripts/test-vf-ort.sh`. Reusing it in `build-ffmpeg.sh` is a separate change. The binary links
 GPL components: it stays in the owner's registry and is never published.

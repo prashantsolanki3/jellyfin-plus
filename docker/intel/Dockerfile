@@ -106,9 +106,16 @@ RUN set -eux; \
     JP_WEB="$JELLYFIN_WEB" JP_SRC=/out/patcher/jellyfin-plus.js JP_THEME_SRC=/out/patcher/jellyfinplus-theme.css \
         bash scripts/jellyfin-plus-webinject
 
-# The shaders. install-shaders.sh fetches from mutable upstream URLs with no hash (a recorded gap).
+# The shaders. install-shaders.sh pins and hashes the FSRCNNX, Anime4K and NIS files; the gist and
+# raw/master ones (FSR, SSimSuperRes, KrigBilateral, ravu, CuNNy) are still mutable (a recorded gap).
+# The test -f list is every SR file the plugin offers by default or in its menu, plus the sharpeners.
 RUN bash scripts/install-shaders.sh /usr/share/jellyfin-shaders \
- && test -f /usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl
+ && test -f /usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl \
+ && test -f /usr/share/jellyfin-shaders/FSRCNNX_x2_16-0-4-1.glsl \
+ && test -f /usr/share/jellyfin-shaders/Anime4K_Upscale_CNN_x2_S.glsl \
+ && test -f /usr/share/jellyfin-shaders/Anime4K_Upscale_CNN_x2_M.glsl \
+ && test -f /usr/share/jellyfin-shaders/NVScaler.glsl \
+ && test -f /usr/share/jellyfin-shaders/RCAS-1.7.glsl
 
 # ---- the image -----------------------------------------------------------------------------------
 FROM ${JELLYFIN_IMAGE}
