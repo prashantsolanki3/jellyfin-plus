@@ -793,7 +793,7 @@ Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API 
 | Base image | `docker.io/jellyfin/jellyfin:12.4.20261026-211555@sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771` |
 | FidelityFX-FSR2 | commit `1680d1edd5c034f88ebbbb793d8b88f8842cf804` (a git commit id is a content hash; the build checks `git rev-parse HEAD`) |
 | .NET 10 SDK | `10.0.404` tarball, checked against its published sha512 (`DOTNET_SDK_SHA512`) |
-| Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage |
+| Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage; a library the build puts under `/usr/local` (shaderc, which has no package) is copied to `/usr/local/lib` and `ldconfig` runs before the acceptance check |
 
 **Acceptance, enforced by the build.** `ldd` of the patched ffmpeg shows no `not found`; `-filters`
 lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwaccels` lists `vaapi`;

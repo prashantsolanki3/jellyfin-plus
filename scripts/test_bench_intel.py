@@ -314,6 +314,66 @@ def build_apt_checks(df):
     check("the apt install comes before the FSR2 fetch and compile", 0 <= at < fetch, f"{at} {fetch}")
     check("the distro shaderc is not installed (it broke nlmeans_vulkan)", "libshaderc" not in " ".join(pkgs))
 
+    check("every -dev package has a runtime pair listed", not unpaired_dev(pkgs + wanted, DEV_RUNTIME),
+          str(unpaired_dev(pkgs + wanted, DEV_RUNTIME)))
+    check("mutant: a -dev package with no runtime pair is caught", unpaired_dev(pkgs + ["libnew-dev"], DEV_RUNTIME) == ["libnew-dev"])
+
+
+# Each -dev package of the build stage and the runtime package the final stage gets for it. The final
+# stage installs the ldd-derived runtime-packages.txt, so these arrive by themselves; None is a build tool.
+DEV_RUNTIME = {
+    "libvulkan-dev": "libvulkan1",
+    "libva-dev": "libva2",
+    "libvpl-dev": "libvpl2",
+    "libdrm-dev": "libdrm2",
+    "libx264-dev": "libx264-164",
+    "libxcb1-dev": "libxcb1",
+    "glslang-tools": None,
+}
+
+
+def unpaired_dev(pkgs, table):
+    return sorted({p for p in pkgs if p.endswith("-dev") and p not in table})
+
+
+def local_libs_failures(df):
+    """What keeps a source-built shared library (shaderc, under /usr/local) out of the final image.
+
+    dpkg -S finds no package for it, so runtime-packages.txt cannot name it: the build stage must copy it
+    and the final stage must put it where ldconfig looks, before the ldd 'not found' check.
+    """
+    bad = []
+    build, _, final = df.partition("AS build")[2].rpartition("\nFROM ")
+    if not re.search(r"/usr/local/\*\).*?/out/local-libs/", build, re.S):
+        bad.append("the build stage does not copy /usr/local libraries to /out/local-libs")
+    # stdout of that loop is the package list: a stray echo would land in runtime-packages.txt and break apt
+    if re.search(r'echo "local: [^"]*"', build) and not re.search(r'echo "local: [^"]*" >&2', build):
+        bad.append("the local-lib message goes to stdout, into runtime-packages.txt")
+    copy = final.find("COPY --from=build /out/local-libs/ /usr/local/lib/")
+    ldconfig = final.find("ldconfig")
+    gate = final.find("grep 'not found'")
+    if copy < 0:
+        bad.append("the final stage does not copy /out/local-libs to /usr/local/lib")
+    if ldconfig < 0:
+        bad.append("the final stage does not run ldconfig")
+    if not 0 <= copy < ldconfig < gate:
+        bad.append(f"order must be COPY, ldconfig, then the not-found check ({copy} {ldconfig} {gate})")
+    return bad
+
+
+def local_libs_checks(df):
+    check("the source-built /usr/local libraries reach the final image", not local_libs_failures(df), str(local_libs_failures(df)))
+    no_copy = df.replace("COPY --from=build /out/local-libs/ /usr/local/lib/", "")
+    check("mutant: no copy of the local libraries is caught", bool(local_libs_failures(no_copy)))
+    no_ldconfig = df.replace("ldconfig", "true")
+    check("mutant: no ldconfig is caught", bool(local_libs_failures(no_ldconfig)))
+    late = df.replace("RUN ldconfig\n", "") + "\nRUN ldconfig\n"
+    check("mutant: ldconfig after the not-found check is caught", bool(local_libs_failures(late)))
+    stdout_echo = df.replace('echo "local: $n" >&2', 'echo "local: $n"')
+    check("mutant: a message on stdout (into runtime-packages.txt) is caught", bool(local_libs_failures(stdout_echo)))
+    no_build = df.replace("/out/local-libs/", "/out/x/")
+    check("mutant: a build stage that copies nothing is caught", bool(local_libs_failures(no_build)))
+
 
 def dockerfile_checks(tmp):
     df = open(DOCKERFILE).read()
@@ -340,6 +400,7 @@ def dockerfile_checks(tmp):
     check("NVIDIA build variables absent", not re.search(r"GPU_VENDOR=nvidia|WITH_DLSS|WITH_OPTIX", df))
 
     build_apt_checks(df)
+    local_libs_checks(df)
     web_step_checks(df)
 
     ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
