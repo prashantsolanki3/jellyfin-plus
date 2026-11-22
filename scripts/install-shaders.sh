@@ -245,6 +245,85 @@ fetch_cunny soft CuNNy-4x16-SOFT-Q.glsl
 fetch_cunny soft CuNNy-4x32-SOFT-Q.glsl
 fetch_cunny ds   CuNNy-4x16-DS-Q.glsl
 
+# =================================================================================================
+# FSRCNNX and Anime4K: the default and the menued SR levels (ShaderLibrary "fsrcnnx",
+# "fsrcnnx-heavy", "anime4k-s", "anime4k-m"). FETCHED, never vendored, each pinned and verified.
+#
+#   FSRCNNX  igv, LGPL-3.0-or-later. A release asset, so the pin is the tag plus the sha256 of the
+#            file. The guard it carries is left alone, like CuNNy's: it matches SrMinScaleFactor.
+#   Anime4K  bloc97, MIT. Fetched by COMMIT (tag v4.0.1), the content pin, plus the sha256.
+#
+# The 16-weight FSRCNNX is the "fsrcnnx-heavy" level; "fsrcnnx-max" (FSRCNN_x2_r1_32-0-2) has no
+# upstream release asset and is not installed here.
+# -------------------------------------------------------------------------------------------------
+FSRCNNX_BASE=${FSRCNNX_URL_BASE:-https://github.com/igv/FSRCNN-TensorFlow/releases/download/1.1}
+FSRCNNX_8_SHA256=${FSRCNNX_8_SHA256:-e800dbc5c1c95185cc82216c597724533ff5f2880179f256eef600f03e8dc2ae}
+FSRCNNX_16_SHA256=${FSRCNNX_16_SHA256:-d5a24a271e5d9a3f7f7a053b150c460a44c25b3cf7f770857d57cc3a2e1c9965}
+ANIME4K_REV=4029bf701ecaa15f163cdc49cffe5501c1acf410
+ANIME4K_BASE=${ANIME4K_URL_BASE:-https://raw.githubusercontent.com/bloc97/Anime4K/$ANIME4K_REV/glsl/Upscale}
+ANIME4K_S_SHA256=${ANIME4K_S_SHA256:-4c53ec2e287908f7ee7bcb266b0170421626d663576468b7d7dafc62962649a4}
+ANIME4K_M_SHA256=${ANIME4K_M_SHA256:-716e02098a68f0d648761f2b96b4dd139e1cb09b174bb369fca3aa34328fff7e}
+
+# fetch_pinned <name> <url> <sha256> [local-dir]: download (or copy) into $TMP and check the hash.
+fetch_pinned() {
+    name=$1
+    url=$2
+    want=$3
+    if [ -n "${4:-}" ]; then
+        cp "$4/$name" "$TMP/$name"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$TMP/$name"
+    else
+        wget -qO "$TMP/$name" "$url"
+    fi
+    got=$(sha256_of "$TMP/$name")
+    [ "$got" = "$want" ] \
+        || { echo "$name sha256 is $got, expected $want" >&2; exit 1; }
+}
+
+fetch_fsrcnnx() {
+    name=$1
+    fetch_pinned "$name" "$FSRCNNX_BASE/$name" "$2" "${FSRCNNX_DIR:-}"
+    grep -q 'Copyright (C) 2017-2021 igv' "$TMP/$name" \
+        || { echo "$name is not igv's FSRCNNX" >&2; exit 1; }
+    grep -q 'GNU Lesser General Public License' "$TMP/$name" \
+        || { echo "LGPL header missing from $name" >&2; exit 1; }
+    install -m 0644 "$TMP/$name" "$DIR/$name"
+}
+
+fetch_anime4k() {
+    name=$1
+    variant=$2
+    fetch_pinned "$name" "$ANIME4K_BASE/$name" "$3" "${ANIME4K_DIR:-}"
+    grep -q 'Copyright (c) 2019-2021 bloc97' "$TMP/$name" \
+        || { echo "$name is not bloc97's Anime4K" >&2; exit 1; }
+    grep -q 'Permission is hereby granted, free of charge' "$TMP/$name" \
+        || { echo "MIT licence header missing from $name" >&2; exit 1; }
+    grep -qF "//!DESC Anime4K-v3.2-Upscale-CNN-x2-($variant)" "$TMP/$name" \
+        || { echo "$name is not the ($variant) Upscale CNN x2 network" >&2; exit 1; }
+    grep -q '^//!HOOK MAIN' "$TMP/$name" \
+        || { echo "$name no longer hooks MAIN - the composition order assumption is void" >&2; exit 1; }
+    install -m 0644 "$TMP/$name" "$DIR/$name"
+}
+
+fetch_fsrcnnx FSRCNNX_x2_8-0-4-1.glsl "$FSRCNNX_8_SHA256"
+fetch_fsrcnnx FSRCNNX_x2_16-0-4-1.glsl "$FSRCNNX_16_SHA256"
+fetch_anime4k Anime4K_Upscale_CNN_x2_S.glsl S "$ANIME4K_S_SHA256"
+fetch_anime4k Anime4K_Upscale_CNN_x2_M.glsl M "$ANIME4K_M_SHA256"
+
+# Everything the plugin and the Arc image's own check rely on, named here so a future edit that
+# drops a fetch fails the install instead of the last image step.
+for f in RCAS-2.0 RCAS-1.7 RCAS-1.4 NVScaler NVSharpen-0.25 NVSharpen-0.65 \
+         FSRCNNX_x2_8-0-4-1 FSRCNNX_x2_16-0-4-1 Anime4K_Upscale_CNN_x2_S Anime4K_Upscale_CNN_x2_M \
+         SSimSuperRes KrigBilateral ravu-zoom-r3 \
+         CuNNy-fast-SOFT-Q CuNNy-4x16-SOFT-Q CuNNy-4x32-SOFT-Q CuNNy-4x16-DS-Q; do
+    [ -s "$DIR/$f.glsl" ] || { echo "install-shaders.sh did not produce $DIR/$f.glsl" >&2; exit 1; }
+done
+
+echo
+echo "FSRCNNX and Anime4K installed into $DIR:"
+ls -l "$DIR"/FSRCNNX_*.glsl "$DIR"/Anime4K_*.glsl
+
 echo
 echo "session-10 shaders installed into $DIR:"
 ls -l "$DIR"/SSimSuperRes.glsl "$DIR"/KrigBilateral.glsl "$DIR"/ravu-zoom-r3.glsl "$DIR"/CuNNy-*.glsl
