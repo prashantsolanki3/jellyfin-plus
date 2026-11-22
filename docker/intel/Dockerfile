@@ -146,6 +146,12 @@ COPY --from=build /jellyfin/jellyfin-web /jellyfin/jellyfin-web
 COPY --chmod=0755 shim/jellyfin-ffmpeg-upscale /usr/local/bin/jellyfin-ffmpeg-upscale
 COPY --chmod=0755 scripts/bench-intel.sh scripts/ffmpeg-vendor.sh /usr/local/lib/jellyfin-plus/scripts/
 
+# Jellyfin loads plugins only from $JELLYFIN_DATA_DIR/plugins, an empty volume on first start: the wrapper
+# seeds the staged plugin there, then execs the base image's own ENTRYPOINT (/jellyfin/jellyfin) with the
+# same arguments. Without it the image starts a stock Jellyfin.
+COPY --chmod=0755 docker/intel/entrypoint.py /usr/local/bin/jellyfin-plus-entrypoint
+ENTRYPOINT ["/usr/local/bin/jellyfin-plus-entrypoint"]
+
 # The shim's config and log paths are fixed and the pod's root filesystem is read-only, so they are links
 # into /var/cache/jellyfin, which the Deployment mounts as an emptyDir (as the shader cache already is).
 # The shim wants ffprobe beside itself (INSTALL.md).
@@ -180,3 +186,8 @@ RUN --mount=type=bind,from=base-pkgs,source=/usr/lib/jellyfin-ffmpeg/ffmpeg,targ
     test -f /usr/lib/jellyfin-plus/Jellyfin.Plugin.Plus.Patcher.dll; \
     test -f /usr/lib/jellyfin-plus/0Harmony.dll; \
     test -f /usr/lib/jellyfin-plus-dist/JellyfinPlus_1.0.0.0/Jellyfin.Plugin.Plus.dll
+
+# The plugin acceptance: a headless start through the entrypoint must seed the plugin dir and log
+# "Loaded plugin: Jellyfin Plus". Last, so it runs against the finished image.
+RUN --mount=type=bind,source=docker/intel/accept-plugin.sh,target=/tmp/accept-plugin.sh \
+    bash /tmp/accept-plugin.sh /usr/local/bin/jellyfin-plus-entrypoint
