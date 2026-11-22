@@ -965,6 +965,43 @@ def test_row_5(tmp):
     check("row 5 FAILs when its stream cannot start", st == "FAIL", f"{st} {detail}")
 
 
+def stage_meta_check(tmp, label, guid, abi, strip_source):
+    """Run the real stage-plugin.sh against a stub dotnet and read the meta.json it writes."""
+    root = tempfile.mkdtemp(dir=tmp)
+    repo = os.path.join(root, "repo")
+    for d in ("scripts", "assets", "src/patcher", "docker/intel"):
+        os.makedirs(os.path.join(repo, d))
+    shutil.copy(os.path.join(HERE, "plugin-meta.sh"), os.path.join(repo, "scripts"))
+    shutil.copy(os.path.join(REPO, "assets", "plugin-meta.json"), os.path.join(repo, "assets"))
+    open(os.path.join(repo, "assets", "jellyfinplus.png"), "wb").close()
+    script = open(os.path.join(REPO, "docker", "intel", "stage-plugin.sh")).read()
+    if strip_source:
+        script = "".join(l for l in script.splitlines(True) if not re.match(r"\s*\.\s+\"\$REPO/scripts/plugin-meta\.sh\"", l))
+    staged = os.path.join(repo, "docker", "intel", "stage-plugin.sh")
+    open(staged, "w").write(script)
+    bindir = os.path.join(root, "bin")
+    os.makedirs(bindir)
+    fake = os.path.join(bindir, "dotnet")
+    # dotnet publish <proj> ... -o <dir>: leave the files stage-plugin.sh copies out of it.
+    open(fake, "w").write('#!/usr/bin/env bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\n'
+                          'mkdir -p "$out"; cd "$out"; touch Jellyfin.Plugin.Plus.dll Jellyfin.Plugin.Plus.deps.json '
+                          'Jellyfin.Plugin.Plus.Patcher.dll 0Harmony.dll\n')
+    os.chmod(fake, 0o755)
+    env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"], PLUGIN_VERSION="3.2.1.0")
+    dist, patcher = os.path.join(root, "dist"), os.path.join(root, "patcher")
+    p = subprocess.run([BASH, staged, repo, root, dist, patcher], capture_output=True, text=True, env=env)
+    try:
+        doc = json.load(open(os.path.join(dist, "JellyfinPlus_3.2.1.0", "meta.json")))
+    except (OSError, ValueError):
+        doc = {}
+    ok = bool(doc) and p.returncode == 0 and doc.get("guid") == (guid.group(1) if guid else None) \
+        and doc.get("targetAbi") == (abi.group(1) if abi else None)
+    if strip_source:
+        check(f"{label} fails instead of writing meta.json", not ok and p.returncode != 0, p.stdout + p.stderr)
+    else:
+        check(f"{label} writes meta.json with plugin-meta.sh's guid and targetAbi", ok, p.stdout + p.stderr)
+
+
 def test_shared_files(tmp):
     meta = os.path.join(HERE, "plugin-meta.sh")
     check("scripts/plugin-meta.sh exists", os.path.isfile(meta))
@@ -978,7 +1015,8 @@ def test_shared_files(tmp):
     check("plugin-meta.sh target ABI is manifest.json's", bool(abi) and manifest["versions"][0]["targetAbi"] == abi.group(1))
     for rel in ("scripts/proxmox-build.sh", "docker/intel/stage-plugin.sh"):
         text = open(os.path.join(REPO, rel)).read()
-        check(f"{rel} sources plugin-meta.sh", "plugin-meta.sh" in text)
+        if rel.startswith("scripts/"):
+            check(f"{rel} sources plugin-meta.sh", re.search(r"^\.\s+\S*scripts/plugin-meta\.sh", text, re.M) is not None)
         check(f"{rel} carries neither the GUID nor the target ABI", not (guid and guid.group(1) in text) and not (abi and abi.group(1) in text.replace("12.1.0.0", "")))
     p = subprocess.run([BASH, "-c", f". {meta}; plugin_first_meta 9.8.7.6"], capture_output=True, text=True)
     try:
@@ -988,6 +1026,8 @@ def test_shared_files(tmp):
     check("plugin_first_meta prints the first-install meta.json",
           doc.get("guid") == (guid.group(1) if guid else None) and doc.get("version") == "9.8.7.6" and doc.get("name") == "Jellyfin Plus"
           and doc.get("targetAbi") == (abi.group(1) if abi else None) and {"owner", "overview", "category"} <= set(doc), p.stdout + p.stderr)
+    stage_meta_check(tmp, "stage-plugin.sh", guid, abi, strip_source=False)
+    stage_meta_check(tmp, "stage-plugin.sh without its source line", guid, abi, strip_source=True)
 
     ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
     for pat in ("**/.env*", "**/*.pem", "**/*.key"):
