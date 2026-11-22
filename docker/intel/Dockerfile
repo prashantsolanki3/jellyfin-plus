@@ -94,12 +94,17 @@ RUN bash docker/intel/stage-plugin.sh /src "$JELLYFIN_BIN" /out/plugin-dist /out
 
 # The web client, built from web/src and injected into the web root now: the pod's root filesystem is
 # read-only, so the runtime injector (scripts/jellyfin-plus-webinject) cannot run there.
-RUN cd web && npm ci --no-audit --no-fund && cd .. \
- && bash scripts/build-web-panel.sh \
- && install -m 0644 web/jellyfin-plus.js /out/patcher/jellyfin-plus.js \
- && install -m 0644 web/theme/jellyfinplus.css /out/patcher/jellyfinplus-theme.css \
- && JP_WEB="$JELLYFIN_WEB" JP_SRC=/out/patcher/jellyfin-plus.js JP_THEME_SRC=/out/patcher/jellyfinplus-theme.css \
-    bash scripts/jellyfin-plus-webinject
+RUN set -eux; \
+    echo "web: npm ci"; \
+    (cd web && npm ci --no-audit --no-fund); \
+    echo "web: build"; \
+    bash scripts/build-web-panel.sh; \
+    echo "web: install bundle and theme"; \
+    install -m 0644 web/jellyfin-plus.js /out/patcher/jellyfin-plus.js; \
+    install -m 0644 web/theme/jellyfinplus.css /out/patcher/jellyfinplus-theme.css; \
+    echo "web: inject into $JELLYFIN_WEB"; \
+    JP_WEB="$JELLYFIN_WEB" JP_SRC=/out/patcher/jellyfin-plus.js JP_THEME_SRC=/out/patcher/jellyfinplus-theme.css \
+        bash scripts/jellyfin-plus-webinject
 
 # The shaders. install-shaders.sh fetches from mutable upstream URLs with no hash (a recorded gap).
 RUN bash scripts/install-shaders.sh /usr/share/jellyfin-shaders \

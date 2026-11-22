@@ -340,6 +340,7 @@ def dockerfile_checks(tmp):
     check("NVIDIA build variables absent", not re.search(r"GPU_VENDOR=nvidia|WITH_DLSS|WITH_OPTIX", df))
 
     build_apt_checks(df)
+    web_step_checks(df)
 
     ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
     need = ["scripts", "src", "web", "web/src", "shim", "assets", "ffmpeg", "docker", ".", "web/theme", "patches"]
@@ -358,12 +359,76 @@ def dockerfile_checks(tmp):
     check("the Intel filter list the image checks is oidn ort", out == ["oidn", "ort"], str(out))
 
 
+def web_step(df):
+    """The build stage's RUN that builds the client and injects it (the one that failed silently in CI)."""
+    for m in re.finditer(r"^RUN (?:[^\n]*\\\n)*[^\n]*", df, re.M):
+        if "jellyfin-plus-webinject" in m.group(0):
+            return m.group(0)
+    return ""
+
+
+def web_step_checks(df):
+    step = web_step(df)
+    check("the Dockerfile has the web build and inject step", "jellyfin-plus-webinject" in step)
+    check("the web step starts with set -eux so a failure names its command",
+          bool(re.match(r"RUN set -[a-z]*e[a-z]*x[a-z]*;", step) or re.match(r"RUN set -[a-z]*x[a-z]*e[a-z]*;", step)), step[:60])
+    check("the web step echoes which phase it is in", len(re.findall(r"\becho\b", step)) >= 3, step)
+
+    # JP_SRC / JP_THEME_SRC must name the files the step installs just before it injects.
+    installed = re.findall(r"install -m 0644 \S+ ([^\s;]+)", step)
+    src = re.search(r"JP_SRC=(\S+)", step)
+    theme = re.search(r"JP_THEME_SRC=(\S+)", step)
+    check("JP_SRC is the installed client bundle", bool(src) and src.group(1) in installed, f"{installed}")
+    check("JP_THEME_SRC is the installed theme css", bool(theme) and theme.group(1) in installed, f"{installed}")
+    check("the step injects into $JELLYFIN_WEB", 'JP_WEB="$JELLYFIN_WEB"' in step)
+    check("the step runs after stage-plugin.sh creates /out/patcher",
+          0 <= df.find("stage-plugin.sh /src") < df.find(step[:40]) if step else False)
+
+
+def test_webinject_without_dpkg_package(tmp):
+    """The injector must not abort silently when jellyfin-web is a plain tree, not a dpkg package.
+
+    In the image build stage dpkg-query exits 1 for jellyfin-web; under set -e + pipefail that killed the
+    script before any output (Arc image build, step 12/13).
+    """
+    web = os.path.join(tmp, "web")
+    os.makedirs(os.path.join(web, "themes", "dark"))
+    open(os.path.join(web, "index.html"), "w").write(
+        '<html><head><title>x</title><script defer="defer" src="main.js"></script></head><body></body></html>')
+    open(os.path.join(web, "config.json"), "w").write('{"themes": []}')
+    open(os.path.join(web, "themes", "dark", "theme.css"), "w").write("")
+    src = os.path.join(tmp, "src.js")
+    open(src, "w").write("// bundle\n")
+    css = os.path.join(tmp, "theme.css")
+    open(css, "w").write("/* theme */\n")
+
+    stubs = os.path.join(tmp, "stubs")
+    os.makedirs(stubs)
+    p = os.path.join(stubs, "dpkg-query")
+    open(p, "w").write("#!/bin/sh\nexit 1\n")
+    os.chmod(p, 0o755)
+
+    env = clean_env({"JP_WEB": web, "JP_SRC": src, "JP_THEME_SRC": css}, path=stubs)
+    env.pop("JP_CONF_MD5", None)
+    rc, out, err = run(os.path.join(HERE, "jellyfin-plus-webinject"), [], env)
+    check("webinject exits 0 when dpkg-query fails", rc == 0, f"rc={rc} out={out!r} err={err!r}")
+    check("webinject reports the index.html hook", "index.html hooked" in out, out)
+    check("webinject installed jellyfin-plus.js", os.path.isfile(os.path.join(web, "jellyfin-plus.js")))
+    html = open(os.path.join(web, "index.html")).read()
+    check("index.html carries the script tag", "jellyfin-plus.js?v=" in html)
+    check("the theme was installed", os.path.isfile(os.path.join(web, "themes", "jellyfinplus", "theme.css")), out)
+
+    # the apt hook's pre-dpkg call reads the same md5, so it must not die either
+    rc, out, err = run(os.path.join(HERE, "jellyfin-plus-webinject"), ["--restore-conffile"], env)
+    check("--restore-conffile exits 0 when dpkg-query fails", rc == 0, f"rc={rc} err={err!r}")
+
+
 def main():
     if not BASH:
         print("no bash")
         return 1
     with tempfile.TemporaryDirectory() as tmp:
-        for part in (test_plan_and_refusals, test_stub_run, test_mutants):
+        for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
             part(sub)
