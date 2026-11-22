@@ -127,10 +127,11 @@ LABEL org.opencontainers.image.title="jellyfin-plus-arc" \
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Run-time libraries the new binary links (named by the build stage), and jq for bench-intel.sh.
+# Run-time libraries the new binary links (named by the build stage), python3 for the shim (the base has
+# none; full python3, not -minimal: the shim imports json, subprocess and re), and jq for bench-intel.sh.
 COPY --from=build /out/runtime-packages.txt /tmp/runtime-packages.txt
 RUN apt-get update \
- && xargs -a /tmp/runtime-packages.txt apt-get install -y --no-install-recommends jq \
+ && xargs -a /tmp/runtime-packages.txt apt-get install -y --no-install-recommends python3 jq \
  && rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
 
 COPY --from=build /usr/lib/jellyfin-ffmpeg-oidn /usr/lib/jellyfin-ffmpeg-oidn
@@ -172,6 +173,8 @@ RUN --mount=type=bind,from=base-pkgs,source=/usr/lib/jellyfin-ffmpeg/ffmpeg,targ
     "$F" -hide_banner -hwaccels | grep -qx vaapi; \
     "$F" -hide_banner -encoders | grep -q h264_qsv; \
     cmp /tmp/base-ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg; \
+    v=$(/usr/local/bin/jellyfin-ffmpeg-upscale -version); \
+    echo "$v" | grep -q '^ffmpeg version'; \
     test -f /jellyfin/jellyfin-web/jellyfin-plus.js; \
     grep -q 'jellyfin-plus.js' /jellyfin/jellyfin-web/index.html; \
     test -f /usr/lib/jellyfin-plus/Jellyfin.Plugin.Plus.Patcher.dll; \

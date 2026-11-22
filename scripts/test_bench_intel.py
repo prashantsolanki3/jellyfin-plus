@@ -375,6 +375,56 @@ def local_libs_checks(df):
     check("mutant: a build stage that copies nothing is caught", bool(local_libs_failures(no_build)))
 
 
+SHIM_PATH = "/usr/local/bin/jellyfin-ffmpeg-upscale"
+
+
+def shim_interpreter_failures(df, shim_src):
+    """What lets an image ship whose shim Jellyfin cannot start (build 8: no python3, 'Failed to find valid ffmpeg').
+
+    The shim is a script, so its interpreter must be in the FINAL stage (the build stage's python3 does not
+    ship), and the acceptance RUN must make the exact call Jellyfin makes, not only test the real binary.
+    python3-minimal is not enough: json, subprocess and re live in the stdlib package only python3 pulls in.
+    """
+    bad = []
+    final = df.rpartition("\nFROM ")[2]
+    shebang = shim_src.split("\n", 1)[0]
+    if not re.search(r"^#!/usr/bin/env python3$", shebang):
+        bad.append(f"the shim's interpreter is no longer python3 ({shebang!r}); update this check")
+    apt = re.search(r"apt-get install[^\n]*(?:\\\n[^\n]*)*", final)
+    if not apt or not re.search(r"(?<![\w.-])python3(?![\w.-])", apt.group(0)):
+        bad.append("the final stage does not apt-get install python3 (python3-minimal does not count)")
+    copy = final.find("jellyfin-ffmpeg-upscale /usr/local/bin/jellyfin-ffmpeg-upscale")
+    call = final.find(f"$({SHIM_PATH} -version)")
+    if copy < 0:
+        bad.append("the final stage does not copy the shim")
+    if call < 0:
+        bad.append("the acceptance RUN does not run the shim with -version (the call Jellyfin makes)")
+    elif copy > call:
+        bad.append("the shim -version check runs before the shim is copied in")
+    if call >= 0 and "grep -q '^ffmpeg version'" not in final[call:]:
+        bad.append("the shim -version output is not required to start with 'ffmpeg version'")
+    return bad
+
+
+def shim_interpreter_checks(df):
+    shim_src = open(os.path.join(REPO, "shim", "jellyfin-ffmpeg-upscale")).read()
+    check("the final image carries the shim's interpreter and checks the shim", not shim_interpreter_failures(df, shim_src),
+          str(shim_interpreter_failures(df, shim_src)))
+    no_py = df.replace(" python3 jq", " jq")
+    check("mutant: no python3 in the final stage is caught", bool(shim_interpreter_failures(no_py, shim_src)))
+    minimal = df.replace(" python3 jq", " python3-minimal jq")
+    check("mutant: python3-minimal is caught", bool(shim_interpreter_failures(minimal, shim_src)))
+    no_call = df.replace(f"$({SHIM_PATH} -version)", "$(true)")
+    check("mutant: no shim -version check is caught", bool(shim_interpreter_failures(no_call, shim_src)))
+    no_grep = df.replace("grep -q '^ffmpeg version'", "true")
+    check("mutant: a shim check that does not read the output is caught", bool(shim_interpreter_failures(no_grep, shim_src)))
+    early = df.replace(f"$({SHIM_PATH} -version)", "$(true)").replace("ENV DEBIAN_FRONTEND=noninteractive\n",
+                       f"ENV DEBIAN_FRONTEND=noninteractive\nRUN v=$({SHIM_PATH} -version); echo \"$v\" | grep -q '^ffmpeg version'\n", 1)
+    check("mutant: a shim check before the shim is copied is caught", bool(shim_interpreter_failures(early, shim_src)))
+    other = shim_src.replace("#!/usr/bin/env python3", "#!/usr/bin/env python3.12", 1)
+    check("mutant: a changed shebang is caught", bool(shim_interpreter_failures(df, other)))
+
+
 def dockerfile_checks(tmp):
     df = open(DOCKERFILE).read()
     spec = open(SPEC).read()
@@ -401,6 +451,7 @@ def dockerfile_checks(tmp):
 
     build_apt_checks(df)
     local_libs_checks(df)
+    shim_interpreter_checks(df)
     web_step_checks(df)
 
     ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
