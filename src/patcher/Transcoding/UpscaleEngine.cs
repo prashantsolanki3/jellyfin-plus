@@ -3072,10 +3072,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
         ///
         /// Blank or "auto" means "follow the client", which is the old behaviour on request.
         /// </summary>
-        public static string EncoderFor(EncodingJobInfo state, out string reason)
+        public static string EncoderFor(EncodingJobInfo state, out string reason, DeviceInit devices = null)
         {
             string chosen = ChooseEncoder(state, out reason);
-            string guarded = GuardAv1(state, chosen, out string guardReason);
+            string guarded = GuardAv1(state, chosen, out string guardReason, devices);
             if (guardReason != null)
             {
                 reason = guardReason + "; " + reason;
@@ -3088,14 +3088,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// Swaps av1_nvenc for hevc_nvenc (h264_nvenc when the session cannot take HEVC) on a GPU
         /// without an AV1 encoder. ffmpeg lists av1_nvenc whenever it is compiled in, so the
         /// encoder list cannot catch this; the encoder only fails at open, killing the transcode.
-        /// reason is null when nothing was swapped.
+        /// reason is null when nothing was swapped. devices is the plan's resolved DeviceInit (null
+        /// only where no plan exists).
         /// </summary>
-        public static string GuardAv1(EncodingJobInfo state, string encoder, out string reason)
+        public static string GuardAv1(EncodingJobInfo state, string encoder, out string reason, DeviceInit devices = null)
         {
             reason = null;
             if (IsIntelPath())
             {
-                return GuardAv1Intel(state, encoder, out reason);
+                return GuardAv1Intel(state, encoder, out reason, devices);
             }
 
             if (!string.Equals(encoder, "av1_nvenc", StringComparison.OrdinalIgnoreCase) || Av1NvencUsable() != false)
@@ -3115,10 +3116,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// is test-encoded (once, remembered) and a failure swaps to hevc_qsv, or h264_qsv when the
         /// session cannot take HEVC. An inconclusive probe leaves the choice alone.
         /// </summary>
-        private static string GuardAv1Intel(EncodingJobInfo state, string encoder, out string reason)
+        private static string GuardAv1Intel(EncodingJobInfo state, string encoder, out string reason, DeviceInit devices)
         {
             reason = null;
-            if (!string.Equals(encoder, "av1_qsv", StringComparison.OrdinalIgnoreCase) || Av1QsvUsable(Devices()) != false)
+            if (!string.Equals(encoder, "av1_qsv", StringComparison.OrdinalIgnoreCase) || Av1QsvUsable(devices) != false)
             {
                 return encoder;
             }
@@ -3137,8 +3138,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private static bool? _av1Qsv;
         private static readonly object _av1QsvLock = new object();
 
-        /// <summary>Replaces the one-frame AV1 test encode (null result = inconclusive). For the tests.</summary>
-        internal static Func<bool?> Av1QsvProbeSource { get; set; }
+        /// <summary>Replaces the one-frame AV1 test encode (null result = inconclusive); receives the device the caller passed. For the tests.</summary>
+        internal static Func<DeviceInit, bool?> Av1QsvProbeSource { get; set; }
 
         /// <summary>
         /// Whether av1_qsv can open on this GPU, found by encoding one frame. Null when it could
@@ -3149,7 +3150,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         {
             if (Av1QsvProbeSource != null)
             {
-                return Av1QsvProbeSource();
+                return Av1QsvProbeSource(devices);
             }
 
             lock (_av1QsvLock)

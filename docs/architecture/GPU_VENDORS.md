@@ -185,7 +185,7 @@ report each with its own reason (`needs NVIDIA`, or "not measured on Intel" for 
 them) is enhanced without them, with `GpuWithheld` and the summary saying so, and that the same
 sessions on an NVIDIA box run them. A mutation check (the Intel gate off in the device resolution, in
 the level withholding and in the probe lists) failed 33, 12 and 6 of the earlier checks; the checks
-added for the review have not been run. The shim's `render_node` has its own 11 checks in
+added for the review have since been run and passed. The shim's `render_node` has its own 11 checks in
 `scripts/test-shim-device.py`, run by the
 script when python3 is present (the SDK container has none, so they were run separately).
 

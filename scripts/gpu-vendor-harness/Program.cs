@@ -514,7 +514,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.EncoderListSource = () => Encoders(list);
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Settings = new UpscaleSettings { Encoder = encoder, GpuVendor = setting };
         }
@@ -546,16 +546,27 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             // AV1 without an AV1 encoder in the GPU: the test encode fails and the choice swaps.
             OnIntel("auto", "auto", FullList);
-            UpscaleEngine.Av1QsvProbeSource = () => false;
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
             Equal("av1_qsv fails its test encode, client takes hevc: hevc_qsv", "hevc_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason));
             Equal("av1_qsv swap: the reason", "a test encode with av1_qsv failed on this GPU, used hevc_qsv instead of av1_qsv; Encoder set to auto; following the client-negotiated av1 (av1_qsv)", reason);
             Equal("av1_qsv fails its test encode, client takes only h264: h264_qsv", "h264_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "h264"), out reason));
-            UpscaleEngine.Av1QsvProbeSource = () => null;
+            UpscaleEngine.Av1QsvProbeSource = _ => null;
             Equal("an inconclusive AV1 test leaves av1_qsv alone", "av1_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason));
             Equal("GuardAv1 on Intel leaves other encoders alone", "hevc_qsv", UpscaleEngine.GuardAv1(null, "hevc_qsv", out reason));
             Check("GuardAv1 on Intel: nothing swapped, no reason", reason == null);
-            UpscaleEngine.Av1QsvProbeSource = () => false;
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
             Equal("GuardAv1 on Intel swaps a test-encode failure", "hevc_qsv", UpscaleEngine.GuardAv1(null, "av1_qsv", out reason));
+
+            // The plan's DeviceInit is the one the test encode runs on; GuardAv1Intel must not resolve its own.
+            var planDevices = new UpscaleEngine.DeviceInit { QsvArgs = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD999" };
+            UpscaleEngine.DeviceInit probed = null;
+            UpscaleEngine.Av1QsvProbeSource = d => { probed = d; return false; };
+            UpscaleEngine.GuardAv1(null, "av1_qsv", out reason, planDevices);
+            Check("GuardAv1 on Intel probes on the plan's DeviceInit, not a fresh Devices()", ReferenceEquals(probed, planDevices));
+            probed = null;
+            UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason, planDevices);
+            Check("EncoderFor hands the plan's DeviceInit to GuardAv1", ReferenceEquals(probed, planDevices));
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
 
             // The encoder list decides between QSV and software, and never produces VA-API or NVENC.
             OnIntel("auto", "auto", "libx264", "libx265", "hevc_vaapi", "h264_vaapi");
@@ -1028,7 +1039,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
 
             // What the probe held before, for an NVIDIA box with every file in place.
