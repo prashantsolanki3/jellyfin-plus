@@ -491,6 +491,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
             /// </summary>
             public bool HardwareDecode { get; set; }
 
+            /// <summary>The pixel format the chain downloads in after a hardware decode, derived from the source's pixel format by HardwareSurfaceFormat. Set together with HardwareDecode.</summary>
+            public string HardwareDecodeFormat { get; set; }
+
             /// <summary>Why HardwareDecode is what it is. Null when the setting is off or there is no detected Intel GPU, which keeps every other command and record as before.</summary>
             public string HardwareDecodeReason { get; set; }
 
@@ -1787,11 +1790,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         }
 
         /// <summary>
-        /// The pixel format the chain downloads in after a hardware decode. One constant because it
-        /// is inferred, not measured (GPU_VENDORS.md 5.6): the Vulkan frames keep the decoder's own
-        /// sw format, which for 8-bit VA-API decode is nv12.
+        /// The VA-API surface format a decode of this source pixel format downloads in, or null when
+        /// there is no hardware decode for it. The Vulkan frames keep the decoder's own sw format; for
+        /// 8-bit 4:2:0 that is nv12.
         /// </summary>
-        internal const string HardwareDecodeFormat = "nv12";
+        internal static string HardwareSurfaceFormat(string pixelFormat) =>
+            pixelFormat == "yuv420p" ? "nv12" : null;
 
         /// <summary>
         /// IntelHardwareDecode (GPU_VENDORS.md 5.6): decides once whether this session decodes on the
@@ -1850,7 +1854,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     return;
                 }
 
-                if (!HardwareDecodableSource(plan, videoStream, out string codec))
+                if (!HardwareDecodableSource(plan, videoStream, out string codec, out string surfaceFormat))
                 {
                     plan.HardwareDecodeReason = HardwareSourceReason;
                     return;
@@ -1887,11 +1891,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 }
 
                 plan.HardwareDecode = true;
+                plan.HardwareDecodeFormat = surfaceFormat;
                 plan.HardwareDecodeReason = "decoded on the Intel GPU (VA-API) and mapped to Vulkan";
             }
             catch (Exception ex)
             {
                 plan.HardwareDecode = false;
+                plan.HardwareDecodeFormat = null;
                 plan.HardwareDecodeReason = "software decode: error: " + ex.Message;
             }
         }
@@ -1917,11 +1923,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// software frames, hwmap into Vulkan then fails, and the stream dies instead of degrading.
         /// Anything Jellyfin would tone-map, deinterlace or rotate adds a node that has to see CPU
         /// frames, and a property that cannot be read counts as "no". The codec is the normalised
-        /// name (h264 or hevc) when this returns true.
+        /// name (h264 or hevc), and the surface format the chain downloads in, when this returns true.
         /// </summary>
-        private static bool HardwareDecodableSource(Plan plan, object stream, out string codec)
+        private static bool HardwareDecodableSource(Plan plan, object stream, out string codec, out string surfaceFormat)
         {
             codec = null;
+            surfaceFormat = null;
             if (plan.SourceSideways)
             {
                 return false;
@@ -1941,7 +1948,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
 
             string pixelFormat = (StreamValue(stream, "PixelFormat") as string ?? string.Empty).Trim().ToLowerInvariant();
-            if (pixelFormat != "yuv420p")
+            string format = HardwareSurfaceFormat(pixelFormat);
+            if (format == null)
             {
                 return false;
             }
@@ -1963,8 +1971,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
 
             string range = (StreamValue(stream, "VideoRangeType")?.ToString() ?? string.Empty).Trim();
-            return range.Length == 0 || string.Equals(range, "SDR", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(range, "Unknown", StringComparison.OrdinalIgnoreCase);
+            if (range.Length != 0 && !string.Equals(range, "SDR", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(range, "Unknown", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            codec = name;
+            surfaceFormat = format;
+            return true;
         }
 
         /// <summary>Replaces the startup test-decode (true, false, null for inconclusive). The tests set it; nothing in production does.</summary>
@@ -2107,7 +2122,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>
         /// The chain the start-up test decodes through: the production hardware-decode chain for a
         /// plain 2x upscale, so the hwmap into Vulkan, libplacebo on the imported surfaces and the
-        /// download to HardwareDecodeFormat are all exercised.
+        /// download to the surface format are all exercised.
         /// </summary>
         internal static string HardwareDecodeTestChain() =>
             BuildChain(new Plan
@@ -2116,6 +2131,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 Height = HardwareDecodeClipHeight * 2,
                 UpscaleApplied = true,
                 HardwareDecode = true,
+                HardwareDecodeFormat = HardwareSurfaceFormat("yuv420p"),
             });
 
         /// <summary>The stock ffmpeg command that writes a tiny 8-bit 4:2:0 clip of this codec (h264 Main or hevc Main), the source the gate admits.</summary>
@@ -4020,7 +4036,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 }
 
                 AppendLibplaceboSegment(hw, plan, cfg);
-                hw.Append(",hwdownload,format=").Append(HardwareDecodeFormat);
+                hw.Append(",hwdownload,format=").Append(plan.HardwareDecodeFormat ?? throw new InvalidOperationException("hardware decode without a surface format"));
                 return hw.ToString();
             }
 

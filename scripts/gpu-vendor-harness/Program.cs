@@ -1231,13 +1231,21 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("hardware decode: no hwupload and no format=yuv420p", !chain.Contains("hwupload") && !chain.Contains("yuv420p"), chain);
             Equal("hardware decode, literal plan: the chain",
                 "hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=nv12",
-                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, HardwareDecode = true }));
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
             Equal("hardware decode, literal plan with deband: the chain",
                 "hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:deband=1:deband_threshold=3:deband_grain=0,hwdownload,format=nv12",
-                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, DebandApplied = true, HardwareDecode = true }));
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, DebandApplied = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
             Equal("hardware decode, untagged range: tagged before the map",
                 "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=nv12",
-                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, RangeUntagged = true, HardwareDecode = true }));
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, RangeUntagged = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
+            Equal("the surface format of 8-bit 4:2:0 is nv12", "nv12", UpscaleEngine.HardwareSurfaceFormat("yuv420p"));
+            foreach (string other in new[] { "yuv420p10le", "yuv422p", "yuv444p", "p010le", "nv12", string.Empty, null })
+            {
+                Check("no surface format, so no hardware decode, for " + (other ?? "null"), UpscaleEngine.HardwareSurfaceFormat(other) == null);
+            }
+
+            Equal("the decided plan carries the derived format", "nv12", hw.HardwareDecodeFormat);
+            Check("a software plan carries no format", HwDecide(Machine("renderD128", "0x8086"), HwSettings(false), PlainHwJob("upscale", "1080")).HardwareDecodeFormat == null);
             Equal("the software chain with the same literal plan is the one it always was",
                 "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=yuv420p",
                 UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));

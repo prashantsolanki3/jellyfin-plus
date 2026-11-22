@@ -657,8 +657,8 @@ condition failed (`HardwareDecodeReason`):
    one definition of the path): stock ffmpeg cannot map VA-API frames to Vulkan;
 6. the start-up test has passed for the source's codec. It runs the production chain
    (`HardwareDecodeTestChain`, built by `BuildChain` with `HardwareDecode` set) with the production device
-   arguments (`HardwareDecodeDeviceArgs`) on a tiny generated h264 and hevc clip, so `HardwareDecodeFormat =
-   "nv12"` is exercised and not assumed. It runs on a thread-pool thread (`CachedProbe`, started at plugin
+   arguments (`HardwareDecodeDeviceArgs`) on a tiny generated h264 and hevc clip, so the download format
+   (`HardwareSurfaceFormat`) is exercised and not assumed. It runs on a thread-pool thread (`CachedProbe`, started at plugin
    load by `PrimeHardwareDecode` and by the first plan that finds nothing): a plan only reads the answer,
    so a session that arrives first decodes in software ("has not finished") and none waits. A pass is kept
    for the life of the process; a fail or a test that could not run is asked again after 60 s while the
@@ -674,8 +674,9 @@ so they follow the upscale on this path; the golden harness case pins both order
 
 Premises inferred from the source and not seen to work (P3 to P6): that `ffmpeg/0008` and `0009` make
 the VA-API to Vulkan `hwmap` negotiate; that `vk@va` derives a device the decoder's frames can be mapped
-into; that VA-API frames cannot enter a CPU node (hence the plan condition); and that the downloaded
-format is `nv12` (one constant, `HardwareDecodeFormat`).
+into; and that VA-API frames cannot enter a CPU node (hence the plan condition). The downloaded
+format is derived from the gated source pixel format (`HardwareSurfaceFormat`: `yuv420p` gives `nv12`,
+anything else has no hardware decode) and stored on the plan as `HardwareDecodeFormat`.
 
 The shim: stock jellyfin-ffmpeg failed `hwmap=derive_device=vulkan` from VA-API ("Conversion failed!"
 on the A380), and `0008`/`0009` exist only in the patched binary, so `pick_binary` routes a command
@@ -700,7 +701,7 @@ existing behaviour, not byte-identical in cost.)
 Still open and not changed by this: `DrmVulkanStarts` blocks the caller and caches a null for the life of
 the process, and `PrimeHardwareDecode` calls `Devices()` on its background task and so waits on it there.
 NOT VERIFIED on an Arc: that the test-decode passes, that the gate's profiles are the ones the driver
-decodes, that `-hwaccel_device va` is accepted with `vk@va`, and that `nv12` is the format downloaded.
+decodes, that `-hwaccel_device va` is accepted with `vk@va`, and that `nv12` is the format a real Arc downloads (the map is derived from the gated 4:2:0 source, not measured).
 
 ### 5.7 PR 8: a `GPU_VENDOR=intel` build, and the five-filter invariant
 
