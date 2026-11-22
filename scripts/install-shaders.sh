@@ -51,10 +51,25 @@ install -m 0644 "$TMP"/RCAS-2.0.glsl "$TMP"/RCAS-1.7.glsl "$TMP"/RCAS-1.4.glsl "
 # output is always larger than the source, so as published the pass would silently never run - a
 # no-op that measures as "no difference" and looks like a result. The guard is removed here, and
 # the two sharpness builds are cut from the same file so the licence header travels with them.
-NIS_URL=${NIS_GLSL_URL:-https://gist.githubusercontent.com/agyild/7e8951915b2bf24526a9343d951db214/raw}
+#
+# The gist's unversioned /raw URL serves whatever is newest, and it stopped being v1.0.2. The fetch
+# is pinned to one revision and each file is checked against its sha256 before anything reads it.
+NIS_REV=05f00864228871ffd157daa9beb2db8fa7412cfa
+NIS_URL=${NIS_GLSL_URL:-https://gist.githubusercontent.com/agyild/7e8951915b2bf24526a9343d951db214/raw/$NIS_REV}
+NIS_SHA256_NVScaler_glsl=${NIS_SCALER_SHA256:-bac778ec0108d272e4dad97794a3c257e65bbebd52aa762f95bce930cbd6b73c}
+NIS_SHA256_NVSharpen_glsl=${NIS_SHARPEN_SHA256:-3d51ac2a9da18284c1f77e46a019e783eac0c609924e6b32e8011889f54f9a12}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
 
 fetch_nis() {
     name=$1
+    want=$(eval "echo \$NIS_SHA256_${name//./_}")
     if [ -n "${NIS_DIR:-}" ]; then
         cp "$NIS_DIR/$name" "$TMP/$name"
     elif command -v curl >/dev/null 2>&1; then
@@ -63,6 +78,9 @@ fetch_nis() {
         wget -qO "$TMP/$name" "$NIS_URL/$name"
     fi
 
+    got=$(sha256_of "$TMP/$name")
+    [ "$got" = "$want" ] \
+        || { echo "$name sha256 is $got, expected $want (pinned revision $NIS_REV)" >&2; exit 1; }
     grep -q 'NVIDIA Image Scaling v1.0.2' "$TMP/$name" \
         || { echo "$name is not NVIDIA Image Scaling v1.0.2" >&2; exit 1; }
     grep -q 'Permission is hereby granted, free of charge' "$TMP/$name" \
