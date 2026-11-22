@@ -9,8 +9,13 @@ Needs no GPU, ffmpeg, docker, network or Jellyfin. It runs the real scripts/benc
     line, the thresholds, and the exact commands of rows 2, 7 and 9; it runs nothing and writes nothing;
   - the plan has no NVIDIA-only string in any command and follows the env overrides (node, title, clips);
   - each refusal exits 2 (bad row, unknown argument, BENCH_RUNS=0, no BENCH_ASSERT_QUIET);
-  - a hermetic run against stub ffmpeg/curl/jq: row 13 is MANUAL, every row lacking an input is SKIP
+  - a hermetic run against stub ffmpeg/curl: row 13 is MANUAL, every row lacking an input is SKIP
     and never PASS, and results.jsonl is written;
+  - runs against a fake Jellyfin (a stub curl serving JSON by path; real jq, or a stand-in when absent):
+    the API rows PASS on a good server and FAIL on a failing one, the token stays off curl's command
+    line, rows 1 and 12 read only the shim-log lines of this run, row 6 sets and restores the plugin
+    configuration, row 5 reads the device of its own stream, the gates read HHMM as decimal;
+  - scripts/plugin-meta.sh holds the plugin GUID and target ABI once (Plugin.cs and manifest.json agree);
   - docker/intel/Dockerfile keeps its pins (base digest, FSR2 commit, SDK sha512), builds the Intel
     variant, carries the acceptance checks, and its digest matches the spec page;
   - mutation: each deliberate breakage of bench-intel.sh is caught by the plan checks.
@@ -18,6 +23,7 @@ Needs no GPU, ffmpeg, docker, network or Jellyfin. It runs the real scripts/benc
 It does not build the image and does not run a row against a GPU. Exit status: 0 every check passed,
 1 a check failed.
 """
+import json
 import os
 import re
 import shutil
@@ -225,19 +231,290 @@ def test_plan_and_refusals(tmp):
     check("the gate refusal says gate", "gate:" in err, err)
 
 
-def stub_bin(tmp):
+JQ = shutil.which("jq")
+REAL_DATE = shutil.which("date")
+TOKEN = "tok-SECRET-4242"
+
+# Used only when this machine has no jq: it answers the exact filters bench-intel.sh sends and nothing
+# else, so a filter the script changes is a failure here, not a silent pass. Real jq is preferred.
+FAKE_JQ = r'''#!@PY@
+import json, re, sys
+
+args = sys.argv[1:]
+raw = compact = null_in = False
+named, rest, i = {}, [], 0
+while i < len(args):
+    a = args[i]
+    if a in ("-r", "--raw-output"):
+        raw = True
+    elif a in ("-c", "--compact-output"):
+        compact = True
+    elif a in ("-n", "--null-input"):
+        null_in = True
+    elif a in ("-nc", "-cn"):
+        null_in = compact = True
+    elif a == "--arg":
+        named[args[i + 1]] = args[i + 2]
+        i += 2
+    elif a == "--argjson":
+        named[args[i + 1]] = json.loads(args[i + 2])
+        i += 2
+    else:
+        rest.append(a)
+    i += 1
+flt = rest[0]
+data = None
+if not null_in:
+    text = sys.stdin.read()
+    if not text.strip():
+        sys.exit(0)
+    data = json.loads(text)
+
+
+def path(d, p):
+    for k in [k for k in p.split(".") if k]:
+        d = d.get(k) if isinstance(d, dict) else None
+    return d
+
+
+def emit(v):
+    if raw and isinstance(v, str):
+        print(v)
+    else:
+        print(json.dumps(v, separators=(",", ":")) if compact else json.dumps(v))
+
+
+m_alt = re.fullmatch(r"(\.[A-Za-z.]+) // (.+)", flt)
+m_ne = re.fullmatch(r"(\.[A-Za-z.]+) != false", flt)
+m_path = re.fullmatch(r"\.[A-Za-z.]+", flt)
+if flt == "{row:$row,status:$status,detail:$detail}":
+    emit({"row": named["row"], "status": named["status"], "detail": named["detail"]})
+elif flt == '[.Levels.Denoise[]?, .Levels.Neural[]?, .Levels.Game[]?] | join(" ")':
+    lv = data.get("Levels") or {}
+    emit(" ".join(lv.get("Denoise", []) + lv.get("Neural", []) + lv.get("Game", [])))
+elif flt == 'first(.Items[] | select(.Path | endswith("/" + $n)) | .Id) // empty':
+    for it in data.get("Items", []):
+        if it["Path"].endswith("/" + named["n"]):
+            emit(it["Id"])
+            break
+elif flt == 'first(.[] | select(.Name == "Jellyfin Plus") | .Id) // empty':
+    for it in data:
+        if it["Name"] == "Jellyfin Plus":
+            emit(it["Id"])
+            break
+elif flt == ".NeuralMaxSourceHeight = 480 | .NeuralAllowed = true":
+    data["NeuralMaxSourceHeight"] = 480
+    data["NeuralAllowed"] = True
+    emit(data)
+elif m_ne:
+    emit(path(data, m_ne.group(1)) is not False)
+elif m_alt:
+    v, d = path(data, m_alt.group(1)), m_alt.group(2).strip()
+    if v is None or v is False:
+        if d != "empty":
+            emit(json.loads(d))
+    else:
+        emit(v)
+elif m_path:
+    emit(path(data, flt))
+else:
+    sys.stderr.write("fake jq: unsupported filter: %s\n" % flt)
+    sys.exit(3)
+'''
+
+# The filter list is followed by thousands of lines, as the real binary's is: a `| grep -q` that quits at
+# its match then SIGPIPEs the writer, and under pipefail that reads as "no such filter".
+FFMPEG_STUB = r'''#!/bin/sh
+case "$*" in
+*-filters*)
+    for f in oidn ort fsr2 libplacebo xpsnr; do echo " T.. $f  V->V stub"; done
+    i=0; while [ $i -lt 4000 ]; do echo " T.. pad$i  V->V padding so the pipe fills"; i=$((i + 1)); done
+    exit 0;;
+*xpsnr=*)
+    case "$*" in *shader.mkv*) echo "XPSNR y: 40.0 u: 40.0 v: 40.0" >&2;; *) echo "XPSNR y: 30.0 u: 30.0 v: 30.0" >&2;; esac
+    exit 0;;
+*-benchmark*)
+    [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
+    printf 'frame=  240 fps=120\rbench: utime=1.0s stime=0.1s rtime=2.0s\n' >&2;;
+esac
+exit 0
+'''
+
+FFPROBE_STUB = '#!/bin/sh\ncase "$*" in *r_frame_rate*) echo 24/1;; *height,codec_name*) echo h264,1080;; *) echo h264;; esac\n'
+
+# `date +%H%M` is the only thing it fakes (FAKE_HM); everything else is the real date.
+DATE_STUB = '#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${FAKE_HM:-}" ]; then echo "$FAKE_HM"; exit 0; fi\ndone\nexec "$REAL_DATE" "$@"\n'
+
+# A fake Jellyfin: serves JSON by URL path from $FAKE_DIR/scenario.json, logs every call (argv, stdin,
+# POST body) to $FAKE_DIR/log.jsonl, and keeps the plugin configuration and started sessions in state.json.
+FAKE_CURL = r'''#!@PY@
+import json, os, sys, urllib.parse
+
+d = os.environ["FAKE_DIR"]
+argv = sys.argv[1:]
+sc = json.load(open(os.path.join(d, "scenario.json")))
+sp = os.path.join(d, "state.json")
+st = json.load(open(sp)) if os.path.exists(sp) else {"config": sc["config"], "sessions": {}}
+stdin = ""
+if "--config" in argv and argv[argv.index("--config") + 1] == "-":
+    stdin = sys.stdin.read()
+url = next((a for a in argv if a.startswith("http")), "")
+body = ""
+for i, a in enumerate(argv):
+    if a in ("-d", "--data", "--data-binary") and argv[i + 1].startswith("@"):
+        body = open(argv[i + 1][1:]).read()
+with open(os.path.join(d, "log.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": argv, "stdin": stdin, "url": url, "body": body}) + "\n")
+u = urllib.parse.urlparse(url)
+path, q = u.path, urllib.parse.parse_qs(u.query)
+
+
+def out(obj, raw=False):
+    sys.stdout.write(obj if raw else json.dumps(obj))
+    sys.exit(0)
+
+
+def fail():
+    sys.stderr.write("curl: (22) The requested URL returned error: 404\n")
+    sys.exit(22)
+
+
+def shimlog(text):
+    p = os.environ.get("FAKE_SHIM_LOG")
+    if p and text:
+        open(p, "a").write(text + "\n")
+
+
+def save():
+    json.dump(st, open(sp, "w"))
+
+
+if path == "/System/Info/Public":
+    out({"ServerName": "fake"})
+if sc.get("fail_all"):
+    fail()
+cfg_max = st["config"].get("NeuralMaxSourceHeight", 0)
+if path == "/Plugins":
+    out([{"Name": "Other", "Id": "0000"}, {"Name": "Jellyfin Plus", "Id": "plugin-guid"}])
+if path.startswith("/Plugins/") and path.endswith("/Configuration"):
+    if "-X" in argv and argv[argv.index("-X") + 1] == "POST":
+        st["config"] = json.loads(body)
+        save()
+        sys.exit(0)
+    out(st["config"])
+if path == "/JellyfinPlus/Status":
+    out({"Gpu": {"Vendor": "intel", "RenderNode": "/dev/dri/renderD128"}})
+if path == "/JellyfinPlus/Gpu/Load":
+    out({"gpuBusyPercent": 12})
+if path == "/Items":
+    out({"Items": [{"Id": "id%d" % h, "Path": "/media/tears_%dp.mkv" % h} for h in (360, 720, 1080, 2160)]})
+if path.startswith("/JellyfinPlus/Session/"):
+    sid = path.rsplit("/", 1)[1]
+    if sid == "bench-probe":
+        shimlog(sc.get("probe_logs"))
+    s = st["sessions"].get(sid)
+    if s is None:
+        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": ["off", "fsr2"]}
+        if cfg_max > 0 and sc.get("config_applies", True):
+            levels["NeuralMaxSourceHeight"] = cfg_max
+        out({"Known": False, "Levels": levels})
+    routing = None
+    if cfg_max > 0 and s["neural"] and s["src_height"] > cfg_max:
+        routing = "neural %s NOT run: the source is %dp, taller than NeuralMaxSourceHeight %d, so the shader path ran" % (
+            s["neural"], s["src_height"], cfg_max)
+    out({"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False),
+         "NeuralDevice": sc.get("device", "openvino"), "NeuralRouting": sc["routing"] if "routing" in sc else routing})
+if path.endswith("/master.m3u8"):
+    if sc.get("fail_master"):
+        fail()
+    sid = q["PlaySessionId"][0]
+    st["sessions"][sid] = {"src_height": int(path.split("/")[2][2:]), "neural": q.get("neural", [""])[0]}
+    save()
+    shimlog(sc.get("stream_logs"))
+    out("#EXTM3U\nmain.m3u8?PlaySessionId=" + sid + "\n", raw=True)
+if path.endswith("/main.m3u8"):
+    out("#EXTM3U\n" + "".join("hls1/main/%d.mp4\n" % i for i in range(7)), raw=True)
+if "/hls1/main/" in path:
+    if sc.get("fail_segments"):
+        fail()
+    out("segment-bytes", raw=True)
+fail()
+'''
+
+JSON_ROW = re.compile(r"^result: row (\d+) (\w+) ?(.*)$", re.M)
+
+
+def results(out):
+    """row number -> (status, detail) from the `result:` lines of a run."""
+    return {int(n): (s, d) for n, s, d in JSON_ROW.findall(out)}
+
+
+def stub_bin(tmp, fake_api=False):
+    """Stub tools; jq is the real one (the script writes JSONL with it). fake_api swaps curl for FAKE_CURL."""
     d = os.path.join(tmp, "stubs")
     os.makedirs(d)
-    for name, body in {
-        "ffmpeg": '#!/bin/sh\ncase "$*" in *-filters*) for f in oidn ort fsr2 libplacebo xpsnr; do echo " T.. $f  V->V stub"; done;; esac\n',
-        "ffprobe": "#!/bin/sh\nexit 0\n",
-        "curl": "#!/bin/sh\nexit 22\n",
-        "jq": "#!/bin/sh\nexit 0\n",
-    }.items():
+    bodies = {
+        "ffmpeg": FFMPEG_STUB,
+        "ffprobe": FFPROBE_STUB,
+        "date": DATE_STUB,
+        "curl": FAKE_CURL.replace("@PY@", sys.executable) if fake_api else "#!/bin/sh\nexit 22\n",
+    }
+    for name, body in bodies.items():
         p = os.path.join(d, name)
         open(p, "w").write(body)
         os.chmod(p, 0o755)
+    if JQ:
+        os.symlink(JQ, os.path.join(d, "jq"))
+    else:
+        p = os.path.join(d, "jq")
+        open(p, "w").write(FAKE_JQ.replace("@PY@", sys.executable))
+        os.chmod(p, 0o755)
+    open(os.path.join(d, "fsr2-nocuda"), "w").close()
     return d
+
+
+class World:
+    """One hermetic bench run: stub tools, a clips dir, a fake Jellyfin with a scenario, a shim log."""
+
+    def __init__(self, tmp, name, scenario=None, extra=None):
+        self.root = os.path.join(tmp, name)
+        os.makedirs(self.root)
+        self.stubs = stub_bin(self.root, fake_api=True)
+        self.clips = os.path.join(self.root, "clips")
+        self.out = os.path.join(self.root, "out")
+        self.fake = os.path.join(self.root, "fake")
+        self.shim = os.path.join(self.root, "shim.log")
+        os.makedirs(self.clips)
+        os.makedirs(self.fake)
+        open(self.shim, "w").close()
+        sc = {"config": {"NeuralAllowed": True, "NeuralMaxSourceHeight": 0, "Keep": "me"}}
+        sc.update(scenario or {})
+        self.config0 = dict(sc["config"])
+        json.dump(sc, open(os.path.join(self.fake, "scenario.json"), "w"))
+        ff = os.path.join(self.stubs, "ffmpeg")
+        self.env = clean_env(dict({
+            "BENCH_FFMPEG": ff, "BENCH_STOCK_FFMPEG": ff, "BENCH_CLIPS": self.clips, "BENCH_OUT": self.out,
+            "BENCH_JELLYFIN_URL": "http://jf.test", "BENCH_JELLYFIN_TOKEN": TOKEN, "BENCH_SHIM_LOG": self.shim,
+            "BENCH_RUNS": "1", "BENCH_CONFIRM_NO_GATES": "1", "FAKE_DIR": self.fake, "FAKE_SHIM_LOG": self.shim,
+            "REAL_DATE": REAL_DATE or "date"}, **(extra or {})), path=self.stubs)
+
+    def run(self, args, script=BENCH, **extra):
+        # the quiet-box gates read the real clock and /proc: the gate tests call run() themselves
+        return run(script, ["--no-gates", *args], dict(self.env, **extra))
+
+    def log(self):
+        p = os.path.join(self.fake, "log.jsonl")
+        return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+
+    def urls(self):
+        return [e["url"] for e in self.log() if e["url"]]
+
+    def posts(self):
+        return [json.loads(e["body"]) for e in self.log() if "POST" in e["argv"]]
+
+    def jsonl(self):
+        p = os.path.join(self.out, "results.jsonl")
+        return open(p).read().splitlines() if os.path.exists(p) else []
 
 
 def test_stub_run(tmp):
@@ -246,7 +523,7 @@ def test_stub_run(tmp):
     out = os.path.join(tmp, "out")
     os.makedirs(clips)
     env = clean_env({"BENCH_FFMPEG": os.path.join(stubs, "ffmpeg"), "BENCH_STOCK_FFMPEG": os.path.join(stubs, "ffmpeg"),
-                     "BENCH_CLIPS": clips, "BENCH_OUT": out}, path=stubs)
+                     "BENCH_CLIPS": clips, "BENCH_OUT": out, "BENCH_CONFIRM_NO_GATES": "1"}, path=stubs)
     rc, so, err = run(BENCH, ["--no-gates", "--rows", "1,5,6,7,8,10,11,12,13"], env)
     status = dict(re.findall(r"^result: row (\d+) (\w+)", so, re.M))
     check("stub run exits 0", rc == 0, f"rc={rc} {err}")
@@ -263,7 +540,7 @@ def test_stub_run(tmp):
     p = os.path.join(bare, "ffmpeg")
     open(p, "w").write("#!/bin/sh\nexit 0\n")
     os.chmod(p, 0o755)
-    for n in ("ffprobe", "curl", "jq"):
+    for n in ("ffprobe", "curl"):
         shutil.copy(os.path.join(stubs, n), bare)
     env2 = dict(env, BENCH_FFMPEG=p, BENCH_STOCK_FFMPEG=p, PATH=bare + os.pathsep + env["PATH"])
     rc, _, err = run(BENCH, ["--no-gates", "--rows", "13"], env2)
@@ -283,6 +560,14 @@ def test_mutants(tmp):
         path = mutant_dir(tmp, name, old, new)
         rc, out, _ = run(path, ["--dry-run"])
         check(f"mutant {name} is caught", rc != 0 or bool(plan_failures(out)))
+
+    for name, old, new, fn in [
+        ("octal-hhmm", "hm=$((10#$(TZ=Australia/Melbourne date +%H%M)))", "hm=$(TZ=Australia/Melbourne date +%H%M)", gate_failures),
+        ("run-fps-lost-failure", '|| { echo 0; rm -f "$log"; return 1; }', "|| true", runfps_failures),
+        ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"', 'curl -fsS -H "X-Emby-Token: $JF_TOKEN" "$@" "$JF_URL$p"', token_failures),
+    ]:
+        path = mutant_dir(tmp, name, old, new)
+        check(f"mutant {name} is caught by its behaviour check", bool(fn(path, tmp, "mut-" + name)))
 
 
 def build_apt_checks(df):
@@ -484,12 +769,239 @@ def test_webinject_without_dpkg_package(tmp):
     check("--restore-conffile exits 0 when dpkg-query fails", rc == 0, f"rc={rc} err={err!r}")
 
 
+GATE_CASES = [("0830", True), ("0900", True), ("0700", True), ("1200", True), ("1830", True),
+              ("0158", False), ("0100", False), ("0130", False), ("1630", False), ("1700", False)]
+PSI_OK = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+PSI_HOT = PSI_OK.replace("avg60=0.00", "avg60=5.00", 1)
+
+
+def gate_failures(script, tmp, tag):
+    """What the time-window and PSI gates get wrong (empty = right). `date +%H%M` is faked per case; the
+    leading-zero values 0830, 0900 and 0158 are the ones bash reads as invalid octal."""
+    bad = []
+    w = World(tmp, tag)
+    psi, hot = os.path.join(w.root, "psi"), os.path.join(w.root, "psi-hot")
+    open(psi, "w").write(PSI_OK)
+    open(hot, "w").write(PSI_HOT)
+    for hm, ok in GATE_CASES:
+        rc, out, err = run(script, ["--rows", "13"], dict(w.env, BENCH_ASSERT_QUIET="1", FAKE_HM=hm, BENCH_PSI_FILE=psi))
+        if ok and not (rc == 0 and "MANUAL" in out):
+            bad.append(f"{hm}:open-but-rc{rc}")
+        if not ok and not (rc == 2 and "gate:" in err):
+            bad.append(f"{hm}:closed-but-rc{rc}")
+    rc, out, err = run(script, ["--rows", "13"], dict(w.env, BENCH_ASSERT_QUIET="1", FAKE_HM="1200", BENCH_PSI_FILE=hot))
+    if not (rc == 2 and "PSI" in err):
+        bad.append(f"psi:rc{rc}")
+    return bad
+
+
+def runfps_failures(script, tmp, tag):
+    """A failed ffmpeg run must reach the FAIL branch of rows 2 and 11; a good one must still pass row 11."""
+    bad = []
+    w = World(tmp, tag, extra={"BENCH_JELLYFIN_TOKEN": "", "BENCH_PLEX_TRANSCODING": "1"})
+    rc, out, err = w.run(["--rows", "2,11"], script=script, FAKE_FFMPEG_FAIL="1")
+    res = results(out)
+    for row in (2, 11):
+        st, detail = res.get(row, ("", ""))
+        if st != "FAIL" or "ffmpeg failed" not in detail:
+            bad.append(f"row{row}:{st}:{detail[:40]}")
+    rc, out, err = w.run(["--rows", "11"], script=script)
+    st, detail = results(out).get(11, ("", ""))
+    if st != "PASS" or "fps=120" not in detail:
+        bad.append(f"row11-good:{st}:{detail[:40]}")
+    return bad
+
+
+def token_failures(script, tmp, tag):
+    """The admin token goes to curl on stdin (--config -), never on its command line, on every call."""
+    bad = []
+    w = World(tmp, tag)
+    w.run(["--rows", "3"], script=script)
+    log = w.log()
+    if not log:
+        return ["no curl call logged"]
+    if any(TOKEN in " ".join(e["argv"]) for e in log):
+        bad.append("token on argv")
+    if not all(TOKEN in e["stdin"] for e in log):
+        bad.append("token missing from stdin on some call")
+    if not all("--config" in e["argv"] for e in log):
+        bad.append("not --config -")
+    return bad
+
+
+def test_gates_and_confirmation(tmp):
+    bad = gate_failures(BENCH, tmp, "gates")
+    check("the window and PSI gates read HHMM as decimal", not bad, str(bad))
+
+    w = World(tmp, "nogates")
+    rc, out, err = w.run(["--no-gates", "--rows", "13"], BENCH_CONFIRM_NO_GATES="")
+    check("--no-gates without BENCH_CONFIRM_NO_GATES=1 exits 2", rc == 2 and "BENCH_CONFIRM_NO_GATES" in err, f"rc={rc} {err}")
+    rc, out, err = w.run(["--no-gates", "--rows", "13"])
+    check("--no-gates with BENCH_CONFIRM_NO_GATES=1 proceeds", rc == 0 and "MANUAL" in out, f"rc={rc} {err}")
+    rc, out, err = w.run(["--help"])
+    check("--help names --no-gates and its confirmation", rc == 0 and "--no-gates" in out and "BENCH_CONFIRM_NO_GATES" in out, out)
+
+
+def test_hermetic_api(tmp):
+    """The run against a fake Jellyfin (a stub curl serving JSON by path) and the real jq."""
+    # every call is judged, even when each one works
+    w = World(tmp, "happy", {"stream_logs": "libplacebo=w=1920"})
+    rc, out, err = w.run(["--rows", "2,3,4,12"])
+    res = results(out)
+    check("happy run exits 0 with a summary", rc == 0 and "summary:" in out, f"rc={rc} {err} {out[-300:]}")
+    check("rows 2, 3, 4 and 12 PASS against the fake API", all(res.get(r, ("",))[0] == "PASS" for r in (2, 3, 4, 12)), str(res))
+    segs = [u for u in w.urls() if "/hls1/main/" in u]
+    check("each of the 6 streams fetches its 5 segments (the loop keeps its token)", len(segs) == 6 * 5, str(len(segs)))
+    check("a dying stream is not what passes: row 12 saw each height", all(f"{h}p:" in res.get(12, ("", ""))[1] for h in (480, 720, 1080, 2160)), str(res.get(12)))
+
+    # item 2: an API that answers only /System/Info/Public
+    w = World(tmp, "failall", {"fail_all": True}, {"BENCH_ORT_MODEL": "/m/model.onnx"})
+    rc, out, err = w.run(["--rows", "3,4,5,6,10,12"])
+    res = results(out)
+    check("every row that calls a failing API records FAIL", all(res.get(r, ("",))[0] == "FAIL" for r in (3, 4, 5, 6, 10, 12)), f"{res} {err}")
+    check("the run still prints summary: and exits 1", rc == 1 and "summary:" in out, f"rc={rc} {err}")
+    w = World(tmp, "failmaster", {"fail_master": True})
+    rc, out, err = w.run(["--rows", "3,4,10,12"])
+    res = results(out)
+    check("a stream that cannot start records FAIL for rows 3, 4, 10 and 12", all(res.get(r, ("",))[0] == "FAIL" for r in (3, 4, 10, 12)) and "summary:" in out, f"{res} {err}")
+    w = World(tmp, "failseg", {"fail_segments": True})
+    rc, out, err = w.run(["--rows", "3,12"])
+    res = results(out)
+    check("a stream with no segment is a FAIL, not a 0x PASS", res.get(3, ("",))[0] == "FAIL" and res.get(12, ("",))[0] == "FAIL", str(res))
+
+    bad = token_failures(BENCH, tmp, "token")
+    check("the token is on curl's stdin, not its command line", not bad, str(bad))
+    bad = runfps_failures(BENCH, tmp, "runfps")
+    check("a failed ffmpeg run reaches the FAIL branch of rows 2 and 11", not bad, str(bad))
+
+
+def test_row_1_scope(tmp):
+    w = World(tmp, "row1-old")
+    open(w.shim, "w").write("old session: h264_nvenc\n")
+    rc, out, err = w.run(["--rows", "1"])
+    st, detail = results(out).get(1, ("", ""))
+    check("row 1 ignores shim-log lines written before the run", st == "PASS", f"{st} {detail} {err}")
+    w = World(tmp, "row1-new", {"probe_logs": "new session: h264_nvenc"})
+    open(w.shim, "w").write("old line\n")
+    rc, out, err = w.run(["--rows", "1"])
+    st, detail = results(out).get(1, ("", ""))
+    check("row 1 fails on an nvenc line written during the run", st == "FAIL" and "nvenc/cuda-in-log" in detail, f"{st} {detail}")
+    w = World(tmp, "row12-old")
+    open(w.shim, "w").write("old libplacebo line\n")
+    rc, out, err = w.run(["--rows", "12"])
+    st, detail = results(out).get(12, ("", ""))
+    check("row 12 does not take an old libplacebo line as this run's", st == "FAIL" and "no-libplacebo-in-log" in detail, f"{st} {detail}")
+    w = World(tmp, "row12-new", {"stream_logs": "libplacebo=w=1920"})
+    rc, out, err = w.run(["--rows", "12"])
+    check("row 12 passes on a libplacebo line written during the run", results(out).get(12, ("",))[0] == "PASS", str(results(out)))
+
+
+def row6_case(tmp, tag, scenario=None, **extra):
+    w = World(tmp, tag, scenario, extra={"BENCH_ORT_MODEL": "/m/model.onnx"})
+    rc, out, err = w.run(["--rows", "6"], **extra)
+    return w, rc, out, err, results(out).get(6, ("", ""))
+
+
+def test_row_6(tmp):
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-pass")
+    check("row 6 PASSes when the 720p source is routed to the shader path", st == "PASS", f"{st} {detail} {err}")
+    masters = [u for u in w.urls() if "master.m3u8" in u]
+    check("row 6 asks for a real neural level, never `fast`",
+          len(masters) == 1 and "neural=realesr-anime-x2" in masters[0] and "neural=fast" not in masters[0], str(masters))
+    check("row 6 streams the 720p item", bool(masters) and "/Videos/id720/" in masters[0], str(masters))
+    posts = w.posts()
+    check("row 6 sets NeuralMaxSourceHeight=480 (and NeuralAllowed) then restores the configuration",
+          len(posts) == 2 and posts[0].get("NeuralMaxSourceHeight") == 480 and posts[0].get("NeuralAllowed") is True
+          and posts[0].get("Keep") == "me" and posts[1] == w.config0, str(posts))
+
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-already", {"config": {"NeuralAllowed": True, "NeuralMaxSourceHeight": 480}})
+    check("row 6 leaves a configuration that is already right alone", st == "PASS" and not w.posts(), f"{st} {detail} {w.posts()}")
+
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-noapply", {"config_applies": False})
+    check("row 6 FAILs, saying how to fix it, when the probe does not show 480",
+          st == "FAIL" and "NeuralMaxSourceHeight" in detail and w.posts()[-1] == w.config0, f"{st} {detail}")
+
+    for tag, scn in [("chosen", {"routing": "neural realesr-anime-x2 was chosen"}), ("none", {"routing": None}),
+                     ("applied", {"applied": True})]:
+        w, rc, out, err, (st, detail) = row6_case(tmp, "r6-" + tag, scn)
+        check(f"row 6 FAILs on a record that is not the NOT-run wording ({tag})", st == "FAIL", f"{st} {detail}")
+
+    rc, out, err = World(tmp, "r6-fast").run(["--rows", "6"], BENCH_NEURAL_LEVEL="fast")
+    check("BENCH_NEURAL_LEVEL=fast is refused (it is not a level)", rc == 2 and "BENCH_NEURAL_LEVEL" in err, f"rc={rc} {err}")
+
+    # a server-supplied string with quotes, a backslash and a newline must not break results.jsonl
+    nasty = 'say "hi" \\ back\nline two'
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-json", {"routing": nasty})
+    lines = w.jsonl()
+    parsed = []
+    for l in lines:
+        try:
+            parsed.append(json.loads(l))
+        except ValueError:
+            parsed.append(None)
+    check("every results.jsonl line is valid JSON", bool(lines) and all(parsed), str(lines))
+    check("a detail with quotes, a backslash and a newline round-trips",
+          bool(parsed) and parsed[-1] is not None and nasty in parsed[-1]["detail"] and parsed[-1]["status"] == "FAIL", str(lines))
+    check("a multi-line detail stays on one result: line", "\nline two" not in out and "back line two" in out, out)
+
+
+def test_row_5(tmp):
+    extra = {"BENCH_ORT_MODEL": "/m/model.onnx"}
+    w = World(tmp, "r5-ok", extra=extra)
+    rc, out, err = w.run(["--rows", "5"])
+    st, detail = results(out).get(5, ("", ""))
+    check("row 5 on openvino is MANUAL with the device recorded", st == "MANUAL" and "device=openvino" in detail, f"{st} {detail} {err}")
+    urls = w.urls()
+    stream = next((i for i, u in enumerate(urls) if "master.m3u8" in u and "neural=realesr-anime-x2" in u), -1)
+    sid = re.search(r"PlaySessionId=([^&]+)", urls[stream]).group(1) if stream >= 0 else ""
+    sess = next((i for i, u in enumerate(urls) if u.endswith("/JellyfinPlus/Session/" + sid)), -1) if sid else -1
+    check("row 5 starts its neural stream before it reads that stream's session", 0 <= stream < sess, f"{stream} {sess} {urls}")
+    check("row 5 streams the 360p item", stream >= 0 and "/Videos/id360/" in urls[stream], str(urls[:2]))
+    w = World(tmp, "r5-cpu", {"device": "cpu"}, extra)
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 FAILs on a CPU fallback", st == "FAIL" and "cpu" in detail, f"{st} {detail}")
+    w = World(tmp, "r5-nostream", {"fail_master": True}, extra)
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 FAILs when its stream cannot start", st == "FAIL", f"{st} {detail}")
+
+
+def test_shared_files(tmp):
+    meta = os.path.join(HERE, "plugin-meta.sh")
+    check("scripts/plugin-meta.sh exists", os.path.isfile(meta))
+    src = open(meta).read() if os.path.isfile(meta) else ""
+    guid = re.search(r"^PLUGIN_GUID=\"?([0-9a-f-]{36})", src, re.M)
+    abi = re.search(r"^PLUGIN_TARGET_ABI=\"?([0-9.]+)", src, re.M)
+    plugin_cs = open(os.path.join(REPO, "src", "Plugin.cs")).read()
+    manifest = json.load(open(os.path.join(REPO, "manifest.json")))[0]
+    check("plugin-meta.sh GUID is Plugin.cs's Id", bool(guid) and f'Guid.Parse("{guid.group(1)}")' in plugin_cs)
+    check("plugin-meta.sh GUID is manifest.json's", bool(guid) and manifest["guid"] == guid.group(1))
+    check("plugin-meta.sh target ABI is manifest.json's", bool(abi) and manifest["versions"][0]["targetAbi"] == abi.group(1))
+    for rel in ("scripts/proxmox-build.sh", "docker/intel/stage-plugin.sh"):
+        text = open(os.path.join(REPO, rel)).read()
+        check(f"{rel} sources plugin-meta.sh", "plugin-meta.sh" in text)
+        check(f"{rel} carries neither the GUID nor the target ABI", not (guid and guid.group(1) in text) and not (abi and abi.group(1) in text.replace("12.1.0.0", "")))
+    p = subprocess.run([BASH, "-c", f". {meta}; plugin_first_meta 9.8.7.6"], capture_output=True, text=True)
+    try:
+        doc = json.loads(p.stdout)
+    except ValueError:
+        doc = {}
+    check("plugin_first_meta prints the first-install meta.json",
+          doc.get("guid") == (guid.group(1) if guid else None) and doc.get("version") == "9.8.7.6" and doc.get("name") == "Jellyfin Plus"
+          and doc.get("targetAbi") == (abi.group(1) if abi else None) and {"owner", "overview", "category"} <= set(doc), p.stdout + p.stderr)
+
+    ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
+    for pat in ("**/.env*", "**/*.pem", "**/*.key"):
+        check(f"Dockerfile.dockerignore excludes {pat}", pat in ignore, str(ignore))
+
+
 def main():
     if not BASH:
         print("no bash")
         return 1
     with tempfile.TemporaryDirectory() as tmp:
-        for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package):
+        for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
+                     test_gates_and_confirmation, test_hermetic_api, test_row_1_scope, test_row_6, test_row_5,
+                     test_shared_files):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
             part(sub)
