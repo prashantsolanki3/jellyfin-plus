@@ -78,12 +78,14 @@ RUN GPU_VENDOR=intel WITH_ORT=1 ORT_EP=openvino WITH_FSR2=1 \
     bash scripts/build-ffmpeg.sh
 
 # The apt packages the new binary needs at run time that the base does not carry, named from its own ldd
-# so the final stage installs exactly those and nothing is guessed.
+# so the final stage installs exactly those and nothing is guessed. A library built from source under
+# /usr/local (shaderc: the distro one breaks nlmeans_vulkan) has no package, so it is copied under the
+# soname the binary asks for and the final stage carries it.
 COPY --from=base-pkgs /base-pkgs.txt /base-pkgs.txt
-RUN set -eu; mkdir -p /out; P=/usr/lib/jellyfin-ffmpeg-oidn; \
-    ldd "$P/ffmpeg" | awk '/=>/ && $3 ~ /^\// { print $3 }' | while read -r l; do \
+RUN set -eu; mkdir -p /out/local-libs; P=/usr/lib/jellyfin-ffmpeg-oidn; \
+    ldd "$P/ffmpeg" | awk '/=>/ && $3 ~ /^\// { print $1, $3 }' | while read -r n l; do \
         r=$(readlink -f "$l"); \
-        case "$r" in "$P"/*) continue ;; esac; \
+        case "$r" in "$P"/*) continue ;; /usr/local/*) cp "$r" "/out/local-libs/$n"; echo "local: $n" >&2; continue ;; esac; \
         dpkg -S "$r" 2>/dev/null | head -1 | cut -d: -f1; \
     done | sort -u > /tmp/needed.txt; \
     comm -23 /tmp/needed.txt /base-pkgs.txt > /out/runtime-packages.txt; \
@@ -132,6 +134,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
 
 COPY --from=build /usr/lib/jellyfin-ffmpeg-oidn /usr/lib/jellyfin-ffmpeg-oidn
+# The base lists /usr/local/lib in /etc/ld.so.conf.d/libc.conf (checked on the pinned image); the cache
+# is rebuilt here, before the acceptance check below resolves the binary's libraries.
+COPY --from=build /out/local-libs/ /usr/local/lib/
+RUN ldconfig
 COPY --from=build /out/patcher /usr/lib/jellyfin-plus
 COPY --from=build /out/plugin-dist /usr/lib/jellyfin-plus-dist
 COPY --from=build /usr/share/jellyfin-shaders /usr/share/jellyfin-shaders
