@@ -47,24 +47,26 @@ OUT = "/clips/bench-out"
 
 
 def shader(w, h):
-    # ANV's YUV output from libplacebo is broken (green frames): the Intel chains end in RGBA and convert on the CPU
+    # libplacebo writes yuv420p and the frame is downloaded as is: the RGBA tail it replaced cost ~18 dB (rev-8j46u)
     return (f"format=yuv420p,hwupload,libplacebo=w={w}:h={h}:upscaler=ewa_lanczos:custom_shader_path={SHADER}:"
-            f"format=rgba,hwdownload,format=rgba,format=yuv420p")
+            f"{YUV_END}")
 
 
 def bicubic(w, h):
     return f"scale={w}:{h}:flags=bicubic,format=yuv420p"
 
 
+YUV_END = "format=yuv420p,hwdownload,format=yuv420p"
+# the tail the bench and production used until rev-8j46u: every chain that carries it is a regression
+RGBA_TAIL = "format=rgba,hwdownload,format=rgba"
 FSR2_CHAIN = ("format=yuv420p,format=gbrpf32le,fsr2=w=1920:h=1080,format=yuv420p,hwupload,"
-              "libplacebo=w=1920:h=1080:format=rgba,hwdownload,format=rgba,format=yuv420p")
-RGBA_END = "format=rgba,hwdownload,format=rgba,format=yuv420p"
-# the working VA-API path: decode on the GPU, download, upload to Vulkan, libplacebo to RGBA, download, CPU yuv420p
+              f"libplacebo=w=1920:h=1080:{YUV_END}")
+# the working VA-API path: decode on the GPU, download, upload to Vulkan, libplacebo to yuv420p, download
 HWDEC_CHAIN = (f"hwdownload,format=nv12,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:"
-               f"custom_shader_path={SHADER}:{RGBA_END}")
+               f"custom_shader_path={SHADER}:{YUV_END}")
 # the zero-copy path, tried once: it fails on this ANV with VK_ERROR_DEVICE_LOST
 ZEROCOPY_CHAIN = (f"setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:"
-                  f"custom_shader_path={SHADER}:{RGBA_END}")
+                  f"custom_shader_path={SHADER}:{YUV_END}")
 STOCK = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
 H264 = f"{OUT}/tears_1080p_h264.mkv"
 PREP = f"{STOCK} -hide_banner -nostdin -y -i /clips/tears_1080p.mkv -c:v libx264 -crf 12 -preset fast -an {OUT}/tears_1080p_h264.part.mkv"
@@ -100,9 +102,9 @@ TITLES = {
 # A fragment each row's must-pass line has to carry (the figures the owner's decision names).
 MUST = {
     1: ["vendor=intel", "Vulkan vk@dr", "no nvenc/cuda string"],
-    2: ["fps>=100", "bicubic+0.5dB"],
-    3: ["fps>=1.2x source fps", "bicubic+0.3dB"],
-    4: ["scaler-only fps>=34", "QSV encode >=1.2x", "bicubic+0.3dB"],
+    2: ["fps>=100", "bicubic+0.5dB", "chroma xpsnr>=25dB"],
+    3: ["fps>=1.2x source fps", "bicubic+0.3dB", "chroma xpsnr>=25dB"],
+    4: ["scaler-only fps>=34", "QSV encode >=1.2x", "bicubic+0.3dB", "chroma xpsnr>=25dB"],
     5: ["device=openvino", "slower than real time is a valid result"],
     6: ["NeuralMaxSourceHeight=480", "shader path"],
     7: ["ceil(8*scale^2)", "<=0.5", "<=16 in 99%", "control exactly 0"],
@@ -197,10 +199,11 @@ def plan_failures(text):
     for l in lines:
         if " cmd: " in l and re.search(r"nvenc|cuda|cuvid|nvdec", l, re.I):
             bad.append("nvidia-in-cmd")
-        # every libplacebo chain (not the ort ones, row 5) hands RGBA to the CPU: ANV's YUV output is green
-        if " cmd: " in l and "libplacebo" in l and "ort=" not in l and not re.search(
-                r"libplacebo=[^ ]*:format=rgba,hwdownload,format=rgba,format=yuv420p(,| |$)", l):
-            bad.append("yuv-libplacebo-output:" + l[-80:])
+        # every libplacebo chain (not the ort ones, row 5) writes yuv420p and downloads it; the RGBA tail loses ~18 dB
+        if " cmd: " in l and "libplacebo" in l and "ort=" not in l and (
+                RGBA_TAIL in l or not re.search(
+                    r"libplacebo=[^ ]*:format=yuv420p,hwdownload,format=yuv420p(,| |$)", l)):
+            bad.append("libplacebo-tail:" + l[-80:])
     if f"drm=dr:{NODE}" not in text:
         bad.append("no-drm-device")
     return bad
@@ -370,7 +373,10 @@ case "$*" in
     *shader.mkv* | *pan-fsr2.mkv*) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=30 || y=40;;
     *) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=40 || y=30;;
     esac
-    echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: $y.0000  u: $y.0000  v: $y.0000" >&2
+    # FAKE_XPSNR_GREEN=1: the shader outputs keep their luma score but have lost their chroma, as ANV's green frames did
+    c=$y
+    case "$*" in *shader.mkv*) [ "${FAKE_XPSNR_GREEN:-}" = 1 ] && c=3;; esac
+    echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: $y.0000  u: $c.0000  v: $c.0000" >&2
     exit 0;;
 *libx264*)
     # the H.264 cut of row 9: FAKE_PREP_FAIL=1 fails it, else it writes its last argument (the output)
@@ -673,8 +679,11 @@ def test_mutants(tmp):
         ("skip-frames", "v = 8 * s * s", "v = 4 * s * s"),
         ("row-order", "ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)", "ALL_ROWS=(2 1 3 4 5 6 7 8 9 10 11 12 13)"),
         ("title", '"Vendor record"', '"Vendor"'),
-        ("shader-yuv-end", 'custom_shader_path=$SHADER:$RGBA_END"; }', 'custom_shader_path=$SHADER,hwdownload,format=yuv420p"; }'),
-        ("fsr2-yuv-end", 'libplacebo=w=$1:h=$2:$RGBA_END"; }\n# chain_hwdec', 'libplacebo=w=$1:h=$2,hwdownload,format=yuv420p"; }\n# chain_hwdec'),
+        ("shader-rgba-end", 'custom_shader_path=$SHADER:$YUV_END"; }', 'custom_shader_path=$SHADER:format=rgba,hwdownload,format=rgba,format=yuv420p"; }'),
+        ("fsr2-rgba-end", 'libplacebo=w=$1:h=$2:$YUV_END"; }\n# chain_hwdec', 'libplacebo=w=$1:h=$2:format=rgba,hwdownload,format=rgba,format=yuv420p"; }\n# chain_hwdec'),
+        ("shader-no-yuv-format", 'custom_shader_path=$SHADER:$YUV_END"; }', 'custom_shader_path=$SHADER,hwdownload,format=yuv420p"; }'),
+        ("hwdec-rgba-end", 'hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }\n# chain_zerocopy', 'hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:format=rgba,hwdownload,format=rgba,format=yuv420p"; }\n# chain_zerocopy'),
+        ("chroma-floor-zero", "CHROMA_XPSNR_MIN=25", "CHROMA_XPSNR_MIN=0"),
         ("hwdec-no-download", 'echo "hwdownload,format=nv12,hwupload,libplacebo', 'echo "hwupload,libplacebo'),
         ("hwdec-ffv1-plan", 'cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)"', 'cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)"'),
     ]:
@@ -700,6 +709,7 @@ def test_mutants(tmp):
         ("dims-nominal", "NF >= 2 && $1 > 0 && $2 > 0", "0", size_failures),
         ("no-timeout", 'timeout --kill-after=10 "$RUN_TIMEOUT" "${CMD[@]}"', '"${CMD[@]}"', timeout_failures),
         ("row5-full-length", "ORT_FRAMES=48", "ORT_FRAMES=", row5_budget_failures),
+        ("chroma-unchecked", 'ge "$cu" "$CHROMA_XPSNR_MIN" || status=FAIL', ':', chroma_failures),
         ("signed-dropped", 'printf "%+.2f\\n", c - b', 'printf "%.2f\\n", c - b', signed_failures),
         ("signed-plus-prefix", 'printf "%+.2f\\n", c - b', 'printf "+%.2f\\n", c - b', signed_failures),
         ("row9-ffv1-source", 'cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)"', 'cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)"', row9_failures),
@@ -1435,6 +1445,25 @@ def signed_failures(script, tmp, tag):
     return bad
 
 
+def chroma_failures(script, tmp, tag):
+    """A shader output that kept its luma but lost its chroma (green frames) FAILs rows 2-4 on the chroma score."""
+    bad = []
+    w = World(tmp, tag + "-green")
+    rc, out, err = w.run(["--rows", "2,3,4"], script=script, FAKE_XPSNR_GREEN="1")
+    res = results(out)
+    for row in (2, 3, 4):
+        st, detail = res.get(row, ("", ""))
+        if st != "FAIL" or "chroma_xpsnr=3dB" not in detail or "xpsnr_delta=+10.00dB" not in detail:
+            bad.append(f"green-row{row}:{st}:{detail[:90]}")
+    w = World(tmp, tag + "-good")
+    rc, out, err = w.run(["--rows", "2,3"], script=script)
+    for row in (2, 3):
+        st, detail = results(out).get(row, ("", ""))
+        if st != "PASS" or "chroma_xpsnr=40dB" not in detail:
+            bad.append(f"good-row{row}:{st}:{detail[:90]}")
+    return bad
+
+
 def ffmpeg_log(w):
     p = os.path.join(w.root, "ffmpeg.log")
     return [l for l in open(p).read().splitlines() if "-filters" not in l] if os.path.exists(p) else []
@@ -1442,7 +1471,7 @@ def ffmpeg_log(w):
 
 def row9_failures(script, tmp, tag):
     """Row 9 reads an H.264 1080p clip (VA-API cannot decode the FFV1 masters): cut once from the lossless one with
-    the stock ffmpeg when missing, measure decode, download, upload, libplacebo to RGBA; the zero-copy hwmap path
+    the stock ffmpeg when missing, measure decode, download, upload, libplacebo to yuv420p; the zero-copy hwmap path
     is tried once and its failure is recorded, never the row's failure."""
     bad = []
     w = World(tmp, tag)
@@ -1473,7 +1502,7 @@ def row9_failures(script, tmp, tag):
         bad.append(f"sources:{[l[:200] for l in vf]}")
     on = [l for l in vf if "-hwaccel vaapi -hwaccel_output_format vaapi" in l and "hwmap=" not in l]
     if len(on) != 1 or "hwdownload,format=nv12,hwupload,libplacebo=" not in on[0] or not re.search(
-            r"libplacebo=[^ ]*:format=rgba,hwdownload,format=rgba,format=yuv420p ", on[0]):
+            r"libplacebo=[^ ]*:format=yuv420p,hwdownload,format=yuv420p ", on[0]):
         bad.append(f"on:{on}")
     zc = [l for l in vf if "hwmap=derive_device=vulkan" in l]
     if len(zc) != 1 or " -f null -" not in zc[0] or not zc[0].endswith(" -f null -"):
@@ -1617,6 +1646,8 @@ def test_hermetic_api(tmp):
     check("an item lookup HTTP error is its own FAIL, distinct from 'not in the library'", not bad, str(bad))
     bad = signed_failures(BENCH, tmp, "signed")
     check("rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-", not bad, str(bad))
+    bad = chroma_failures(BENCH, tmp, "chroma")
+    check("rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not", not bad, str(bad))
     bad = row9_failures(BENCH, tmp, "row9")
     check("row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it", not bad, str(bad))
     bad = row10_prime_failures(BENCH, tmp, "row10-prime")

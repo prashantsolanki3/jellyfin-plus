@@ -455,11 +455,10 @@ def build_chain(cfg, tw, th, ratio):
     if files:
         placebo += ":custom_shader_path=%s" % compose_shader(cfg, files)
     if render_node_is_intel(cfg):
-        # ANV returns green frames for libplacebo's multi-planar YUV output (UAVG/VAVG 0), so it
-        # outputs RGBA and the conversion to yuv420p happens on the CPU. The shim cannot see the
-        # source's tags, hence bt709/tv.
-        return ("format=yuv420p,hwupload,%s:format=rgba,hwdownload,format=rgba,"
-                "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" % placebo)
+        # libplacebo writes yuv420p itself, with the format named: the RGBA download tail that ANV's
+        # old green YUV output called for loses ~18 dB of luma XPSNR on the same input, shader or not
+        # (rev-8j46u), and the green frames are gone on the current driver.
+        return "format=yuv420p,hwupload,%s:format=yuv420p,hwdownload,format=yuv420p" % placebo
     return "format=yuv420p,hwupload,%s,hwdownload,format=yuv420p" % placebo
 
 

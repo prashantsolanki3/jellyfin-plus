@@ -5020,13 +5020,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
             AppendLibplaceboSegment(sb, plan, cfg);
 
             // On an Intel GPU there is no CUDA hand-off (it is a Vulkan-to-CUDA map), so the tail
-            // is always a download, whatever GpuResidentEncode says. ANV's multi-planar YUV output
-            // from libplacebo comes back green (UAVG/VAVG 0, measured on an Arc A380), so libplacebo
-            // outputs RGBA and the CPU converts to yuv420p; the QSV encoder's nv12 is then reached by
-            // the conversion ffmpeg inserts at the graph output. Intel only: NVIDIA keeps its tails.
+            // is always a download, whatever GpuResidentEncode says. libplacebo names yuv420p as its
+            // own output and the frame is downloaded as is; the QSV encoder's nv12 is then reached by
+            // the conversion ffmpeg inserts at the graph output. The RGBA download tail that ANV's
+            // earlier green YUV output called for lost ~18 dB of luma XPSNR on the same input, with
+            // no shader at all (rev-8j46u), so it is gone. Intel only: NVIDIA keeps its tails.
             if (IsIntelPath())
             {
-                sb.Append(":format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p");
+                sb.Append(":format=yuv420p,hwdownload,format=yuv420p");
                 return sb.ToString();
             }
 

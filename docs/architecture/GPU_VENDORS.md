@@ -300,18 +300,28 @@ chain feeds `libx264` / `libx265` / `libsvtav1` (the same system-memory frames),
 Recent sessions. VA-API encode belongs with PR 7, which has to solve the shared-device problem for
 decode in the first place.
 
-**Chain tail.** The tail on Intel is not the NVIDIA one: ANV returns green frames for libplacebo's
-multi-planar YUV output (UAVG/VAVG 0 on an Arc A380, XPSNR y 5 dB), so libplacebo ends in
-`:format=rgba` and the chain is `hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p`
-(the plugin's `BuildChain` and the shim, which reads the render node's sysfs vendor id to choose it).
-Measured on the A380 with the plain `hwdownload,format=rgba,format=yuv420p` form: YAVG/UAVG/VAVG
-93.88/116.2/150.4 against 93.9/116.2/150.5 on the master, XPSNR 35.11 dB against 32.06 dB for bicubic.
-The explicit `scale=...bt709:tv` form is the one shipped and was not itself run on the A380. The
-shim cannot see the source's tags, so both use bt709/tv. NVIDIA keeps `hwdownload,format=yuv420p`.
+**Chain tail.** libplacebo ends in `:format=yuv420p` and the chain in `hwdownload,format=yuv420p` (the
+plugin's `BuildChain` and the shim, which reads the render node's sysfs vendor id to choose it), the
+NVIDIA tail with the format named. It was `:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p`
+because ANV returned green frames for libplacebo's multi-planar YUV output (UAVG/VAVG 0 on an Arc A380,
+XPSNR y 5 dB). Measured in the Arc test pod on 2026-11-24 (720p to 1080p, 48 frames, luma XPSNR against
+the 1080p master, rev-8j46u): bicubic 43.17 dB; FSRCNNX straight to yuv420p 42.65 dB; libplacebo with no
+shader and the RGBA tail 24.44 dB; FSRCNNX with the plain RGBA tail 27.59 dB, with the explicit bt709/tv
+tail 24.52 dB (identical with `setparams` bt709 tags at the head). The explicit tail's YAVG/UAVG were
+105.67/116.19 against 105.84/116.24 on the master, so the loss is not a colour matrix or range shift, and
+the bench rows 3 and 4 deltas of -5.70 and -6.13 dB were the tail, not FSRCNNX. The RGBA download path
+is what costs the ~18 dB, shader or not; the exact defect inside it (a frame offset or pairing, a row
+stride, a chroma siting shift in `hwdownload` of RGBA or in the swscale conversion) is NOT localised. The
+green output is gone on the current driver and HuC state (luma XPSNR 42.65 dB direct), and bench rows 2-4
+now FAIL on a chroma XPSNR below 25 dB so it cannot come back unseen. To localise the RGBA defect, on a
+bench Job with the Intel ffmpeg, per frame: `libplacebo=...:format=rgba,hwdownload,format=rgba` straight
+to `-c:v ffv1` against the same chain with `format=yuv420p` output, compared with `psnr=stats_file=` and
+`blend=all_mode=difference,signalstats`; and `-vf ...,showinfo` on both for the frame count and PTS.
+NVIDIA keeps `hwdownload,format=yuv420p`.
 The tail cannot be `hwdownload,format=nv12`: QSV wants `nv12`, and ffmpeg's output stage appends a
 `format=` filter listing the encoder's pixel formats (`ffmpeg_filter.c`) and the graph inserts a
 `scale` for the difference (`avfiltergraph.c`, auto-inserted conversion). The cost is one CPU
-RGBA to yuv420p pass and one yuv420p to nv12 pass per frame, which is not measured. `GpuResidentEncode` is ignored on Intel, the
+yuv420p to nv12 pass per frame, which is not measured. `GpuResidentEncode` is ignored on Intel, the
 session record says `GpuResidentEncode` is n/a, and `Pipeline` reads plain `Vulkan`.
 
 **`ChooseEncoder`.** On Intel the negotiated codec maps to `h264_qsv` / `hevc_qsv` / `av1_qsv`
@@ -481,7 +491,7 @@ the device a session will use. A plan resolves that device once (`Plan.Devices`,
 between two reads cannot make the session record and its command disagree. The shim fallback reads
 an optional `render_node` from its JSON (unset keeps `vulkan=vk:0`); it has no GPU detection and no
 probe, so it is for an operator who knows the node. The one thing it reads from the node is its sysfs
-PCI vendor id (`/sys/class/drm/<node>/device/vendor`), only to pick the Intel RGBA chain tail above;
+PCI vendor id (`/sys/class/drm/<node>/device/vendor`), only to pick the Intel chain tail above (`:format=yuv420p` named);
 an unset, invalid, unreadable or non-Intel node keeps the NVIDIA chain string byte for byte
 (`scripts/test_shim_chain.py`). It is set by hand in
 `/etc/jellyfin-upscale.json`, is never test-started, and `ShimBridge.Sync` (which merges into the

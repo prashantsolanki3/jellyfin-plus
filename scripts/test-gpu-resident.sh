@@ -101,6 +101,10 @@ run_case() {
 log "== test-gpu-resident.sh: $(date -u +%FT%TZ) =="
 log "FFMPEG=$FFMPEG"
 log "FFPROBE=${FFPROBE:-<not found>}"
+if [ ! -x "$FFMPEG" ]; then
+    log "FATAL: patched ffmpeg not executable at $FFMPEG (exit 2 = environment, not a test failure). Set FFMPEG=..."
+    exit 2
+fi
 "$FFMPEG" -version 2>&1 | head -n1
 if [ -z "$FFPROBE" ]; then
     log "FATAL: no ffprobe found (checked \$(dirname \$FFMPEG)/ffprobe, /usr/lib/jellyfin-ffmpeg/ffprobe, PATH). Set FFPROBE=..."

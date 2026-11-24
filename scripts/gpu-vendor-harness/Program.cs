@@ -720,13 +720,13 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 OnIntel("auto", "hevc_nvenc", FullList);
                 UpscaleEngine.Settings.GpuResidentEncode = resident;
                 string tag = " [GpuResidentEncode=" + resident + "]";
-                // libplacebo outputs RGBA and the CPU converts to yuv420p: ANV's multi-planar YUV output
-                // from libplacebo comes back green (UAVG/VAVG 0, measured on an Arc A380).
-                Equal("Intel BuildChain ends in an RGBA download and a CPU conversion, never the CUDA hand-off" + tag,
-                    "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+                // libplacebo names yuv420p as its output and the frame is downloaded as is: the RGBA
+                // download tail lost ~18 dB of luma XPSNR on the same input, with no shader (rev-8j46u).
+                Equal("Intel BuildChain ends in a yuv420p download, never RGBA and never the CUDA hand-off" + tag,
+                    "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=yuv420p,hwdownload,format=yuv420p",
                     UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
-                Equal("Intel BuildChain with deband: format=rgba follows the deband options" + tag,
-                    "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:deband=1:deband_threshold=3:deband_grain=0:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+                Equal("Intel BuildChain with deband: format=yuv420p follows the deband options" + tag,
+                    "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:deband=1:deband_threshold=3:deband_grain=0:format=yuv420p,hwdownload,format=yuv420p",
                     UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, DebandApplied = true }));
                 Equal("Intel HwaccelArgs starts the Vulkan device from the render node, never vk:0, and pins QSV to it" + tag,
                     " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128 -filter_hw_device vk",
@@ -1617,8 +1617,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             Equal("the decided plan carries the derived format", "nv12", hw.HardwareDecodeFormat);
             Check("a software plan carries no format", HwDecide(Machine("renderD128", "0x8086"), HwSettings(false), PlainHwJob("upscale", "1080")).HardwareDecodeFormat == null);
-            Equal("the software chain with the same literal plan on an Intel host ends in RGBA (ANV's YUV output is broken)",
-                "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+            Equal("the software chain with the same literal plan on an Intel host ends in a yuv420p download, not RGBA",
+                "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=yuv420p,hwdownload,format=yuv420p",
                 UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
 
             // The start-up test is the production command: same device arguments (decoder bound by name),
@@ -1751,7 +1751,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Plan off = HwDecide(Machine("renderD128", "0x8086"), HwSettings(false), PlainHwJob("upscale", "1080"));
             Check("off, Intel: no hardware decode, no reason", off.Act && !off.HardwareDecode && off.HardwareDecodeReason == null);
             Equal("off, Intel: the device arguments", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(off));
-            Check("off, Intel: the chain is the software chain", UpscaleEngine.BuildChain(off).StartsWith("format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=") && UpscaleEngine.BuildChain(off).EndsWith(":format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"), UpscaleEngine.BuildChain(off));
+            Check("off, Intel: the chain is the software chain", UpscaleEngine.BuildChain(off).StartsWith("format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=") && UpscaleEngine.BuildChain(off).EndsWith(":format=yuv420p,hwdownload,format=yuv420p"), UpscaleEngine.BuildChain(off));
             Check("off, Intel: the test never ran", calls == 0);
             SessionRecord offRecord = UpscaleEngine.Describe(null, off, off.Status, off.Reason);
             string offJson = JsonSerializer.Serialize(offRecord);
