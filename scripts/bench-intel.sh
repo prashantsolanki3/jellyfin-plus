@@ -24,6 +24,7 @@
 #   BENCH_STOCK_FFMPEG    stock jellyfin-ffmpeg          /usr/lib/jellyfin-ffmpeg/ffmpeg
 #   BENCH_CLIPS           the lossless clips             /clips      <title>_<height>p.mkv, see below
 #   BENCH_OUT             results.jsonl and the row 9 H.264 cut; every other output goes in its run-<id> directory   $BENCH_CLIPS/bench-out
+#   BENCH_TRACE=1         echo every measured ffmpeg argv as `trace: row N: ...` on stderr (every run writes $BENCH_OUT/run-<id>/commands.log anyway)
 #   BENCH_RUN_ID          names this run's directory $BENCH_OUT/run-<id>, created fresh (an existing one is refused, exit 2)   <timestamp>-<pid>
 #   BENCH_TITLE           clip title prefix              tears       (the second source: BENCH_TITLE=anim)
 #   BENCH_RENDER_NODE     the Arc render node            the first vendor-0x8086 node of /dev/dri, else its only node, else /dev/dri/renderD128
@@ -183,7 +184,7 @@ hwdec_clip() {
     if [[ -f "$CLIPS/${TITLE}_1080p_h264.mkv" ]]; then echo "$CLIPS/${TITLE}_1080p_h264.mkv"; else echo "$OUT/${TITLE}_1080p_h264.mkv"; fi
 }
 
-# ---- command builders: fill CMD; the plan prints it and the run executes it, so they cannot differ ---
+# ---- command builders: fill CMD; the plan prints it and the run executes it. commands.log is the record of what ran ---
 
 INIT=(-init_hw_device "vulkan=vk:$VK_DEV" -filter_hw_device vk)
 
@@ -219,9 +220,12 @@ cmd_run_hw() {
 cmd_h264_cut() {
     CMD=("$STOCK_FFMPEG" -hide_banner -nostdin -y -i "$(clip 1080)" -c:v libx264 -crf 12 -preset fast -an "$1")
 }
-# cmd_xpsnr <candidate> <master> <stats>: XPSNR of the candidate against the master.
+# cmd_xpsnr <candidate> <master> <stats>: XPSNR of the candidate against the master. xpsnr pairs frames by pts; both
+# inputs are renumbered to 0, 1, 2... so frame k is scored against frame k whatever offset or jitter either file's
+# timestamps carry (score_inputs has already shown the two have the same number of frames).
 cmd_xpsnr() {
-    CMD=("$PATCHED_FFMPEG" -hide_banner -nostdin -i "$1" -i "$2" -lavfi "xpsnr=stats_file=$3" -f null -)
+    CMD=("$PATCHED_FFMPEG" -hide_banner -nostdin -i "$1" -i "$2"
+         -lavfi "[0:v]settb=1/1000,setpts=N[c];[1:v]settb=1/1000,setpts=N[m];[c][m]xpsnr=stats_file=$3" -f null -)
 }
 # cmd_still <png> <chain> <metadata-file>: a looped still, consecutive-frame difference per frame.
 cmd_still() {
@@ -233,8 +237,15 @@ cmd_still() {
 still_skip() { awk -v s="$1" 'BEGIN { v = 8 * s * s; printf "%d\n", (v == int(v)) ? v : int(v) + 1 }'; }
 
 # ff_exec: run CMD under a hard time limit. The plan prints CMD without this wrapper; every measured run goes
-# through it, so a hung chain (a model compile, a GPU hang) ends the row instead of the whole bench.
-ff_exec() { timeout --kill-after=10 "$RUN_TIMEOUT" "${CMD[@]}"; }
+# through it, so a hung chain (a model compile, a GPU hang) ends the row instead of the whole bench. Each argv it runs is
+# appended to $RUN_OUT/commands.log as `row N: argv`, and echoed as `trace: ...` on the bench's own stderr (fd 9) with
+# BENCH_TRACE=1, so what a row really ran is on disk, not inferred from the plan.
+CUR_ROW=""
+ff_exec() {
+    if [[ -d "$RUN_OUT" ]]; then printf 'row %s: %s\n' "${CUR_ROW:-?}" "${CMD[*]}" >>"$RUN_OUT/commands.log"; fi
+    if [[ "${BENCH_TRACE:-}" == 1 ]]; then printf 'trace: row %s: %s\n' "${CUR_ROW:-?}" "${CMD[*]}" >&9; fi
+    timeout --kill-after=10 "$RUN_TIMEOUT" "${CMD[@]}"
+}
 # timed_out <exit status>: 124 is timeout's own; 137 is the KILL it sends when ffmpeg ignored the TERM.
 timed_out() { [[ "$1" == 124 || "$1" == 137 ]]; }
 # why <exit status> <text>: "timeout after Ns" when the run was timed out, else the text.
@@ -246,8 +257,38 @@ plan_cmd() { # label, then CMD is set
     printf 'plan: row %s cmd: %s\n' "$1" "${CMD[*]}"
 }
 
+# pair_cmd <step> <source clip> <candidate chain fn> <candidate out> <bicubic out> <master> <w> <h>: sets CMD for one command
+# of a candidate-against-bicubic row (2, 3, 4, 8). The rows build their writes with it and the plan prints every step
+# with it, at the size master_dims gives, so the plan lists the argv the row runs (commands.log is the proof).
+pair_cmd() {
+    local step="$1" src="$2" fn="$3" cand="$4" bic="$5" master="$6" ow="$7" oh="$8"
+    case "$step" in
+        fps) cmd_run "$src" "$("$fn" "$ow" "$oh")" ;;
+        write-candidate) cmd_run "$src" "$("$fn" "$ow" "$oh")" "$cand" ;;
+        write-bicubic) cmd_run "$src" "$(chain_bicubic "$ow" "$oh")" "$bic" ;;
+        xpsnr-candidate | xpsnr-chroma) cmd_xpsnr "$cand" "$master" "$RUN_OUT/xpsnr.txt" ;;
+        xpsnr-bicubic) cmd_xpsnr "$bic" "$master" "$RUN_OUT/xpsnr.txt" ;;
+    esac
+}
+
+# plan_pair <row> <steps> <pair_cmd args after the step>...: the plan's line for each step, in the order the row runs them
+plan_pair() {
+    local row="$1" steps="$2" step
+    shift 2
+    for step in $steps; do pair_cmd "$step" "$@"; plan_cmd "$row"; done
+}
+
+PAIR_STEPS="fps write-candidate write-bicubic xpsnr-candidate xpsnr-bicubic xpsnr-chroma"
+# plan_shader_row <row> <source height> <master height> <nominal w> <nominal h>
+plan_shader_row() {
+    local ow oh master
+    master="$(clip "$3")"
+    read -r ow oh <<<"$(master_dims "$master" "$4" "$5")"
+    plan_pair "$1" "$PAIR_STEPS" "$(clip "$2")" chain_shader "$RUN_OUT/r$1-shader.mkv" "$RUN_OUT/r$1-bicubic.mkv" "$master" "$ow" "$oh"
+}
+
 print_plan() {
-    local r
+    local r ow oh
     echo "plan: bench-intel: rows=${ROWS[*]} runs=$RUNS mode=dry-run"
     echo "plan: required filters: $(ffmpeg_required_filters intel) fsr2"
     echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
@@ -259,13 +300,12 @@ print_plan() {
         printf 'plan: row %s must pass: %s\n' "$r" "$(row_must "$r")"
         case "$r" in
             1)  echo "plan: row 1 cmd: curl $JF_URL/JellyfinPlus/Status (admin token), then $JF_URL/JellyfinPlus/Session/bench-probe" ;;
-            2)  cmd_run "$(clip 360)" "$(chain_shader 1920 1080)"; plan_cmd 2
-                cmd_run "$(clip 360)" "$(chain_bicubic 1920 1080)"; plan_cmd 2
+            2)  plan_shader_row 2 360 1080 1920 1080
                 echo "plan: row 2 threshold: fps>=$FPS_R2 xpsnr>=+$XPSNR_R2" ;;
-            3)  cmd_run "$(clip 720)" "$(chain_shader 1920 1080)"; plan_cmd 3
+            3)  plan_shader_row 3 720 1080 1920 1080
                 echo "plan: row 3 cmd: forced transcode of $(clip 720) through $JF_URL (end to end, 5 segments timed)"
                 echo "plan: row 3 threshold: e2e>=${E2E_X}x xpsnr>=+$XPSNR_R3" ;;
-            4)  cmd_run "$(clip 1080)" "$(chain_shader 3840 2160)"; plan_cmd 4
+            4)  plan_shader_row 4 1080 2160 3840 2160
                 echo "plan: row 4 cmd: forced transcode of $(clip 1080) at 2160p through $JF_URL (QSV encode, 5 segments timed)"
                 echo "plan: row 4 threshold: fps>=$FPS_R4 e2e>=${E2E_X}x xpsnr>=+$XPSNR_R4" ;;
             5)  cmd_run "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_FRAMES"; plan_cmd 5
@@ -277,8 +317,9 @@ print_plan() {
                 cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$RUN_OUT/still-control.txt"; plan_cmd 7
                 echo "plan: row 7 skip frames: 3x=$(still_skip 3) 2x=$(still_skip 2) 1.5x=$(still_skip 1.5)"
                 echo "plan: row 7 threshold: mean<=$STILL_MEAN_MAX peak<=$STILL_PEAK_MAX in ${STILL_PEAK_PCT}% control==0" ;;
-            8)  cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 1920 1080)" "$RUN_OUT/pan-fsr2.mkv"; plan_cmd 8
-                cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic 1920 1080)" "$RUN_OUT/pan-bicubic.mkv"; plan_cmd 8
+            8)  read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"
+                plan_pair 8 "write-candidate write-bicubic xpsnr-candidate xpsnr-bicubic" "$CLIPS/pan_720p.mkv" chain_fsr2 \
+                    "$RUN_OUT/pan-fsr2.mkv" "$RUN_OUT/pan-bicubic.mkv" "$CLIPS/pan_1080p.mkv" "$ow" "$oh"
                 echo "plan: row 8 threshold: xpsnr(fsr2)>=xpsnr(bicubic)" ;;
             9)  if [[ ! -f "$(hwdec_clip)" ]]; then cmd_h264_cut "${OUT}/${TITLE}_1080p_h264.part.mkv"; printf 'plan: row 9 prep cmd: %s\n' "${CMD[*]}"; fi
                 cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)" "$RUN_OUT/hwdec-on.mkv"; plan_cmd 9
@@ -459,7 +500,8 @@ xpsnr_y() {
     cmd_xpsnr "$1" "$2" "$RUN_OUT/xpsnr.txt"
     ff_exec 2>"$log" >/dev/null || { rc=$?; rm -f "$log"; return "$rc"; }
     # ffmpeg prints `XPSNR  y: 14.4167  u: ...`: two spaces after XPSNR, so match on whitespace, not one blank
-    v=$(awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") v = $(i + 1) } END { if (v != "") print v + 0 }' "$log")
+    # an identical pair scores `inf`, which some awks read as 0: it is a very high score, not a failed one
+    v=$(awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") v = $(i + 1) } END { if (v != "") print (v ~ /^[+-]?[Ii]nf/ ? 999 : v + 0) }' "$log")
     rm -f "$log"
     [[ -n "$v" ]] || return 1
     echo "$v"
@@ -473,8 +515,9 @@ xpsnr_chroma() {
     log=$(mktemp)
     cmd_xpsnr "$1" "$2" "$RUN_OUT/xpsnr.txt"
     ff_exec 2>"$log" >/dev/null || { rc=$?; rm -f "$log"; return "$rc"; }
-    v=$(awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) { if ($i == "u:") u = $(i + 1); if ($i == "v:") w = $(i + 1) } }
-             END { if (u != "" && w != "") print (u + 0 < w + 0 ? u : w) + 0 }' "$log")
+    v=$(awk 'function num(x) { return x ~ /^[+-]?[Ii]nf/ ? 999 : x + 0 }
+             /XPSNR +y:/ { for (i = 1; i <= NF; i++) { if ($i == "u:") u = $(i + 1); if ($i == "v:") w = $(i + 1) } }
+             END { if (u != "" && w != "") print (num(u) < num(w) ? num(u) : num(w)) }' "$log")
     rm -f "$log"
     [[ -n "$v" ]] || return 1
     echo "$v"
@@ -491,6 +534,45 @@ master_dims() {
     d=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$1" 2>/dev/null \
         | awk -F, 'NF >= 2 && $1 > 0 && $2 > 0 { printf "%d %d\n", $1, $2 }') || d=""
     echo "${d:-$2 $3}"
+}
+
+# probe_stream <file>: "width height pix_fmt color_range start_time frames" of the first video stream, `?` for anything
+# ffprobe did not report (frames are the demuxed packets: one per frame in these files, and no decode).
+probe_stream() {
+    "$FFPROBE" -v error -select_streams v:0 -count_packets \
+        -show_entries stream=width,height,pix_fmt,color_range,start_time,nb_read_packets -of default=nw=1 "$1" 2>/dev/null \
+        | awk -F= 'function d(x) { return x == "" ? "?" : x }
+                   { v[$1] = $2 }
+                   END { printf "%s %s %s %s %s %s\n", d(v["width"]), d(v["height"]), d(v["pix_fmt"]), d(v["color_range"]), d(v["start_time"]), d(v["nb_read_packets"]) }' \
+        || true
+}
+# first_pts <file>: the presentation times of the first three packets, on one line.
+first_pts() {
+    "$FFPROBE" -v error -select_streams v:0 -read_intervals '%+#3' -show_entries packet=pts_time -of csv=p=0 "$1" 2>/dev/null | tr '\n' ' ' || true
+}
+
+# score_inputs <row> <candidate> <bicubic> <master>: what the scorer is about to compare, written to
+# $RUN_OUT/r<row>-inputs.txt (size, pix_fmt, range, start_time, frame count, first pts of each file). xpsnr scores frame k
+# of one file against frame k of the other, so a candidate whose size or frame count differs from the master's would
+# score pairing error, not picture quality (run16 scored -27 dB for a picture a hand probe scored at -0.47 dB): that is
+# the row's FAIL, with both numbers, before any xpsnr runs. Returns 1 after recording it. A master ffprobe cannot read
+# has nothing to compare against: the file says `?` and the row goes on.
+score_inputs() {
+    local row="$1" kind f w h pf cr st n mw="?" mh="?" mn="?" rep="$RUN_OUT/r$1-inputs.txt"
+    local -A path=([master]="$4" [candidate]="$2" [bicubic]="$3")
+    : >"$rep"
+    for kind in master candidate bicubic; do
+        f="${path[$kind]}"
+        read -r w h pf cr st n <<<"$(probe_stream "$f")"
+        printf '%s %s: %sx%s pix_fmt=%s color_range=%s start_time=%s frames=%s first_pts=%s\n' \
+            "$kind" "$f" "$w" "$h" "$pf" "$cr" "$st" "$n" "$(first_pts "$f")" >>"$rep"
+        if [[ "$kind" == master ]]; then
+            mw="$w"; mh="$h"; mn="$n"
+        elif [[ ("$mw" != "?" && "$w" != "$mw") || ("$mh" != "?" && "$h" != "$mh") || ("$mn" != "?" && "$n" != "$mn") ]]; then
+            record "$row" FAIL "scored file does not line up with the master, xpsnr not run: $kind $f is ${w}x$h with $n frames, the master is ${mw}x$mh with $mn frames (see $rep)"
+            return 1
+        fi
+    done
 }
 
 # ---- Jellyfin API ----------------------------------------------------------------------------------
@@ -618,11 +700,12 @@ shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h
     local shader_out="$RUN_OUT/r$row-shader.mkv" bicubic_out="$RUN_OUT/r$row-bicubic.mkv"
     read -r ow oh <<<"$(master_dims "$(clip "$h")" "$w" "$h")"
     fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$ow" "$oh")") || { rc=$?; record "$row" FAIL "$(why "$rc" "ffmpeg failed")"; return; }
-    cmd_run "$(clip "$sh")" "$(chain_shader "$ow" "$oh")" "$shader_out"
+    pair_cmd write-candidate "$(clip "$sh")" chain_shader "$shader_out" "$bicubic_out" "$(clip "$h")" "$ow" "$oh"
     write_run "$shader_out" || { record "$row" FAIL "$WRITE_ERR"; return; }
-    cmd_run "$(clip "$sh")" "$(chain_bicubic "$ow" "$oh")" "$bicubic_out"
+    pair_cmd write-bicubic "$(clip "$sh")" chain_shader "$shader_out" "$bicubic_out" "$(clip "$h")" "$ow" "$oh"
     write_run "$bicubic_out" || { record "$row" FAIL "$WRITE_ERR"; return; }
     require_fresh "$row" "$shader_out" "$bicubic_out" || return 0
+    score_inputs "$row" "$shader_out" "$bicubic_out" "$(clip "$h")" || return 0
     detail="fps=$fps"
     d=$(xpsnr_delta "$shader_out" "$bicubic_out" "$(clip "$h")") || xrc=$?
     if [[ "$xrc" == 0 ]]; then
@@ -770,11 +853,12 @@ row_8() {
     [[ -f "$CLIPS/pan_720p.mkv" && -f "$CLIPS/pan_1080p.mkv" ]] || { record 8 SKIP "no pan_720p.mkv / pan_1080p.mkv"; return; }
     local d ow oh rc=0 fsr2_out="$RUN_OUT/pan-fsr2.mkv" bicubic_out="$RUN_OUT/pan-bicubic.mkv"
     read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"
-    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 "$ow" "$oh")" "$fsr2_out"
+    pair_cmd write-candidate "$CLIPS/pan_720p.mkv" chain_fsr2 "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv" "$ow" "$oh"
     write_run "$fsr2_out" || { record 8 FAIL "$WRITE_ERR"; return; }
-    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic "$ow" "$oh")" "$bicubic_out"
+    pair_cmd write-bicubic "$CLIPS/pan_720p.mkv" chain_fsr2 "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv" "$ow" "$oh"
     write_run "$bicubic_out" || { record 8 FAIL "$WRITE_ERR"; return; }
     require_fresh 8 "$fsr2_out" "$bicubic_out" || return 0
+    score_inputs 8 "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv" || return 0
     d=$(xpsnr_delta "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv") || { rc=$?; record 8 FAIL "xpsnr failed ($(why "$rc" "the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv"))"; return; }
     if ge "$d" 0; then record 8 PASS "xpsnr_delta=${d}dB"; else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda"; fi
 }
@@ -917,7 +1001,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,13p;21,48p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p;21,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -942,6 +1026,9 @@ esac
 [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "BENCH_RUN_ID must be letters, digits, dot, dash or underscore (it names a directory), got: $RUN_ID"
 parse_block_windows
 
+# before the plan: it sizes the outputs at the master's own size (master_dims), as the run does
+FFPROBE="$(dirname "$STOCK_FFMPEG")/ffprobe"
+
 if [[ $DRY == 1 ]]; then
     print_plan
     exit 0
@@ -952,7 +1039,6 @@ if [[ $GATES == 1 ]]; then
 elif [[ "${BENCH_CONFIRM_NO_GATES:-}" != 1 ]]; then
     die "--no-gates skips the quiet-box checks (no vzdump, no Plex or production transcode, no memory pressure): set BENCH_CONFIRM_NO_GATES=1 to say you have made them"
 fi
-FFPROBE="$(dirname "$STOCK_FFMPEG")/ffprobe"
 need "$PATCHED_FFMPEG"; need "$FFPROBE"; need curl; need jq; need awk; need timeout
 [[ -d "$CLIPS" ]] || die "no clips directory: $CLIPS"
 mkdir -p "$OUT"
@@ -970,8 +1056,10 @@ if [[ -r "$SHIM_LOG" ]]; then SHIM_LOG_START=$(wc -c <"$SHIM_LOG" | tr -d ' '); 
 trap cfg_restore EXIT
 trap 'exit 130' INT TERM
 
+if [[ "${BENCH_TRACE:-}" == 1 ]]; then exec 9>&2; fi
 for r in "${ROWS[@]}"; do
     say "row $r: $(row_title "$r")"
+    CUR_ROW="$r"
     "row_$r"
 done
 
