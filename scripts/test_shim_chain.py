@@ -3,9 +3,9 @@
 
     python3 -I scripts/test_shim_chain.py
 
-On Intel (the render node's sysfs vendor is 0x8086) libplacebo outputs RGBA and the chain converts to
-yuv420p on the CPU, because ANV's multi-planar YUV output from libplacebo comes back green. Every
-other case (no render node, an invalid one, NVIDIA, unreadable sysfs) keeps the chain string it had
+On Intel (the render node's sysfs vendor is 0x8086) libplacebo names yuv420p as its output and the
+frame is downloaded as is: the RGBA download tail that ANV's earlier green YUV output called for lost
+~18 dB of luma XPSNR (rev-8j46u). Every other case (no render node, an invalid one, NVIDIA, unreadable sysfs) keeps the chain string it had
 before, byte for byte. Exit status 0 when every check passed.
 """
 import importlib.machinery
@@ -96,23 +96,23 @@ with tempfile.TemporaryDirectory() as tmp:
     equal("unreadable vendor file: the pre-change chain", NVIDIA_PLAIN, chain(cfg_for("/dev/dri/renderD140")))
 
     # ---- Intel ----
-    INTEL_PLAIN = ("format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=rgba,"
-                   "hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p")
-    equal("Intel render node: libplacebo outputs rgba, downloaded as rgba, converted on the CPU",
+    INTEL_TAIL = ":format=yuv420p,hwdownload,format=yuv420p"
+    INTEL_PLAIN = "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos" + INTEL_TAIL
+    equal("Intel render node: libplacebo writes yuv420p and the frame is downloaded as is",
           INTEL_PLAIN, chain(cfg_for("/dev/dri/renderD128")))
 
     intel_shader = chain(cfg_for("/dev/dri/renderD128", True))
     check("Intel with shaders: still libplacebo with the shader", ":custom_shader_path=" in intel_shader, intel_shader)
-    check("Intel with shaders: libplacebo is told to output rgba", ":format=rgba," in intel_shader, intel_shader)
-    check("Intel with shaders: ends in the download, the CPU conversion and yuv420p",
-          intel_shader.endswith(",hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"),
-          intel_shader)
-    check("Intel: no yuv420p download straight from Vulkan",
-          ",hwdownload,format=yuv420p" not in intel_shader and ",hwdownload,format=yuv420p" not in chain(cfg_for("/dev/dri/renderD128")))
+    check("Intel with shaders: ends in the named yuv420p output, the download and yuv420p",
+          intel_shader.endswith(INTEL_TAIL), intel_shader)
+    # The RGBA download tail lost ~18 dB of luma XPSNR on the same input even with no shader (rev-8j46u).
+    check("Intel: no rgba anywhere, plain or with shaders",
+          "rgba" not in intel_shader and "rgba" not in chain(cfg_for("/dev/dri/renderD128"))
+          and "out_color_matrix" not in intel_shader, intel_shader)
 
     # The sharpener-only chain (ratio below sr_min_scale_factor) takes the same tail.
     low = chain(cfg_for("/dev/dri/renderD128", True), ratio=1.2)
-    check("Intel at a low ratio: same rgba tail", low.endswith(",hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"), low)
+    check("Intel at a low ratio: same yuv420p tail", low.endswith(INTEL_TAIL) and "rgba" not in low, low)
 
 print()
 print("%d passed, %d failed" % (passed, failed))

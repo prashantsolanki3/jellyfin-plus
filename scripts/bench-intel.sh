@@ -111,9 +111,9 @@ row_title() {
 row_must() {
     case "$1" in
         1)  echo "vendor=intel; render node $NODE; Vulkan vk@dr; no NVIDIA-only level offered; fsr2 offered (marker present); no nvenc/cuda string in any command line" ;;
-        2)  echo "fps>=100; xpsnr>=bicubic+0.5dB" ;;
-        3)  echo "end-to-end fps>=1.2x source fps; xpsnr>=bicubic+0.3dB" ;;
-        4)  echo "scaler-only fps>=34; end-to-end with QSV encode >=1.2x source fps; xpsnr>=bicubic+0.3dB" ;;
+        2)  echo "fps>=100; xpsnr>=bicubic+0.5dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
+        3)  echo "end-to-end fps>=1.2x source fps; xpsnr>=bicubic+0.3dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
+        4)  echo "scaler-only fps>=34; end-to-end with QSV encode >=1.2x source fps; xpsnr>=bicubic+0.3dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
         5)  echo "session record device=openvino (not a CPU fallback); fps measured at 360p and 720p; xpsnr>=FSRCNNX where it runs; slower than real time is a valid result" ;;
         6)  echo "NeuralMaxSourceHeight=480: a 720p source goes to the shader path and the record says why" ;;
         7)  echo "after the first ceil(8*scale^2) frames: mean consecutive-frame luma difference<=0.5, per-frame max<=16 in 99% of frames; FSRCNNX control exactly 0" ;;
@@ -135,6 +135,7 @@ XPSNR_R3=0.3
 FPS_R4=34
 XPSNR_R4=0.3
 FPS_R11=36
+CHROMA_XPSNR_MIN=25
 STILL_MEAN_MAX=0.5
 STILL_PEAK_MAX=16
 STILL_PEAK_PCT=99
@@ -154,17 +155,19 @@ hwdec_clip() {
 
 INIT=(-init_hw_device "drm=dr:$NODE" -init_hw_device "vulkan=vk@dr" -filter_hw_device vk)
 
-# ANV's YUV output from libplacebo is broken (green frames, measured): the Intel chains have libplacebo write RGBA,
-# download it and convert to yuv420p on the CPU. That is what production will run, so the bench measures it.
-RGBA_END="format=rgba,hwdownload,format=rgba,format=yuv420p"
-chain_shader() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$RGBA_END"; }
+# libplacebo writes yuv420p and the frame is downloaded as is, which is what production runs. The RGBA tail
+# (`format=rgba,hwdownload,format=rgba,...,format=yuv420p`) it replaced cost ~18 dB of luma XPSNR on the same input, with
+# no shader at all (rev-8j46u, measured 2026-11-24: 24.4 dB against 42.65 dB direct); the green frames it was added
+# for are no longer produced, and rows 2-4 fail on chroma XPSNR below $CHROMA_XPSNR_MIN dB if they come back.
+YUV_END="format=yuv420p,hwdownload,format=yuv420p"
+chain_shader() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }
 chain_bicubic() { echo "scale=$1:$2:flags=bicubic,format=yuv420p"; }
 chain_ort() { echo "format=yuv420p,format=gbrpf32le,ort=model=${ORT_MODEL:-MODEL}:device=openvino,format=yuv420p,hwupload,libplacebo=w=$1:h=$2,hwdownload,format=yuv420p"; }
-chain_fsr2() { echo "format=yuv420p,format=gbrpf32le,fsr2=w=$1:h=$2${FSR2_OPTS:+:$FSR2_OPTS},format=yuv420p,hwupload,libplacebo=w=$1:h=$2:$RGBA_END"; }
+chain_fsr2() { echo "format=yuv420p,format=gbrpf32le,fsr2=w=$1:h=$2${FSR2_OPTS:+:$FSR2_OPTS},format=yuv420p,hwupload,libplacebo=w=$1:h=$2:$YUV_END"; }
 # chain_hwdec: VA-API frames downloaded, uploaded to Vulkan, libplacebo: the path that works on this ANV.
-chain_hwdec() { echo "hwdownload,format=nv12,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$RGBA_END"; }
+chain_hwdec() { echo "hwdownload,format=nv12,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }
 # chain_zerocopy: the VA-API frames mapped straight into Vulkan; fails with VK_ERROR_DEVICE_LOST on this ANV.
-chain_zerocopy() { echo "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$RGBA_END"; }
+chain_zerocopy() { echo "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }
 
 # cmd_run <clip> <chain> [output] [frames]: a measured run; output omitted = discard (-f null), else lossless
 # ffv1; frames given = stop after that many frames (-frames:v).
@@ -401,6 +404,21 @@ xpsnr_y() {
     echo "$v"
 }
 
+# xpsnr_chroma <candidate> <master>: the lower of the u and v XPSNR. ANV's green frames (chroma planes written as 0)
+# leave luma alone in some builds, so the luma score alone cannot tell them from a good frame. Prints nothing and
+# returns non-zero when it was not measured, as xpsnr_y does.
+xpsnr_chroma() {
+    local log v rc
+    log=$(mktemp)
+    cmd_xpsnr "$1" "$2" "$OUT/xpsnr.txt"
+    ff_exec 2>"$log" >/dev/null || { rc=$?; rm -f "$log"; return "$rc"; }
+    v=$(awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) { if ($i == "u:") u = $(i + 1); if ($i == "v:") w = $(i + 1) } }
+             END { if (u != "" && w != "") print (u + 0 < w + 0 ? u : w) + 0 }' "$log")
+    rm -f "$log"
+    [[ -n "$v" ]] || return 1
+    echo "$v"
+}
+
 src_fps() { "$FFPROBE" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$1" | awk -F/ '{ printf "%.3f\n", $1 / ($2 ? $2 : 1) }'; }
 
 # master_dims <reference master> <dst-w> <dst-h>: "W H" of the reference master itself (ffprobe), the size the test
@@ -535,7 +553,7 @@ xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB, si
 }
 
 shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size
-    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d status=PASS detail="" src ow oh rc=0 xrc=0
+    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d cu status=PASS detail="" src ow oh rc=0 xrc=0
     mkdir -p "$OUT"
     read -r ow oh <<<"$(master_dims "$(clip "$h")" "$w" "$h")"
     fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$ow" "$oh")") || { rc=$?; record "$row" FAIL "$(why "$rc" "ffmpeg failed")"; return; }
@@ -548,6 +566,13 @@ shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h
     if [[ "$xrc" == 0 ]]; then
         detail+=" xpsnr_delta=${d}dB"
         ge "$d" "$xmin" || status=FAIL
+        if cu=$(xpsnr_chroma "$OUT/r$row-shader.mkv" "$(clip "$h")"); then
+            detail+=" chroma_xpsnr=${cu}dB"
+            ge "$cu" "$CHROMA_XPSNR_MIN" || status=FAIL
+        else
+            detail+=" chroma xpsnr failed ($(why "$?" "ffmpeg xpsnr of $OUT/r$row-shader.mkv"))"
+            status=FAIL
+        fi
     else
         detail+=" xpsnr failed ($(why "$xrc" "ffmpeg xpsnr of the ${ow}x${oh} outputs against $(clip "$h")"))"
         status=FAIL
@@ -738,7 +763,7 @@ row_9() {
     local on_log off_log on_cpu off_cpu gain x status=PASS rc zc
     on_log="$OUT/hwdec-on.log"; off_log="$OUT/hwdec-off.log"
     hwdec_source || { record 9 FAIL "$HWDEC_ERR"; return; }
-    # the working path: VA-API decode, download, upload to Vulkan, libplacebo to RGBA (the Intel chains' end)
+    # the working path: VA-API decode, download, upload to Vulkan, libplacebo to yuv420p, download
     cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" "$OUT/hwdec-on.mkv"
     ff_exec >/dev/null 2>"$on_log" || { rc=$?; record 9 FAIL "$(why "$rc" "hardware decode chain failed: $(tail -1 "$on_log")")"; return; }
     ! grep -q 'Conversion failed' "$on_log" || status=FAIL

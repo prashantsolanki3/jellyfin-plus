@@ -53,15 +53,14 @@ sudo -u jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -loglevel error \
 If that prints `OK`, the hard part of your environment is already right. If it fails on permissions,
 add the service user to the `video` and `render` groups.
 
-**On an Intel GPU** (Arc/ANV), libplacebo's multi-planar YUV output comes back green, so it outputs
-RGBA and the CPU converts to yuv420p. Name your render node in `render_node` and use the same chain
-with this tail and `hevc_qsv`:
+**On an Intel GPU** (Arc/ANV), name your render node in `render_node` and use the same chain with
+libplacebo writing yuv420p, and `hevc_qsv`:
 
 ```bash
 sudo -u jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -loglevel error \
   -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk \
   -f lavfi -i testsrc=size=1280x720:rate=30 -t 2 \
-  -vf "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" \
+  -vf "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=yuv420p,hwdownload,format=yuv420p" \
   -c:v hevc_qsv -f null - && echo OK
 ```
 
