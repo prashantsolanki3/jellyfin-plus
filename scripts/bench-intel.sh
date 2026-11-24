@@ -25,7 +25,10 @@
 #   BENCH_CLIPS           the lossless clips             /clips      <title>_<height>p.mkv, see below
 #   BENCH_OUT             results and outputs            $BENCH_CLIPS/bench-out
 #   BENCH_TITLE           clip title prefix              tears       (the second source: BENCH_TITLE=anim)
-#   BENCH_RENDER_NODE     the Arc render node            /dev/dri/renderD128
+#   BENCH_RENDER_NODE     the Arc render node            the first vendor-0x8086 node of /dev/dri, else its only node, else /dev/dri/renderD128
+#   BENCH_VULKAN_DEVICE   the ffmpeg Vulkan device (vk:<this>)   0 with one GPU node in /dev/dri, Intel (a name match) with several
+#   BENCH_SYSFS_DRM       where the vendor files are read      /sys/class/drm
+#   BENCH_DRI_DIR         the pod's device nodes               /dev/dri
 #   BENCH_SHADER          the FSRCNNX shader             /usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl
 #   BENCH_ORT_MODEL       an ONNX model for row 5        (none: row 5 SKIPs)
 #   BENCH_FSR2_OPTS       extra fsr2 filter options      (none)
@@ -59,7 +62,31 @@ PREFIX="$(dirname "$PATCHED_FFMPEG")"
 CLIPS="${BENCH_CLIPS:-/clips}"
 OUT="${BENCH_OUT:-$CLIPS/bench-out}"
 TITLE="${BENCH_TITLE:-tears}"
-NODE="${BENCH_RENDER_NODE:-/dev/dri/renderD128}"
+
+# pick_render_node sets NODE and VK_DEV. The Arc is not always renderD128 (an RTX can take it), and deriving Vulkan from
+# DRM (vulkan=vk@dr) failed on renderD129 (run14), so the node is found at run time and Vulkan is opened by index or name.
+# A candidate is a sysfs render node that is also in this pod's /dev/dri: /sys/class/drm lists the host's cards.
+pick_render_node() {
+    local sysdrm="${BENCH_SYSFS_DRM:-/sys/class/drm}" dri="${BENCH_DRI_DIR:-/dev/dri}" d name vendor intel="" first="" count=0
+    for d in "$sysdrm"/renderD*; do
+        name="${d##*/}"
+        [[ -r "$d/device/vendor" && -e "$dri/$name" ]] || continue
+        vendor=""
+        read -r vendor <"$d/device/vendor" || true
+        count=$((count + 1))
+        [[ -n "$first" ]] || first="$name"
+        [[ -n "$intel" || "$vendor" != 0x8086 ]] || intel="$name"
+    done
+    NODE="${BENCH_RENDER_NODE:-}"
+    if [[ -z "$NODE" ]]; then
+        if [[ -n "$intel" ]]; then NODE="$dri/$intel"
+        elif (( count == 1 )); then NODE="$dri/$first"
+        else NODE=/dev/dri/renderD128; fi
+    fi
+    if (( count > 1 )); then VK_DEV=Intel; else VK_DEV=0; fi
+    VK_DEV="${BENCH_VULKAN_DEVICE:-$VK_DEV}"
+}
+pick_render_node
 SHADER="${BENCH_SHADER:-/usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl}"
 ORT_MODEL="${BENCH_ORT_MODEL:-}"
 FSR2_OPTS="${BENCH_FSR2_OPTS:-}"
@@ -110,7 +137,7 @@ row_title() {
 
 row_must() {
     case "$1" in
-        1)  echo "vendor=intel; render node $NODE; Vulkan vk@dr; no NVIDIA-only level offered; fsr2 offered (marker present); no nvenc/cuda string in any command line" ;;
+        1)  echo "vendor=intel; render node $NODE; Vulkan vk:$VK_DEV; no NVIDIA-only level offered; fsr2 offered (marker present); no nvenc/cuda string in any command line" ;;
         2)  echo "fps>=100; xpsnr>=bicubic+0.5dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
         3)  echo "end-to-end fps>=1.2x source fps; xpsnr>=bicubic+0.3dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
         4)  echo "scaler-only fps>=34; end-to-end with QSV encode >=1.2x source fps; xpsnr>=bicubic+0.3dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
@@ -153,7 +180,7 @@ hwdec_clip() {
 
 # ---- command builders: fill CMD; the plan prints it and the run executes it, so they cannot differ ---
 
-INIT=(-init_hw_device "drm=dr:$NODE" -init_hw_device "vulkan=vk@dr" -filter_hw_device vk)
+INIT=(-init_hw_device "vulkan=vk:$VK_DEV" -filter_hw_device vk)
 
 # libplacebo writes yuv420p and the frame is downloaded as is, which is what production runs. The RGBA tail
 # (`format=rgba,hwdownload,format=rgba,...,format=yuv420p`) it replaced cost ~18 dB of luma XPSNR on the same input, with
@@ -179,7 +206,7 @@ cmd_run() {
 # cmd_run_hw: as cmd_run with VA-API decode and the VA-API to Vulkan device (GPU_VENDORS.md 5.6).
 cmd_run_hw() {
     CMD=("$PATCHED_FFMPEG" -hide_banner -nostdin -y -benchmark -stats
-         -init_hw_device "vaapi=va:$NODE" -init_hw_device "vulkan=vk@va" -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk
+         -init_hw_device "vaapi=va:$NODE" -init_hw_device "vulkan=vk:$VK_DEV" -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk
          -i "$1" -vf "$2" -an)
     if [[ -n "${3:-}" ]]; then CMD+=(-c:v ffv1 "$3"); else CMD+=(-f null -); fi
 }
@@ -221,6 +248,7 @@ print_plan() {
     echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
     echo "plan: every measured ffmpeg runs under timeout --kill-after=10 ${RUN_TIMEOUT}s (BENCH_RUN_TIMEOUT); row 5 runs ${ORT_RUNS}x per clip, ${ORT_FRAMES} frames"
     echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; render node: $NODE"
+    echo "plan: vulkan device: vk:$VK_DEV"
     for r in "${ROWS[@]}"; do
         printf 'plan: row %s: %s\n' "$r" "$(row_title "$r")"
         printf 'plan: row %s must pass: %s\n' "$r" "$(row_must "$r")"
@@ -539,8 +567,8 @@ row_1() {
     else
         why=" (no $SHIM_LOG yet: the command-line check needs a session first)"
     fi
-    "$PATCHED_FFMPEG" -hide_banner -nostdin -init_hw_device "drm=dr:$NODE" -init_hw_device vulkan=vk@dr \
-        -f lavfi -i nullsrc=s=64x64 -frames:v 1 -f null - >/dev/null 2>&1 || bad+=" vulkan-vk@dr-failed"
+    "$PATCHED_FFMPEG" -hide_banner -nostdin -init_hw_device "vulkan=vk:$VK_DEV" \
+        -f lavfi -i nullsrc=s=64x64 -frames:v 1 -f null - >/dev/null 2>&1 || bad+=" vulkan-vk:$VK_DEV-failed"
     if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, fsr2 offered, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
 }
 
@@ -857,7 +885,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,13p;21,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p;21,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

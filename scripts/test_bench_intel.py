@@ -42,7 +42,7 @@ SPEC = os.path.join(REPO, "docs", "architecture", "GPU_VENDORS.md")
 FF = "/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg"
 NODE = "/dev/dri/renderD128"
 SHADER = "/usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl"
-INIT = f"-init_hw_device drm=dr:{NODE} -init_hw_device vulkan=vk@dr -filter_hw_device vk"
+INIT = "-init_hw_device vulkan=vk:0 -filter_hw_device vk"
 OUT = "/clips/bench-out"
 
 
@@ -74,7 +74,7 @@ PREP = f"{STOCK} -hide_banner -nostdin -y -i /clips/tears_1080p.mkv -c:v libx264
 
 def hw_cmd(clip, chain, tail):
     return (f"{FF} -hide_banner -nostdin -y -benchmark -stats -init_hw_device vaapi=va:{NODE} "
-            f"-init_hw_device vulkan=vk@va -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk "
+            f"-init_hw_device vulkan=vk:0 -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk "
             f"-i {clip} -vf {chain} -an {tail}")
 
 
@@ -101,7 +101,7 @@ TITLES = {
 
 # A fragment each row's must-pass line has to carry (the figures the owner's decision names).
 MUST = {
-    1: ["vendor=intel", "Vulkan vk@dr", "no nvenc/cuda string"],
+    1: ["vendor=intel", "Vulkan vk:0", "no nvenc/cuda string"],
     2: ["fps>=100", "bicubic+0.5dB", "chroma xpsnr>=25dB"],
     3: ["fps>=1.2x source fps", "bicubic+0.3dB", "chroma xpsnr>=25dB"],
     4: ["scaler-only fps>=34", "QSV encode >=1.2x", "bicubic+0.3dB", "chroma xpsnr>=25dB"],
@@ -162,6 +162,9 @@ def clean_env(extra=None, path=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("BENCH_")}
     env["PATH"] = (path + os.pathsep if path else "") + os.environ.get("PATH", "/usr/bin:/bin")
     env["LC_ALL"] = "C"
+    # no render node in sight: the script falls back to renderD128, so the plan goldens do not depend on the host's GPUs
+    env["BENCH_SYSFS_DRM"] = "/nonexistent/sys-class-drm"
+    env["BENCH_DRI_DIR"] = "/nonexistent/dev-dri"
     env.update(extra or {})
     return env
 
@@ -204,8 +207,10 @@ def plan_failures(text):
                 RGBA_TAIL in l or not re.search(
                     r"libplacebo=[^ ]*:format=yuv420p,hwdownload,format=yuv420p(,| |$)", l)):
             bad.append("libplacebo-tail:" + l[-80:])
-    if f"drm=dr:{NODE}" not in text:
-        bad.append("no-drm-device")
+    if "vulkan=vk:0 " not in text:
+        bad.append("no-vulkan-index-device")
+    if re.search(r"vk@|drm=dr:", text):
+        bad.append("vulkan-derived-from-drm")
     return bad
 
 
@@ -237,7 +242,7 @@ def test_plan_and_refusals(tmp):
     env = clean_env({"BENCH_RENDER_NODE": "/dev/dri/renderD129", "BENCH_TITLE": "anim", "BENCH_CLIPS": "/data"})
     rc, out4, _ = run(BENCH, ["--dry-run"], env)
     check("env overrides reach the commands",
-          "drm=dr:/dev/dri/renderD129" in out4 and "/data/anim_360p.mkv" in out4 and "renderD128" not in out4 and "/clips" not in out4)
+          "vaapi=va:/dev/dri/renderD129" in out4 and "vulkan=vk:0 " in out4 and "/data/anim_360p.mkv" in out4 and "renderD128" not in out4 and "/clips" not in out4)
 
     clips = os.path.join(tmp, "plan-clips")
     os.makedirs(clips)
@@ -674,7 +679,9 @@ def test_mutants(tmp):
     for name, old, new in [
         ("threshold-fps", "FPS_R2=100", "FPS_R2=10"),
         ("threshold-peak", "STILL_PEAK_MAX=16", "STILL_PEAK_MAX=32"),
-        ("nvidia-device", 'INIT=(-init_hw_device "drm=dr:$NODE"', 'INIT=(-init_hw_device "cuda=cu:0"'),
+        ("nvidia-device", 'INIT=(-init_hw_device "vulkan=vk:$VK_DEV"', 'INIT=(-init_hw_device "cuda=cu:0"'),
+        ("vulkan-from-drm", 'INIT=(-init_hw_device "vulkan=vk:$VK_DEV"', 'INIT=(-init_hw_device "drm=dr:$NODE" -init_hw_device "vulkan=vk@dr"'),
+        ("row9-vulkan-from-va", '-init_hw_device "vulkan=vk:$VK_DEV" -hwaccel vaapi', '-init_hw_device "vulkan=vk@va" -hwaccel vaapi'),
         ("row-dropped", "ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)", "ALL_ROWS=(1 2 3 4 5 6 7 8 10 11 12 13)"),
         ("skip-frames", "v = 8 * s * s", "v = 4 * s * s"),
         ("row-order", "ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)", "ALL_ROWS=(2 1 3 4 5 6 7 8 9 10 11 12 13)"),
@@ -1698,6 +1705,88 @@ def test_row_1_scope(tmp):
     check("row 12 passes on a libplacebo line written during the run", results(out).get(12, ("",))[0] == "PASS", str(results(out)))
 
 
+def drm_fixture(root, cards, in_dri):
+    """A fake /sys/class/drm (renderDnnn/device/vendor for every card) and /dev/dri (a file per name in in_dri)."""
+    sysdrm = os.path.join(root, "sys-class-drm")
+    dri = os.path.join(root, "dev-dri")
+    os.makedirs(dri)
+    for name, vendor in cards.items():
+        os.makedirs(os.path.join(sysdrm, name, "device"))
+        open(os.path.join(sysdrm, name, "device", "vendor"), "w").write(vendor + "\n")
+    os.makedirs(sysdrm, exist_ok=True)
+    for name in in_dri:
+        open(os.path.join(dri, name), "w").close()
+    return {"BENCH_SYSFS_DRM": sysdrm, "BENCH_DRI_DIR": dri}, dri
+
+
+ARC, RTX = "0x8086", "0x10de"
+# (case, sysfs cards, names in /dev/dri, extra env, node wanted ("dri/<name>" = under the fixture dir), vulkan device wanted)
+PICK_CASES = [
+    ("arc-at-128", {"renderD128": ARC}, ["renderD128"], {}, "dri/renderD128", "0"),
+    ("arc-at-129-alone-in-the-pod", {"renderD128": RTX, "renderD129": ARC}, ["renderD129"], {}, "dri/renderD129", "0"),
+    ("arc-at-129-beside-an-rtx", {"renderD128": RTX, "renderD129": ARC}, ["renderD128", "renderD129"], {}, "dri/renderD129", "Intel"),
+    ("arc-at-128-beside-an-rtx", {"renderD128": ARC, "renderD129": RTX}, ["renderD128", "renderD129"], {}, "dri/renderD128", "Intel"),
+    ("the-only-node-is-used", {"renderD129": RTX}, ["renderD129"], {}, "dri/renderD129", "0"),
+    ("no-node-falls-back-to-128", {}, [], {}, "/dev/dri/renderD128", "0"),
+    ("a-card-with-no-dev-node-is-not-a-candidate", {"renderD129": ARC}, [], {}, "/dev/dri/renderD128", "0"),
+    ("node-override", {"renderD128": RTX, "renderD129": ARC}, ["renderD129"], {"BENCH_RENDER_NODE": "/dev/dri/renderD130"},
+     "/dev/dri/renderD130", "0"),
+    ("vulkan-override", {"renderD128": RTX, "renderD129": ARC}, ["renderD128", "renderD129"], {"BENCH_VULKAN_DEVICE": "1"},
+     "dri/renderD129", "1"),
+]
+
+
+def pick_failures(script, tmp, tag):
+    """What the runtime pick of the render node and the Vulkan device gets wrong (empty = right), by --dry-run plan."""
+    bad = []
+    for case, cards, in_dri, extra, node, vk in PICK_CASES:
+        env_fix, dri = drm_fixture(os.path.join(tmp, f"{tag}-{case}"), cards, in_dri)
+        want = os.path.join(dri, node[4:]) if node.startswith("dri/") else node
+        rc, out, err = run(script, ["--dry-run", "--rows", "1,2,9"], clean_env(dict(env_fix, **extra)))
+        if rc != 0:
+            bad.append(f"{case}:rc{rc}:{err[:80]}")
+            continue
+        if f"render node: {want}\n" not in out:
+            bad.append(f"{case}:node:{re.findall(r'render node: (.*)', out)}")
+        if f"vaapi=va:{want} " not in out:
+            bad.append(f"{case}:row9-node")
+        if f"-init_hw_device vulkan=vk:{vk} -filter_hw_device vk" not in out or f"vulkan=vk:{vk} -hwaccel vaapi" not in out:
+            bad.append(f"{case}:vulkan-device:{vk}")
+        if f"Vulkan vk:{vk};" not in out:
+            bad.append(f"{case}:row1-must")
+        if re.search(r"vk@|drm=dr:", out):
+            bad.append(f"{case}:vulkan-from-drm")
+        if "renderD128" not in want and "renderD128" in out:
+            bad.append(f"{case}:renderD128-left-in-plan")
+    return bad
+
+
+def test_render_node_pick(tmp):
+    bad = pick_failures(BENCH, tmp, "real")
+    check("the Arc is picked by vendor or as the only node, and Vulkan is opened by index or name (never from DRM)", not bad, str(bad))
+    check("a clean run (no fixture, no node) still plans renderD128 with vk:0",
+          "render node: /dev/dri/renderD128\n" in run(BENCH, ["--dry-run"])[1] and not plan_failures(run(BENCH, ["--dry-run"])[1]))
+
+    # row 1 with the Arc at renderD129 alone in the pod: the live probe opens vk:0 and says nothing of DRM
+    env_fix, _ = drm_fixture(os.path.join(tmp, "row1"), {"renderD128": RTX, "renderD129": ARC}, ["renderD129"])
+    w = World(tmp, "row1-arc129", extra=env_fix)
+    w.run(["--rows", "1"])
+    probe = [l for l in ffmpeg_log(w) if "nullsrc" in l]
+    check("row 1's probe initialises Vulkan as vk:0 with no DRM device",
+          len(probe) == 1 and "-init_hw_device vulkan=vk:0 " in probe[0] and not re.search(r"vk@|drm=dr:", probe[0]), str(probe))
+
+    for name, old, new in [
+        ("pick-vendor-check-dropped", '[[ -n "$intel" || "$vendor" != 0x8086 ]] || intel="$name"', '[[ -n "$intel" ]] || intel="$name"'),
+        ("pick-dev-node-check-dropped", '[[ -r "$d/device/vendor" && -e "$dri/$name" ]]', '[[ -r "$d/device/vendor" ]]'),
+        ("pick-fixed-128", 'else NODE=/dev/dri/renderD128; fi', 'else NODE=/dev/dri/renderD128; fi; NODE=/dev/dri/renderD128'),
+        ("pick-vulkan-index-always", 'if (( count > 1 )); then VK_DEV=Intel; else VK_DEV=0; fi', 'VK_DEV=0'),
+        ("pick-vulkan-override-ignored", 'VK_DEV="${BENCH_VULKAN_DEVICE:-$VK_DEV}"', ':'),
+        ("pick-node-override-ignored", 'NODE="${BENCH_RENDER_NODE:-}"', 'NODE=""'),
+    ]:
+        path = mutant_dir(tmp, name, old, new)
+        check(f"mutant {name} is caught", bool(pick_failures(path, tmp, name)))
+
+
 def row6_case(tmp, tag, scenario=None, **extra):
     w = World(tmp, tag, scenario, extra={"BENCH_ORT_MODEL": "/m/model.onnx"})
     rc, out, err = w.run(["--rows", "6"], **extra)
@@ -1842,7 +1931,7 @@ def main():
         return 1
     with tempfile.TemporaryDirectory() as tmp:
         for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
-                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_row_6, test_row_5,
+                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_render_node_pick, test_row_6, test_row_5,
                      test_shared_files):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
