@@ -86,6 +86,14 @@ def run_cmd(clip, chain, out=None):
     return f"{FF} -hide_banner -nostdin -y -benchmark -stats {INIT} -i {clip} -vf {chain} -an {tail}"
 
 
+# the pairing is by frame index: a pts offset or a dropped frame in a written file cannot shift the comparison
+PAIR = "[0:v]settb=1/1000,setpts=N[c];[1:v]settb=1/1000,setpts=N[m];[c][m]xpsnr=stats_file="
+
+
+def xpsnr_cmd(cand, master, run=RUN):
+    return f"{FF} -hide_banner -nostdin -i {cand} -i {master} -lavfi {PAIR}{run}/xpsnr.txt -f null -"
+
+
 TITLES = {
     1: "Vendor record",
     2: "FSRCNNX 360p to 1080p, software decode",
@@ -135,8 +143,13 @@ EXACT = [
     "plan: bench-intel: rows=1 2 3 4 5 6 7 8 9 10 11 12 13 runs=3 mode=dry-run",
     "plan: required filters: oidn ort fsr2",
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080)),
-    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080)),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), f"{RUN}/r2-shader.mkv"),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080), f"{RUN}/r2-bicubic.mkv"),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-shader.mkv", "/clips/tears_1080p.mkv"),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-bicubic.mkv", "/clips/tears_1080p.mkv"),
     "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160)),
+    "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160), f"{RUN}/r4-shader.mkv"),
+    "plan: row 4 cmd: " + xpsnr_cmd(f"{RUN}/r4-bicubic.mkv", "/clips/tears_2160p.mkv"),
     "plan: row 7 cmd: " + (f"{FF} -hide_banner -nostdin -y {INIT} -loop 1 -framerate 24 -t 10 -i /clips/still_720p.png "
                            f"-vf {FSR2_CHAIN},tblend=all_mode=difference,signalstats,"
                            f"metadata=print:key=lavfi.signalstats.YAVG:file={RUN}/still-fsr2.txt -an -f null -"),
@@ -146,6 +159,8 @@ EXACT = [
     "plan: row 9 cmd: " + run_cmd(H264, shader(1920, 1080), f"{RUN}/hwdec-off.mkv"),
     "plan: row 8 cmd: " + run_cmd("/clips/pan_720p.mkv", FSR2_CHAIN, f"{RUN}/pan-fsr2.mkv"),
     "plan: row 8 cmd: " + run_cmd("/clips/pan_720p.mkv", bicubic(1920, 1080), f"{RUN}/pan-bicubic.mkv"),
+    "plan: row 8 cmd: " + xpsnr_cmd(f"{RUN}/pan-fsr2.mkv", "/clips/pan_1080p.mkv"),
+    "plan: row 8 cmd: " + xpsnr_cmd(f"{RUN}/pan-bicubic.mkv", "/clips/pan_1080p.mkv"),
     "plan: row 9 zero-copy cmd: " + hw_cmd(H264, ZEROCOPY_CHAIN, "-f null -"),
     "plan: row 13: MANUAL, the owner's browser check over a port-forward",
 ]
@@ -391,6 +406,11 @@ case "$*" in
     # FAKE_XPSNR_GREEN=1: the shader outputs keep their luma score but have lost their chroma, as ANV's green frames did
     c=$y
     case "$*" in *shader.mkv*) [ "${FAKE_XPSNR_GREEN:-}" = 1 ] && c=3;; esac
+    # FAKE_XPSNR_INF=1: an identical pair, which ffmpeg scores as infinity
+    if [ "${FAKE_XPSNR_INF:-}" = 1 ]; then
+        echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: inf  u: inf  v: inf" >&2
+        exit 0
+    fi
     echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: $y.0000  u: $c.0000  v: $c.0000" >&2
     exit 0;;
 *libx264*)
@@ -424,7 +444,17 @@ case "$*" in
             case "$last" in *"$FAKE_FFV1_SKIP"*) skip=1;; esac
         fi
         if [ -z "$skip" ]; then
-            echo ffv1-stub > "$last"
+            # the file says what was asked of it (size from the chain, 480 frames like the masters), so ffprobe can report it.
+            # FAKE_FFV1_SHORT / _BADSIZE hold a substring of the output path: one frame short, or a 1280x572 picture.
+            dims=$(echo "$*" | sed -n 's/.*libplacebo=w=\([0-9]*\):h=\([0-9]*\).*/\1 \2/p;s/.*scale=\([0-9]*\):\([0-9]*\):.*/\1 \2/p')
+            n=480
+            if [ -n "${FAKE_FFV1_SHORT:-}" ]; then
+                case "$last" in *"$FAKE_FFV1_SHORT"*) n=479;; esac
+            fi
+            if [ -n "${FAKE_FFV1_BADSIZE:-}" ]; then
+                case "$last" in *"$FAKE_FFV1_BADSIZE"*) dims="1280 572";; esac
+            fi
+            echo "ffv1-stub $dims $n" > "$last"
             if [ -n "${FAKE_FFV1_STALE:-}" ]; then
                 case "$last" in *"$FAKE_FFV1_STALE"*) touch -t 200001010000 "$last";; esac
             fi
@@ -446,6 +476,24 @@ exit 0
 FFPROBE_STUB = r'''#!/bin/sh
 case "$*" in
 *r_frame_rate*) echo 24/1;;
+*packet=pts_time*) echo 0.000000; echo 0.041667; echo 0.083333;;
+*nb_read_packets*)
+    # a file the ffmpeg stub wrote says its own size and frame count; a master is 480 frames of its clip's size
+    for a in "$@"; do last="$a"; done
+    if [ -f "$last" ] && read -r tag w h n < "$last" && [ "$tag" = ffv1-stub ]; then :
+    else
+        n=480
+        case "$last" in
+        *tears_360p*) w=640; h=286;;
+        *tears_720p* | *pan_720p*) w=1280; h=572;;
+        *tears_1080p* | *pan_1080p*) w=1920; h=858;;
+        *tears_2160p*) w=3840; h=1714;;
+        *wide_360p*) w=640; h=360;;
+        *wide_1080p*) w=1920; h=1080;;
+        *) exit 1;;
+        esac
+    fi
+    echo "width=$w"; echo "height=$h"; echo pix_fmt=yuv420p; echo color_range=tv; echo start_time=0.000000; echo "nb_read_packets=$n";;
 *stream=width,height*)
     case "$*" in
     *tears_360p*) echo 640,286;;
@@ -770,7 +818,18 @@ def test_mutants(tmp):
         ("write-failure-swallowed", 'return "$rc"\n}\n# fresh_output', 'timed_out "$rc" && return "$rc"; return 0\n}\n# fresh_output', quick_stale),
         ("fresh-check-removed", 'fresh_output() { [[ -s "$1" ]] && ! [[ "$RUN_OUT/.run-start" -nt "$1" ]]; }', 'fresh_output() { :; }', quick_stale),
         ("fresh-mtime-unchecked", 'fresh_output() { [[ -s "$1" ]] && ! [[ "$RUN_OUT/.run-start" -nt "$1" ]]; }', 'fresh_output() { [[ -s "$1" ]]; }', quick_stale),
-        ("row10-no-prime", 'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
+        ("xpsnr-pairing-removed", '-lavfi "[0:v]settb=1/1000,setpts=N[c];[1:v]settb=1/1000,setpts=N[m];[c][m]xpsnr=stats_file=$3"',
+         '-lavfi "xpsnr=stats_file=$3"', argv_failures),
+        ("xpsnr-inputs-swapped", '-nostdin -i "$1" -i "$2"\n', '-nostdin -i "$2" -i "$1"\n', argv_failures),
+        ("commands-log-removed", """printf 'row %s: %s\\n' "${CUR_ROW:-?}" "${CMD[*]}" >>"$RUN_OUT/commands.log\"""", ":", argv_failures),
+        ("plan-sizes-nominal", 'read -r ow oh <<<"$(master_dims "$master" "$4" "$5")"', 'ow=$4 oh=$5', argv_failures),
+        ("inputs-file-not-written", 'rep="$RUN_OUT/r$1-inputs.txt"', "rep=/dev/null", argv_failures),
+        ("frame-count-unchecked", ' || ("$mn" != "?" && "$n" != "$mn") ]]', " ]]", inputs_failures),
+        ("size-unchecked", '("$mw" != "?" && "$w" != "$mw") || ("$mh" != "?" && "$h" != "$mh") || ', "", inputs_failures),
+        ("inf-read-as-zero-y", "print (v ~ /^[+-]?[Ii]nf/ ? 999 : v + 0)", "print v + 0", inputs_failures),
+        ("inf-read-as-zero-chroma", "return x ~ /^[+-]?[Ii]nf/ ? 999 : x + 0", "return x + 0", inputs_failures),
+        ("trace-silent", """printf 'trace: row %s: %s\\n' "${CUR_ROW:-?}" "${CMD[*]}" >&9;""", ":;", trace_failures),
+        ("row10-no-prime",'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
         ("row10-short-wait", "LOAD_WAIT=5", "LOAD_WAIT=1", row10_prime_failures),
         ("row10-fdinfo-none", 'fdnote="fdinfo=not visible from the bench pod"', 'fdnote="fdinfo_busy=none"', row10_prime_failures),
         ("row10-stock-unmatched", "jellyfin-ffmpeg(-oidn)?/ffmpeg", "jellyfin-ffmpeg-oidn/ffmpeg",
@@ -1685,6 +1744,119 @@ def stale_output_failures(script, tmp, tag, full=True):
     return bad
 
 
+def argv_failures(script, tmp, tag):
+    """rev-hxlit: run16 scored rows 2/3/4/8 at -27..-38 dB where a hand run of the same chains scored -0.47 dB, and nothing
+    showed what the bench had run. A run logs every argv to $RUN_OUT/commands.log; the plan prints that same sequence at the
+    master's own size; row 2's scorer compares $RUN_OUT/r2-shader.mkv with the 1080p master, in that order, by frame
+    index, and the files it scores match the master's size and frame count (r2-inputs.txt)."""
+    bad = []
+    w = World(tmp, tag)
+    pan_clips(w)
+    ff = os.path.join(w.stubs, "ffmpeg")
+    rc, out, err = w.run(["--rows", "2,3,4,8"], script=script, BENCH_RUN_ID="argv")
+    for row in (2, 3, 4, 8):
+        if results(out).get(row, ("",))[0] != "PASS":
+            bad.append(f"run-row{row}:{results(out).get(row)}")
+    run_dir = os.path.join(w.out, "run-argv")
+    log_path = os.path.join(run_dir, "commands.log")
+    if not os.path.isfile(log_path):
+        return bad + ["no commands.log"]
+    logged = open(log_path).read().splitlines()
+    # what was logged is what the stub ffmpeg was handed
+    handed = [f"{ff} {l}" for l in ffmpeg_log(w)]
+    if [l.split(": ", 1)[1] for l in logged] != handed:
+        bad.append("commands.log-differs-from-what-ffmpeg-got")
+
+    master, src = f"{w.clips}/tears_1080p.mkv", f"{w.clips}/tears_360p.mkv"
+    r2 = [l[len("row 2: "):] for l in logged if l.startswith("row 2: ")]
+    sh, bi = f"{run_dir}/r2-shader.mkv", f"{run_dir}/r2-bicubic.mkv"
+    xp = [l for l in r2 if "xpsnr=" in l]
+    pairs = [re.search(r" -i (\S+) -i (\S+) -lavfi ", l).groups() for l in xp]
+    if pairs != [(sh, master), (bi, master), (sh, master)]:
+        bad.append(f"row2-xpsnr-inputs:{pairs}")
+    if any(PAIR not in l for l in xp):
+        bad.append("row2-xpsnr-pairing-not-by-index")
+    writes = [l for l in r2 if "-c:v ffv1" in l]
+    want_writes = [run_cmd(src, shader(1920, 858), sh), run_cmd(src, bicubic(1920, 858), bi)]
+    if writes != [l.replace(FF, ff, 1) for l in want_writes]:
+        bad.append(f"row2-writes:{writes}")
+    fps = [l for l in r2 if "-f null -" in l and "xpsnr=" not in l]
+    if fps != [run_cmd(src, shader(1920, 858)).replace(FF, ff, 1)]:
+        bad.append(f"row2-run_fps:{fps}")
+
+    # the scored files, the bicubic control and the master have the same size and frame count
+    ip = os.path.join(run_dir, "r2-inputs.txt")
+    inputs = open(ip).read().splitlines() if os.path.isfile(ip) else []
+    shape = [re.search(r": (\d+x\d+) .* frames=(\d+) first_pts=(\S+)", l) for l in inputs]
+    if len(inputs) != 3 or not all(shape) or len({(m.group(1), m.group(2)) for m in shape}) != 1 \
+            or (shape[0].group(1), shape[0].group(2)) != ("1920x858", "480") \
+            or not all(m.group(3) == "0.000000" for m in shape) or not all("pix_fmt=yuv420p color_range=tv" in l for l in inputs):
+        bad.append(f"r2-inputs:{inputs}")
+    for row in (3, 4, 8):
+        if not os.path.isfile(os.path.join(run_dir, f"r{row}-inputs.txt")):
+            bad.append(f"no r{row}-inputs.txt")
+
+    # the plan lists, for each of these rows, the argv the run logged for it
+    rc, plan, err = run(script, ["--dry-run", "--rows", "2,3,4,8"], dict(w.env, BENCH_RUN_ID="argv"))
+    for row in (2, 3, 4, 8):
+        planned = [l[len(f"plan: row {row} cmd: "):] for l in plan.splitlines() if l.startswith(f"plan: row {row} cmd: {ff} ")]
+        ran = [l[len(f"row {row}: "):] for l in logged if l.startswith(f"row {row}: ")]
+        if not planned or planned != ran:
+            bad.append(f"plan-vs-run-row{row}:{len(planned)}/{len(ran)}")
+    return bad
+
+
+def inputs_failures(script, tmp, tag):
+    """A scored file whose size or frame count differs from the master's FAILs the row with both numbers, and no xpsnr
+    is run on it; an xpsnr of infinity (an identical pair) is a high score, never 0 dB."""
+    bad = []
+    master_size = {2: "1920x858", 3: "1920x858", 4: "3840x1714", 8: "1920x858"}
+    for label, env, rows, extra in (
+            ("short-shader", {"FAKE_FFV1_SHORT": "r2-shader.mkv"}, (2,), ("candidate ",)),
+            ("short-bicubic", {"FAKE_FFV1_SHORT": "r2-bicubic.mkv"}, (2,), ("bicubic ",)),
+            ("short-all", {"FAKE_FFV1_SHORT": ".mkv"}, (2, 3, 4, 8), ()),
+            ("size", {"FAKE_FFV1_BADSIZE": ".mkv"}, (2, 3, 4, 8), ())):
+        w = World(tmp, f"{tag}-{label}")
+        pan_clips(w)
+        rc, out, err = w.run(["--rows", ",".join(map(str, rows))], script=script, **env)
+        for row in rows:
+            st, detail = results(out).get(row, ("", ""))
+            want = ("479 frames", "480 frames") if "FAKE_FFV1_SHORT" in env else ("1280x572", master_size[row])
+            if st != "FAIL" or not all(n in detail for n in want + extra) or "xpsnr_delta" in detail or "xpsnr not run" not in detail:
+                bad.append(f"{label}-row{row}:{st}:{detail[:120]}")
+        if any("xpsnr=" in l for l in ffmpeg_log(w)):
+            bad.append(f"{label}-scored-a-file-that-does-not-line-up")
+
+    w = World(tmp, tag + "-inf")
+    rc, out, err = w.run(["--rows", "2,9"], script=script, FAKE_XPSNR_INF="1")
+    st9, d9 = results(out).get(9, ("", ""))
+    st2, d2 = results(out).get(2, ("", ""))
+    if st9 != "PASS" or "xpsnr_on_vs_off=999dB" not in d9:
+        bad.append(f"inf-row9:{st9}:{d9[:80]}")
+    if "chroma_xpsnr=999dB" not in d2 or "xpsnr_delta=+0.00dB" not in d2:
+        bad.append(f"inf-row2:{st2}:{d2[:100]}")
+    return bad
+
+
+def trace_failures(script, tmp, tag):
+    """BENCH_TRACE=1 echoes each argv as it runs; without it nothing is echoed."""
+    bad = []
+    w = World(tmp, tag)
+    rc, out, err = w.run(["--rows", "2"], script=script, BENCH_TRACE="1")
+    if len([l for l in err.splitlines() if l.startswith("trace: row 2: ")]) != 6:
+        bad.append(f"trace:{err[:120]}")
+    rc, out, err = w.run(["--rows", "2"], script=script)
+    if "trace:" in err or "trace:" in out:
+        bad.append("trace-without-flag")
+    return bad
+
+
+def test_scored_inputs(tmp):
+    for name, fn in (("argv", argv_failures), ("inputs", inputs_failures), ("trace", trace_failures)):
+        got = fn(BENCH, tmp, name)
+        check(f"scored inputs: {name}", not got, str(got))
+
+
 def fake_proc(w, name, argv0, pid="4242"):
     """A stand-in /proc (BENCH_PROC) holding one process with a DRM client: the transcode of another pod is not in the
     real /proc of the bench pod."""
@@ -2070,7 +2242,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
                      test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_render_node_pick, test_row_6, test_row_5,
-                     test_shared_files):
+                     test_shared_files, test_scored_inputs):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
             part(sub)

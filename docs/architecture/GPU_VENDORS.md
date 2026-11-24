@@ -1026,6 +1026,16 @@ the run. The admin token reaches curl on stdin, never on a command line. A faile
 stream that returns no segment, is a `FAIL` of that row, not a figure. Exit codes: 0, 1 if any row
 `FAIL`, 2 for a refusal.
 
+**What a score compares.** Every measured ffmpeg argv is appended to `$BENCH_OUT/run-<id>/commands.log`
+(`row N: argv`; `BENCH_TRACE=1` also echoes it as `trace:` on stderr), and `--dry-run` prints the same
+sequence for rows 2, 3, 4 and 8 at the master's own size: the `run_fps` run, the candidate and bicubic writes
+and the xpsnr calls. Before xpsnr runs, rows 2, 3, 4 and 8 write `r<row>-inputs.txt` (size, pix_fmt, range,
+start_time, frame count and first pts of the candidate, the bicubic and the master) and FAIL, with both
+numbers, when a scored file's size or frame count differs from the master's. xpsnr then pairs frame k with
+frame k (both inputs renumbered with `setpts=N`), not by pts, and an infinite score (an identical pair) is
+999 dB, not 0. Scores from before this change paired by pts and are not comparable (run16 scored -27 dB
+where a hand run of the same chains scored -0.47 dB).
+
 **Inputs the owner supplies.** The lossless clips (`<title>_{360,720,1080,2160}p.mkv`, `still_720p.png`,
 `pan_720p.mkv`, `pan_1080p.mkv`), an admin API token for the test Jellyfin, and an ONNX model for
 row 5. No library content is committed (AGENTS.md invariant 18).
