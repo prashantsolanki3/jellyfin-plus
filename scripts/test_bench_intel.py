@@ -770,7 +770,7 @@ def test_mutants(tmp):
         ("write-failure-swallowed", 'return "$rc"\n}\n# fresh_output', 'timed_out "$rc" && return "$rc"; return 0\n}\n# fresh_output', quick_stale),
         ("fresh-check-removed", 'fresh_output() { [[ -s "$1" ]] && ! [[ "$RUN_OUT/.run-start" -nt "$1" ]]; }', 'fresh_output() { :; }', quick_stale),
         ("fresh-mtime-unchecked", 'fresh_output() { [[ -s "$1" ]] && ! [[ "$RUN_OUT/.run-start" -nt "$1" ]]; }', 'fresh_output() { [[ -s "$1" ]]; }', quick_stale),
-        ("row10-no-prime",'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
+        ("row10-no-prime", 'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
         ("row10-short-wait", "LOAD_WAIT=5", "LOAD_WAIT=1", row10_prime_failures),
         ("row10-fdinfo-none", 'fdnote="fdinfo=not visible from the bench pod"', 'fdnote="fdinfo_busy=none"', row10_prime_failures),
         ("row10-stock-unmatched", "jellyfin-ffmpeg(-oidn)?/ffmpeg", "jellyfin-ffmpeg-oidn/ffmpeg",
