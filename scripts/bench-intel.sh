@@ -23,7 +23,8 @@
 #   BENCH_FFMPEG          patched ffmpeg                 /usr/lib/jellyfin-ffmpeg-oidn/ffmpeg
 #   BENCH_STOCK_FFMPEG    stock jellyfin-ffmpeg          /usr/lib/jellyfin-ffmpeg/ffmpeg
 #   BENCH_CLIPS           the lossless clips             /clips      <title>_<height>p.mkv, see below
-#   BENCH_OUT             results and outputs            $BENCH_CLIPS/bench-out
+#   BENCH_OUT             results.jsonl and the row 9 H.264 cut; every other output goes in its run-<id> directory   $BENCH_CLIPS/bench-out
+#   BENCH_RUN_ID          names this run's directory $BENCH_OUT/run-<id>, created fresh (an existing one is refused, exit 2)   <timestamp>-<pid>
 #   BENCH_TITLE           clip title prefix              tears       (the second source: BENCH_TITLE=anim)
 #   BENCH_RENDER_NODE     the Arc render node            the first vendor-0x8086 node of /dev/dri, else its only node, else /dev/dri/renderD128
 #   BENCH_VULKAN_DEVICE   the ffmpeg Vulkan device (vk:<this>)   0 with one GPU node in /dev/dri, Intel (a name match) with several
@@ -61,6 +62,10 @@ STOCK_FFMPEG="${BENCH_STOCK_FFMPEG:-/usr/lib/jellyfin-ffmpeg/ffmpeg}"
 PREFIX="$(dirname "$PATCHED_FFMPEG")"
 CLIPS="${BENCH_CLIPS:-/clips}"
 OUT="${BENCH_OUT:-$CLIPS/bench-out}"
+# Every output a row scores or reads back goes in a directory this run creates, so a file an earlier run left (run15 scored
+# run10's) can never be mistaken for this run's. Only results.jsonl (the history) and the row 9 H.264 cut (a derived input) live in $OUT.
+if [[ -n "${BENCH_RUN_ID:-}" ]]; then RUN_ID="$BENCH_RUN_ID"; else printf -v RUN_ID '%(%Y%m%dT%H%M%S)T-%d' -1 "$$"; fi
+RUN_OUT="$OUT/run-$RUN_ID"
 TITLE="${BENCH_TITLE:-tears}"
 
 # pick_render_node sets NODE and VK_DEV. The Arc is not always renderD128 (an RTX can take it), and deriving Vulkan from
@@ -247,7 +252,7 @@ print_plan() {
     echo "plan: required filters: $(ffmpeg_required_filters intel) fsr2"
     echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
     echo "plan: every measured ffmpeg runs under timeout --kill-after=10 ${RUN_TIMEOUT}s (BENCH_RUN_TIMEOUT); row 5 runs ${ORT_RUNS}x per clip, ${ORT_FRAMES} frames"
-    echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; render node: $NODE"
+    echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; run dir: $RUN_OUT (fresh, refused if it exists); render node: $NODE"
     echo "plan: vulkan device: vk:$VK_DEV"
     for r in "${ROWS[@]}"; do
         printf 'plan: row %s: %s\n' "$r" "$(row_title "$r")"
@@ -268,16 +273,16 @@ print_plan() {
                 echo "plan: row 5 cmd: a 360p stream with neural=realesr-anime-x2, then NeuralDevice from $JF_URL/JellyfinPlus/Session/<its PlaySessionId>"
                 echo "plan: row 5 threshold: device=openvino; largest NeuralMaxSourceHeight holding >=${E2E_X}x" ;;
             6)  echo "plan: row 6 cmd: set NeuralMaxSourceHeight=480 (restored after), transcode $(clip 720) with neural=$NEURAL_LEVEL, read Session/<id> NeuralRouting" ;;
-            7)  cmd_still "$CLIPS/still_720p.png" "$(chain_fsr2 1920 1080)" "$OUT/still-fsr2.txt"; plan_cmd 7
-                cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$OUT/still-control.txt"; plan_cmd 7
+            7)  cmd_still "$CLIPS/still_720p.png" "$(chain_fsr2 1920 1080)" "$RUN_OUT/still-fsr2.txt"; plan_cmd 7
+                cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$RUN_OUT/still-control.txt"; plan_cmd 7
                 echo "plan: row 7 skip frames: 3x=$(still_skip 3) 2x=$(still_skip 2) 1.5x=$(still_skip 1.5)"
                 echo "plan: row 7 threshold: mean<=$STILL_MEAN_MAX peak<=$STILL_PEAK_MAX in ${STILL_PEAK_PCT}% control==0" ;;
-            8)  cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 1920 1080)" "$OUT/pan-fsr2.mkv"; plan_cmd 8
-                cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic 1920 1080)" "$OUT/pan-bicubic.mkv"; plan_cmd 8
+            8)  cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 1920 1080)" "$RUN_OUT/pan-fsr2.mkv"; plan_cmd 8
+                cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic 1920 1080)" "$RUN_OUT/pan-bicubic.mkv"; plan_cmd 8
                 echo "plan: row 8 threshold: xpsnr(fsr2)>=xpsnr(bicubic)" ;;
             9)  if [[ ! -f "$(hwdec_clip)" ]]; then cmd_h264_cut "${OUT}/${TITLE}_1080p_h264.part.mkv"; printf 'plan: row 9 prep cmd: %s\n' "${CMD[*]}"; fi
-                cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)" "$OUT/hwdec-on.mkv"; plan_cmd 9
-                cmd_run "$(hwdec_clip)" "$(chain_shader 1920 1080)" "$OUT/hwdec-off.mkv"; plan_cmd 9
+                cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)" "$RUN_OUT/hwdec-on.mkv"; plan_cmd 9
+                cmd_run "$(hwdec_clip)" "$(chain_shader 1920 1080)" "$RUN_OUT/hwdec-off.mkv"; plan_cmd 9
                 cmd_run_hw "$(hwdec_clip)" "$(chain_zerocopy 1920 1080)"; printf 'plan: row 9 zero-copy cmd: %s\n' "${CMD[*]}"
                 echo "plan: row 9 threshold: cpu gain>=${HWDEC_CPU_GAIN}% xpsnr(on,off)>=${HWDEC_XPSNR_MIN}dB no 'Conversion failed!'" ;;
             10) echo "plan: row 10 cmd: forced transcode through $JF_URL, ffprobe the segment codec, prime $JF_URL/JellyfinPlus/Gpu/Load, read it again ${LOAD_WAIT}s later and compare with the fdinfo figure when the transcode is visible to the bench pod"
@@ -307,6 +312,34 @@ record() { # row status detail
     [[ "$2" != FAIL ]] || FAILED=1
     mkdir -p "$OUT"
     jq -nc --argjson row "$1" --arg status "$2" --arg detail "$3" '{row:$row,status:$status,detail:$detail}' >> "$OUT/results.jsonl"
+}
+
+# write_run <output>: run CMD, which writes <output>. The target is removed first, so a run that fails leaves nothing
+# to score. Any non-zero exit is a failure (not only a timeout): it returns ffmpeg's status with WRITE_ERR set to the
+# reason and ffmpeg's last stderr line. Call it directly, not in $(...).
+WRITE_ERR=""
+write_run() {
+    local out="$1" log rc=0 last
+    rm -f "$out"
+    log=$(mktemp)
+    ff_exec >/dev/null 2>"$log" || rc=$?
+    if [[ "$rc" != 0 ]]; then
+        last=$(tr '\r' '\n' <"$log" | awk 'NF { l = $0 } END { print substr(l, 1, 200) }')
+        WRITE_ERR="$(why "$rc" "ffmpeg failed writing $out: $last")"
+    fi
+    rm -f "$log"
+    return "$rc"
+}
+# fresh_output <file>: the file exists, is not empty and is no older than this run's start mark, so it is what this
+# run wrote. `! mark -nt file` rather than `file -nt mark`: a file written in the mark's own second is fresh.
+fresh_output() { [[ -s "$1" ]] && ! [[ "$RUN_OUT/.run-start" -nt "$1" ]]; }
+# require_fresh <row> <file>...: records FAIL for the first file this run did not write and returns 1 (the caller then `return 0`, as a bare return would carry the 1 out of the row and errexit would end the run).
+require_fresh() {
+    local row="$1" f
+    shift
+    for f in "$@"; do
+        fresh_output "$f" || { record "$row" FAIL "output not written by this run: $f"; return 1; }
+    done
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || [[ -x "$1" ]] || die "missing tool: $1"; }
@@ -423,7 +456,7 @@ run_fps() {
 xpsnr_y() {
     local log v rc
     log=$(mktemp)
-    cmd_xpsnr "$1" "$2" "$OUT/xpsnr.txt"
+    cmd_xpsnr "$1" "$2" "$RUN_OUT/xpsnr.txt"
     ff_exec 2>"$log" >/dev/null || { rc=$?; rm -f "$log"; return "$rc"; }
     # ffmpeg prints `XPSNR  y: 14.4167  u: ...`: two spaces after XPSNR, so match on whitespace, not one blank
     v=$(awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") v = $(i + 1) } END { if (v != "") print v + 0 }' "$log")
@@ -438,7 +471,7 @@ xpsnr_y() {
 xpsnr_chroma() {
     local log v rc
     log=$(mktemp)
-    cmd_xpsnr "$1" "$2" "$OUT/xpsnr.txt"
+    cmd_xpsnr "$1" "$2" "$RUN_OUT/xpsnr.txt"
     ff_exec 2>"$log" >/dev/null || { rc=$?; rm -f "$log"; return "$rc"; }
     v=$(awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) { if ($i == "u:") u = $(i + 1); if ($i == "v:") w = $(i + 1) } }
              END { if (u != "" && w != "") print (u + 0 < w + 0 ? u : w) + 0 }' "$log")
@@ -525,7 +558,7 @@ api_stream() {
     case "$h" in 2160) br=20000000 ;; 1440) br=8000000 ;; *) br=4000000 ;; esac
     STREAM_SID="bench-$(date +%s)-$h"; STREAM_SEG=""; STREAM_SPEED=0; STREAM_ERR=""
     [[ -n "$id" ]] || { STREAM_ERR="the clip is not in the Jellyfin library"; return 1; }
-    dir="$OUT/stream-$h"; mkdir -p "$dir"
+    dir="$RUN_OUT/stream-$h"; mkdir -p "$dir"
     m3u8="/Videos/$id/master.m3u8?MediaSourceId=$id&PlaySessionId=$STREAM_SID&VideoCodec=hevc,h264&MaxHeight=$h&VideoBitrate=$br&TranscodingMaxAudioChannels=2&allowVideoStreamCopy=false&allowAudioStreamCopy=false${extra:+&$extra}"
     api "$m3u8" >"$dir/master.m3u8" || { STREAM_ERR="GET master.m3u8 failed"; return 1; }
     variant=$(awk '!/^#/ && NF { print; exit }' "$dir/master.m3u8")
@@ -582,23 +615,24 @@ xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB, si
 
 shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size
     local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d cu status=PASS detail="" src ow oh rc=0 xrc=0
-    mkdir -p "$OUT"
+    local shader_out="$RUN_OUT/r$row-shader.mkv" bicubic_out="$RUN_OUT/r$row-bicubic.mkv"
     read -r ow oh <<<"$(master_dims "$(clip "$h")" "$w" "$h")"
     fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$ow" "$oh")") || { rc=$?; record "$row" FAIL "$(why "$rc" "ffmpeg failed")"; return; }
-    cmd_run "$(clip "$sh")" "$(chain_shader "$ow" "$oh")" "$OUT/r$row-shader.mkv"; ff_exec >/dev/null 2>&1 || rc=$?
-    timed_out "$rc" && { record "$row" FAIL "$(why "$rc" "")"; return; }
-    cmd_run "$(clip "$sh")" "$(chain_bicubic "$ow" "$oh")" "$OUT/r$row-bicubic.mkv"; ff_exec >/dev/null 2>&1 || rc=$?
-    timed_out "$rc" && { record "$row" FAIL "$(why "$rc" "")"; return; }
+    cmd_run "$(clip "$sh")" "$(chain_shader "$ow" "$oh")" "$shader_out"
+    write_run "$shader_out" || { record "$row" FAIL "$WRITE_ERR"; return; }
+    cmd_run "$(clip "$sh")" "$(chain_bicubic "$ow" "$oh")" "$bicubic_out"
+    write_run "$bicubic_out" || { record "$row" FAIL "$WRITE_ERR"; return; }
+    require_fresh "$row" "$shader_out" "$bicubic_out" || return 0
     detail="fps=$fps"
-    d=$(xpsnr_delta "$OUT/r$row-shader.mkv" "$OUT/r$row-bicubic.mkv" "$(clip "$h")") || xrc=$?
+    d=$(xpsnr_delta "$shader_out" "$bicubic_out" "$(clip "$h")") || xrc=$?
     if [[ "$xrc" == 0 ]]; then
         detail+=" xpsnr_delta=${d}dB"
         ge "$d" "$xmin" || status=FAIL
-        if cu=$(xpsnr_chroma "$OUT/r$row-shader.mkv" "$(clip "$h")"); then
+        if cu=$(xpsnr_chroma "$shader_out" "$(clip "$h")"); then
             detail+=" chroma_xpsnr=${cu}dB"
             ge "$cu" "$CHROMA_XPSNR_MIN" || status=FAIL
         else
-            detail+=" chroma xpsnr failed ($(why "$?" "ffmpeg xpsnr of $OUT/r$row-shader.mkv"))"
+            detail+=" chroma xpsnr failed ($(why "$?" "ffmpeg xpsnr of $shader_out"))"
             status=FAIL
         fi
     else
@@ -680,11 +714,10 @@ row_6() {
     CFG_ID=$(api /Plugins | jq -r 'first(.[] | select(.Name == "Jellyfin Plus") | .Id) // empty' || true)
     [[ -n "$CFG_ID" ]] || { record 6 FAIL "the Jellyfin Plus plugin is not listed by GET /Plugins"; return; }
     cfg=$(api "/Plugins/$CFG_ID/Configuration") || { record 6 FAIL "GET the plugin configuration failed"; return; }
-    mkdir -p "$OUT"
     if [[ "$(jq -r '.NeuralMaxSourceHeight // 0' <<<"$cfg")" != 480 || "$(jq -r '.NeuralAllowed // false' <<<"$cfg")" != true ]]; then
-        CFG_ORIG="$OUT/plugin-config.orig.json"
+        CFG_ORIG="$RUN_OUT/plugin-config.orig.json"
         printf '%s' "$cfg" >"$CFG_ORIG"
-        new="$OUT/plugin-config.row6.json"
+        new="$RUN_OUT/plugin-config.row6.json"
         jq -c '.NeuralMaxSourceHeight = 480 | .NeuralAllowed = true' <<<"$cfg" >"$new"
         cfg_post "$new" || { cfg_restore; record 6 FAIL "could not set NeuralMaxSourceHeight=480 on the plugin configuration"; return; }
     fi
@@ -714,19 +747,18 @@ row_6() {
 
 row_7() {
     [[ -f "$CLIPS/still_720p.png" ]] || { record 7 SKIP "no $CLIPS/still_720p.png"; return; }
-    mkdir -p "$OUT"
     local skip kind status=PASS detail f rc
     skip=$(still_skip 1.5)
     for kind in fsr2 control; do
-        if [[ "$kind" == fsr2 ]]; then cmd_still "$CLIPS/still_720p.png" "$(chain_fsr2 1920 1080)" "$OUT/still-$kind.txt"
-        else cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$OUT/still-$kind.txt"; fi
+        if [[ "$kind" == fsr2 ]]; then cmd_still "$CLIPS/still_720p.png" "$(chain_fsr2 1920 1080)" "$RUN_OUT/still-$kind.txt"
+        else cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$RUN_OUT/still-$kind.txt"; fi
         ff_exec >/dev/null 2>&1 || { rc=$?; record 7 FAIL "$(why "$rc" "$kind chain failed")"; return; }
     done
     # Row 7 scales 720p to 1080p, i.e. 1.5x: skip = ceil(8 * 2.25) = 18 frames.
-    f=$(awk -v skip="$skip" '/YAVG=/ { split($0, a, "="); n++; if (n > skip) { s += a[2]; c++; if (a[2] > 16) bad++ } } END { printf "%.3f %.1f\n", c ? s / c : -1, c ? 100 * (c - bad) / c : 0 }' "$OUT/still-fsr2.txt")
+    f=$(awk -v skip="$skip" '/YAVG=/ { split($0, a, "="); n++; if (n > skip) { s += a[2]; c++; if (a[2] > 16) bad++ } } END { printf "%.3f %.1f\n", c ? s / c : -1, c ? 100 * (c - bad) / c : 0 }' "$RUN_OUT/still-fsr2.txt")
     local mean pct ctl
     mean=${f% *}; pct=${f#* }
-    ctl=$(awk -v skip="$skip" '/YAVG=/ { split($0, a, "="); n++; if (n > skip) { s += a[2]; c++ } } END { printf "%.3f\n", c ? s / c : -1 }' "$OUT/still-control.txt")
+    ctl=$(awk -v skip="$skip" '/YAVG=/ { split($0, a, "="); n++; if (n > skip) { s += a[2]; c++ } } END { printf "%.3f\n", c ? s / c : -1 }' "$RUN_OUT/still-control.txt")
     le "$mean" "$STILL_MEAN_MAX" && ge "$mean" 0 || status=FAIL
     ge "$pct" "$STILL_PEAK_PCT" || status=FAIL
     [[ "$ctl" == 0.000 ]] || status=FAIL
@@ -736,13 +768,14 @@ row_7() {
 
 row_8() {
     [[ -f "$CLIPS/pan_720p.mkv" && -f "$CLIPS/pan_1080p.mkv" ]] || { record 8 SKIP "no pan_720p.mkv / pan_1080p.mkv"; return; }
-    mkdir -p "$OUT"
-    local d ow oh rc=0
+    local d ow oh rc=0 fsr2_out="$RUN_OUT/pan-fsr2.mkv" bicubic_out="$RUN_OUT/pan-bicubic.mkv"
     read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"
-    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 "$ow" "$oh")" "$OUT/pan-fsr2.mkv"; ff_exec >/dev/null 2>&1 || { rc=$?; record 8 FAIL "$(why "$rc" "fsr2 chain failed")"; return; }
-    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic "$ow" "$oh")" "$OUT/pan-bicubic.mkv"; ff_exec >/dev/null 2>&1 || rc=$?
-    timed_out "$rc" && { record 8 FAIL "$(why "$rc" "")"; return; }
-    d=$(xpsnr_delta "$OUT/pan-fsr2.mkv" "$OUT/pan-bicubic.mkv" "$CLIPS/pan_1080p.mkv") || { rc=$?; record 8 FAIL "xpsnr failed ($(why "$rc" "the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv"))"; return; }
+    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 "$ow" "$oh")" "$fsr2_out"
+    write_run "$fsr2_out" || { record 8 FAIL "$WRITE_ERR"; return; }
+    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic "$ow" "$oh")" "$bicubic_out"
+    write_run "$bicubic_out" || { record 8 FAIL "$WRITE_ERR"; return; }
+    require_fresh 8 "$fsr2_out" "$bicubic_out" || return 0
+    d=$(xpsnr_delta "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv") || { rc=$?; record 8 FAIL "xpsnr failed ($(why "$rc" "the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv"))"; return; }
     if ge "$d" 0; then record 8 PASS "xpsnr_delta=${d}dB"; else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda"; fi
 }
 
@@ -787,22 +820,23 @@ zerocopy_note() {
 }
 
 row_9() {
-    mkdir -p "$OUT"
-    local on_log off_log on_cpu off_cpu gain x status=PASS rc zc
-    on_log="$OUT/hwdec-on.log"; off_log="$OUT/hwdec-off.log"
+    local on_log off_log on_cpu off_cpu gain x status=PASS rc zc on_out="$RUN_OUT/hwdec-on.mkv" off_out="$RUN_OUT/hwdec-off.mkv"
+    on_log="$RUN_OUT/hwdec-on.log"; off_log="$RUN_OUT/hwdec-off.log"
     hwdec_source || { record 9 FAIL "$HWDEC_ERR"; return; }
+    rm -f "$on_out" "$off_out"
     # the working path: VA-API decode, download, upload to Vulkan, libplacebo to yuv420p, download
-    cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" "$OUT/hwdec-on.mkv"
+    cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" "$on_out"
     ff_exec >/dev/null 2>"$on_log" || { rc=$?; record 9 FAIL "$(why "$rc" "hardware decode chain failed: $(tail -1 "$on_log")")"; return; }
     ! grep -q 'Conversion failed' "$on_log" || status=FAIL
     # the control reads the same H.264 clip with software decode, so the CPU and quality comparison is like for like
-    cmd_run "$HWDEC_SRC" "$(chain_shader 1920 1080)" "$OUT/hwdec-off.mkv"
+    cmd_run "$HWDEC_SRC" "$(chain_shader 1920 1080)" "$off_out"
     ff_exec >/dev/null 2>"$off_log" || { rc=$?; record 9 FAIL "$(why "$rc" "software chain failed")"; return; }
+    require_fresh 9 "$on_out" "$off_out" || return 0
     zc=$(zerocopy_note)
     on_cpu=$(tr '\r' '\n' <"$on_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
     off_cpu=$(tr '\r' '\n' <"$off_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
     gain=$(awk -v a="${on_cpu:-0}" -v b="${off_cpu:-0}" 'BEGIN { printf "%.1f\n", (b > 0 ? (b - a) / b * 100 : 0) }')
-    x=$(xpsnr_y "$OUT/hwdec-on.mkv" "$OUT/hwdec-off.mkv") || { rc=$?; record 9 FAIL "xpsnr failed ($(why "$rc" "hwdec-on against hwdec-off")) $zc"; return; }
+    x=$(xpsnr_y "$on_out" "$off_out") || { rc=$?; record 9 FAIL "xpsnr failed ($(why "$rc" "hwdec-on against hwdec-off")) $zc"; return; }
     ge "$gain" "$HWDEC_CPU_GAIN" || status=FAIL
     ge "$x" "$HWDEC_XPSNR_MIN" || status=FAIL
     record 9 "$status" "cpu_gain=${gain}% xpsnr_on_vs_off=${x}dB source=$(basename "$HWDEC_SRC") $zc (the video-engine-busy and command-identical-when-off checks are made on the served session, row 12)"
@@ -813,24 +847,22 @@ row_10() {
     local id codec load fd fdnote status=PASS stream_err="" pid
     item_id "${TITLE}_1080p.mkv" || { record 10 FAIL "$ITEM_ERR"; return; }
     id="$ITEM_ID"
-    mkdir -p "$OUT"
-    rm -f "$OUT/r10-load" "$OUT/r10-fd" "$OUT/r10-pid"
     # Sampled while the stream's segments are being produced; both read the same LOAD_WAIT window. The plugin computes
     # a figure over the time since its last call and caches it (the first call has no baseline): a priming call
     # starts the window, the reading comes >= LOAD_WAIT s later.
     ( sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true
-      sleep "$LOAD_WAIT"; api /JellyfinPlus/Gpu/Load | jq -r '.gpuBusyPercent // empty' >"$OUT/r10-load" ) &
+      sleep "$LOAD_WAIT"; api /JellyfinPlus/Gpu/Load | jq -r '.gpuBusyPercent // empty' >"$RUN_OUT/r10-load" ) &
     ( sleep 2; pid=$(ffmpeg_pid)
       if [[ -n "$pid" ]]; then
-          echo "$pid" >"$OUT/r10-pid"
-          fdinfo_busy "$pid" "$LOAD_WAIT" | sort -k2 -nr | awk 'NR == 1 { print $2 }' >"$OUT/r10-fd"
+          echo "$pid" >"$RUN_OUT/r10-pid"
+          fdinfo_busy "$pid" "$LOAD_WAIT" | sort -k2 -nr | awk 'NR == 1 { print $2 }' >"$RUN_OUT/r10-fd"
       fi ) &
     api_stream "$id" 1080 "sr=fsrcnnx" || stream_err="$STREAM_ERR"
     wait
     [[ -z "$stream_err" ]] || { record 10 FAIL "stream: $stream_err"; return; }
-    load=$(cat "$OUT/r10-load" 2>/dev/null || true)
-    fd=$(cat "$OUT/r10-fd" 2>/dev/null || true)
-    pid=$(cat "$OUT/r10-pid" 2>/dev/null || true)
+    load=$(cat "$RUN_OUT/r10-load" 2>/dev/null || true)
+    fd=$(cat "$RUN_OUT/r10-fd" 2>/dev/null || true)
+    pid=$(cat "$RUN_OUT/r10-pid" 2>/dev/null || true)
     codec=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "${STREAM_SEG:-/dev/null}" 2>/dev/null || true)
     case "$codec" in h264 | hevc) ;; *) status=FAIL ;; esac
     # The transcode runs in the Jellyfin pod, whose /proc this pod cannot read: then the plugin's figure is all there is.
@@ -885,7 +917,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,13p;21,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p;21,48p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -907,6 +939,7 @@ case "$NEURAL_LEVEL" in
     realesr-anime-x2 | realesr-anime-x4 | realesr-general-x4) ;;
     *) die "BENCH_NEURAL_LEVEL must be realesr-anime-x2, realesr-anime-x4 or realesr-general-x4, got: $NEURAL_LEVEL" ;;
 esac
+[[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "BENCH_RUN_ID must be letters, digits, dot, dash or underscore (it names a directory), got: $RUN_ID"
 parse_block_windows
 
 if [[ $DRY == 1 ]]; then
@@ -923,6 +956,10 @@ FFPROBE="$(dirname "$STOCK_FFMPEG")/ffprobe"
 need "$PATCHED_FFMPEG"; need "$FFPROBE"; need curl; need jq; need awk; need timeout
 [[ -d "$CLIPS" ]] || die "no clips directory: $CLIPS"
 mkdir -p "$OUT"
+# plain mkdir, never -p: a directory that exists holds an earlier run's files, and the run does not start in it
+[[ ! -e "$RUN_OUT" ]] || die "run directory $RUN_OUT already exists (BENCH_RUN_ID=$RUN_ID was used before): every run writes a fresh one"
+mkdir "$RUN_OUT" || die "cannot create $RUN_OUT"
+: >"$RUN_OUT/.run-start"
 # The list is captured, then searched: `-filters | grep -q` lets grep quit at its match, the writer takes
 # SIGPIPE, and pipefail reports a filter that is there as missing.
 FILTERS=$("$PATCHED_FFMPEG" -hide_banner -filters 2>/dev/null) || die "$PATCHED_FFMPEG -filters failed"

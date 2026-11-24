@@ -15,6 +15,8 @@ Needs no GPU, ffmpeg, docker, network or Jellyfin. It runs the real scripts/benc
     the API rows PASS on a good server and FAIL on a failing one, the token stays off curl's command
     line, rows 1 and 12 read only the shim-log lines of this run, row 6 sets and restores the plugin
     configuration, row 5 reads the device of its own stream, the gates read HHMM as decimal;
+  - a row scores only files its own run wrote (rev-hxlit): a fresh run-<id> directory per run, a used id
+    refused, any failed write a FAIL, a missing or old scored file a FAIL;
   - scripts/plugin-meta.sh holds the plugin GUID and target ABI once (Plugin.cs and manifest.json agree);
   - docker/intel/Dockerfile keeps its pins (base digest, FSR2 commit, SDK sha512), builds the Intel
     variant, carries the acceptance checks, and its digest matches the spec page;
@@ -44,6 +46,7 @@ NODE = "/dev/dri/renderD128"
 SHADER = "/usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl"
 INIT = "-init_hw_device vulkan=vk:0 -filter_hw_device vk"
 OUT = "/clips/bench-out"
+RUN = f"{OUT}/run-plan"  # a dry run's fresh per-run directory (BENCH_RUN_ID=plan, see run())
 
 
 def shader(w, h):
@@ -136,11 +139,13 @@ EXACT = [
     "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160)),
     "plan: row 7 cmd: " + (f"{FF} -hide_banner -nostdin -y {INIT} -loop 1 -framerate 24 -t 10 -i /clips/still_720p.png "
                            f"-vf {FSR2_CHAIN},tblend=all_mode=difference,signalstats,"
-                           f"metadata=print:key=lavfi.signalstats.YAVG:file={OUT}/still-fsr2.txt -an -f null -"),
+                           f"metadata=print:key=lavfi.signalstats.YAVG:file={RUN}/still-fsr2.txt -an -f null -"),
     "plan: row 7 skip frames: 3x=72 2x=32 1.5x=18",
     "plan: row 9 prep cmd: " + PREP,
-    "plan: row 9 cmd: " + hw_cmd(H264, HWDEC_CHAIN, f"-c:v ffv1 {OUT}/hwdec-on.mkv"),
-    "plan: row 9 cmd: " + run_cmd(H264, shader(1920, 1080), f"{OUT}/hwdec-off.mkv"),
+    "plan: row 9 cmd: " + hw_cmd(H264, HWDEC_CHAIN, f"-c:v ffv1 {RUN}/hwdec-on.mkv"),
+    "plan: row 9 cmd: " + run_cmd(H264, shader(1920, 1080), f"{RUN}/hwdec-off.mkv"),
+    "plan: row 8 cmd: " + run_cmd("/clips/pan_720p.mkv", FSR2_CHAIN, f"{RUN}/pan-fsr2.mkv"),
+    "plan: row 8 cmd: " + run_cmd("/clips/pan_720p.mkv", bicubic(1920, 1080), f"{RUN}/pan-bicubic.mkv"),
     "plan: row 9 zero-copy cmd: " + hw_cmd(H264, ZEROCOPY_CHAIN, "-f null -"),
     "plan: row 13: MANUAL, the owner's browser check over a port-forward",
 ]
@@ -170,7 +175,12 @@ def clean_env(extra=None, path=None):
 
 
 def run(script, args, env=None):
-    p = subprocess.run([BASH, script, *args], capture_output=True, text=True, env=env or clean_env(), timeout=60)
+    env = dict(env or clean_env())
+    # the plan prints the run directory: a fixed id keeps its goldens fixed. A real run keeps the script's own
+    # unique default, so repeated runs in one BENCH_OUT do not collide.
+    if "--dry-run" in args or "--plan" in args:
+        env.setdefault("BENCH_RUN_ID", "plan")
+    p = subprocess.run([BASH, script, *args], capture_output=True, text=True, env=env, timeout=60)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -400,6 +410,26 @@ case "$*" in
 *-benchmark*)
     [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4
+    # an ffv1 write leaves its output (the last argument) as ffmpeg does. FAKE_FFV1_FAIL / _SKIP / _STALE hold a substring
+    # of the output path they apply to: _FAIL exits 1 (a full disk), _SKIP exits 0 and writes nothing, _STALE writes it
+    # with a year-2000 mtime, as a leftover of an earlier run would be.
+    case "$*" in
+    *"-c:v ffv1"*)
+        for a in "$@"; do last="$a"; done
+        if [ -n "${FAKE_FFV1_FAIL:-}" ]; then
+            case "$last" in *"$FAKE_FFV1_FAIL"*) echo "Error writing trailer: No space left on device" >&2; exit 1;; esac
+        fi
+        skip=""
+        if [ -n "${FAKE_FFV1_SKIP:-}" ]; then
+            case "$last" in *"$FAKE_FFV1_SKIP"*) skip=1;; esac
+        fi
+        if [ -z "$skip" ]; then
+            echo ffv1-stub > "$last"
+            if [ -n "${FAKE_FFV1_STALE:-}" ]; then
+                case "$last" in *"$FAKE_FFV1_STALE"*) touch -t 200001010000 "$last";; esac
+            fi
+        fi;;
+    esac
     # the VA-API decode run uses half the CPU of the software one
     case "$*" in
     *-hwaccel*) printf 'frame=  240 fps=120\rbench: utime=0.5s stime=0.1s rtime=2.0s\n' >&2;;
@@ -605,6 +635,7 @@ class World:
 
     def __init__(self, tmp, name, scenario=None, extra=None):
         self.root = os.path.join(tmp, name)
+        self.runs = 0
         os.makedirs(self.root)
         self.stubs = stub_bin(self.root, fake_api=True)
         self.clips = os.path.join(self.root, "clips")
@@ -628,7 +659,11 @@ class World:
 
     def run(self, args, script=BENCH, **extra):
         # the quiet-box gates read the real clock and /proc: the gate tests call run() themselves
-        return run(script, ["--no-gates", *args], dict(self.env, **extra))
+        # every call writes its own run directory unless the test names one (BENCH_RUN_ID=...)
+        self.runs += 1
+        env = dict(self.env, BENCH_RUN_ID=f"w{self.runs}")
+        env.update(extra)
+        return run(script, ["--no-gates", *args], env)
 
     def log(self):
         p = os.path.join(self.fake, "log.jsonl")
@@ -673,6 +708,10 @@ def test_stub_run(tmp):
     env2 = dict(env, BENCH_FFMPEG=p, BENCH_STOCK_FFMPEG=p, PATH=bare + os.pathsep + env["PATH"])
     rc, _, err = run(BENCH, ["--no-gates", "--rows", "13"], env2)
     check("a binary without the Intel filters is refused", rc == 2 and "not the Intel build" in err, f"rc={rc} {err}")
+
+
+def quick_stale(script, tmp, tag):
+    return stale_output_failures(script, tmp, tag, full=False)
 
 
 def test_mutants(tmp):
@@ -724,7 +763,14 @@ def test_mutants(tmp):
         ("row9-cut-every-run", '[[ -f "$HWDEC_SRC" ]] && return 0', ':', row9_failures),
         ("row9-no-zerocopy", 'zc=$(zerocopy_note)', 'zc=""', row9_failures),
         ("row9-zerocopy-fatal", 'zc=$(zerocopy_note)', 'zc=$(zerocopy_note); [[ "$zc" != zerocopy=FAIL* ]] || status=FAIL', row9_failures),
-        ("row10-no-prime", 'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
+        ("run-dir-shared", 'RUN_OUT="$OUT/run-$RUN_ID"', 'RUN_OUT="$OUT"', quick_stale),
+        ("run-dir-reuse-allowed", '[[ ! -e "$RUN_OUT" ]] || die', ': || die', quick_stale),
+        ("run-id-fixed", "printf -v RUN_ID '%(%Y%m%dT%H%M%S)T-%d' -1 \"$$\"", "RUN_ID=run", quick_stale),
+        ("run-id-unchecked", '[[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||', ': ||', quick_stale),
+        ("write-failure-swallowed", 'return "$rc"\n}\n# fresh_output', 'timed_out "$rc" && return "$rc"; return 0\n}\n# fresh_output', quick_stale),
+        ("fresh-check-removed", 'fresh_output() { [[ -s "$1" ]] && ! [[ "$RUN_OUT/.run-start" -nt "$1" ]]; }', 'fresh_output() { :; }', quick_stale),
+        ("fresh-mtime-unchecked", 'fresh_output() { [[ -s "$1" ]] && ! [[ "$RUN_OUT/.run-start" -nt "$1" ]]; }', 'fresh_output() { [[ -s "$1" ]]; }', quick_stale),
+        ("row10-no-prime",'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
         ("row10-short-wait", "LOAD_WAIT=5", "LOAD_WAIT=1", row10_prime_failures),
         ("row10-fdinfo-none", 'fdnote="fdinfo=not visible from the bench pod"', 'fdnote="fdinfo_busy=none"', row10_prime_failures),
         ("row10-stock-unmatched", "jellyfin-ffmpeg(-oidn)?/ffmpeg", "jellyfin-ffmpeg-oidn/ffmpeg",
@@ -1549,6 +1595,96 @@ def row9_failures(script, tmp, tag):
     return bad
 
 
+RUN_FILES = ["r2-shader.mkv", "r2-bicubic.mkv", "r3-shader.mkv", "r3-bicubic.mkv", "r4-shader.mkv", "r4-bicubic.mkv",
+             "pan-fsr2.mkv", "pan-bicubic.mkv", "hwdec-on.mkv", "hwdec-off.mkv"]
+SHARED = ("results.jsonl", "tears_1080p_h264.mkv")
+
+
+def stale_output_failures(script, tmp, tag, full=True):
+    """rev-hxlit: run15 scored files an earlier run (run10) had left, and reported run10's deltas. A row scores only
+    what this run wrote: a fresh run-<id> directory per run (an existing one is refused), any non-zero exit of a
+    file-writing ffmpeg is a FAIL, and a scored file that is missing, empty or older than the run start is a FAIL.
+    full=False leaves rows 6 and 10 (the plugin-config and r10 files, ~8 s) to the one full run; the mutants skip them."""
+    bad = []
+    rows = (2, 3, 4, 8, 9)
+
+    # two runs in one BENCH_OUT write into their own run directories; only the history and the H.264 cut are shared
+    w = World(tmp, tag + "-dirs")
+    pan_clips(w)
+    for i, run_rows in ((1, "2,3,4,6,8,9,10" if full else "2,3,4,8,9"), (2, "2,3,4,8,9")):
+        rc, out, err = w.run(["--rows", run_rows], script=script, BENCH_RUN_ID=f"id{i}")
+        res = results(out)
+        for row in rows:
+            st, detail = res.get(row, ("", ""))
+            if st != "PASS" or ("xpsnr_on_vs_off" if row == 9 else "xpsnr_delta=+10.00dB") not in detail:
+                bad.append(f"dirs-run{i}-row{row}:{st}:{detail[:60]}")
+        d = os.path.join(w.out, f"run-id{i}")
+        missing = [f for f in RUN_FILES if not os.path.isfile(os.path.join(d, f))]
+        if missing:
+            bad.append(f"dirs-run{i}-missing:{missing}")
+    first = os.path.join(w.out, "run-id1")
+    for name in ("hwdec-on.log", "stream-2160") + (("plugin-config.row6.json", "plugin-config.orig.json", "r10-load") if full else ()):
+        if not os.path.exists(os.path.join(first, name)):
+            bad.append(f"dirs-not-in-run-dir:{name}")
+    stray = sorted(n for n in os.listdir(w.out) if n not in SHARED and not n.startswith("run-"))
+    if stray or not os.path.isfile(os.path.join(w.out, "tears_1080p_h264.mkv")):
+        bad.append(f"dirs-shared-dir:{os.listdir(w.out)}")
+    if sorted(n for n in os.listdir(w.out) if n.startswith("run-")) != ["run-id1", "run-id2"]:
+        bad.append(f"dirs-run-dirs:{os.listdir(w.out)}")
+    if len(w.jsonl()) != (12 if full else 10):
+        bad.append(f"dirs-history:{len(w.jsonl())}")
+
+    # without BENCH_RUN_ID each run still gets its own directory
+    w = World(tmp, tag + "-default")
+    for _ in range(2):
+        run(script, ["--no-gates", "--rows", "13"], w.env)
+    dirs = [n for n in os.listdir(w.out) if n.startswith("run-")]
+    if len(dirs) != 2:
+        bad.append(f"default-id:{dirs}")
+
+    # the files of earlier runs are all still on disk, and a run that writes nothing, or something old, scores none of them
+    for label, env in (("skip", {"FAKE_FFV1_SKIP": "mkv"}), ("stale", {"FAKE_FFV1_STALE": "mkv"})):
+        w = World(tmp, f"{tag}-{label}")
+        pan_clips(w)
+        w.run(["--rows", "2,3,4,8,9"], script=script, BENCH_RUN_ID="good")
+        rc, out, err = w.run(["--rows", "2,3,4,8,9"], script=script, BENCH_RUN_ID="later", **env)
+        res = results(out)
+        for row in rows:
+            st, detail = res.get(row, ("", ""))
+            if st != "FAIL" or "output not written by this run" not in detail or "xpsnr_delta" in detail:
+                bad.append(f"{label}-row{row}:{st}:{detail[:70]}")
+
+    # any non-zero exit of a file-writing run is the row's FAIL, with ffmpeg's last line, and nothing is scored after it
+    for label, sub in (("write-all", "mkv"), ("write-second", "bicubic.mkv")):
+        w = World(tmp, f"{tag}-{label}")
+        pan_clips(w)
+        rc, out, err = w.run(["--rows", "2,3,4,8"], script=script, FAKE_FFV1_FAIL=sub)
+        res = results(out)
+        for row in (2, 3, 4, 8):
+            st, detail = res.get(row, ("", ""))
+            if st != "FAIL" or "ffmpeg failed writing" not in detail or "No space left" not in detail or "xpsnr_delta" in detail:
+                bad.append(f"{label}-row{row}:{st}:{detail[:90]}")
+        if any("xpsnr=" in l for l in ffmpeg_log(w)):
+            bad.append(f"{label}-scored-after-a-failed-write")
+
+    # a run id that was used is refused, and the refusal writes nothing
+    w = World(tmp, tag + "-reuse")
+    w.run(["--rows", "2"], script=script, BENCH_RUN_ID="same")
+    d = os.path.join(w.out, "run-same")
+    before = (w.jsonl(), ffmpeg_log(w), sorted(os.listdir(d)) if os.path.isdir(d) else None)
+    rc, out, err = w.run(["--rows", "2"], script=script, BENCH_RUN_ID="same")
+    after = (w.jsonl(), ffmpeg_log(w), sorted(os.listdir(d)) if os.path.isdir(d) else None)
+    if rc != 2 or "already exists" not in err or "result:" in out:
+        bad.append(f"reuse-accepted:rc{rc}:{err[:80]}")
+    if before[2] is None or before != after:
+        bad.append("reuse-wrote")
+    for name in ("../x", "a b", ".hidden", "x/y", "-n"):
+        rc, out, err = run(script, ["--dry-run"], clean_env({"BENCH_RUN_ID": name}))
+        if rc != 2 or "BENCH_RUN_ID" not in err:
+            bad.append(f"bad-id:{name}:rc{rc}")
+    return bad
+
+
 def fake_proc(w, name, argv0, pid="4242"):
     """A stand-in /proc (BENCH_PROC) holding one process with a DRM client: the transcode of another pod is not in the
     real /proc of the bench pod."""
@@ -1657,6 +1793,8 @@ def test_hermetic_api(tmp):
     check("rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not", not bad, str(bad))
     bad = row9_failures(BENCH, tmp, "row9")
     check("row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it", not bad, str(bad))
+    bad = stale_output_failures(BENCH, tmp, "stale")
+    check("a row scores only files this run wrote: a fresh run-<id> directory (a used id is refused), any failed write is FAIL, a missing or old file is FAIL 'not written by this run'", not bad, str(bad))
     bad = row10_prime_failures(BENCH, tmp, "row10-prime")
     check("row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod", not bad, str(bad))
     bad = row10_fdinfo_failures(BENCH, tmp, "row10-fd")
