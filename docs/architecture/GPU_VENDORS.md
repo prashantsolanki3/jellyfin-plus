@@ -1002,7 +1002,7 @@ never `PASS`.
 
 | Row | What | Must pass |
 |---|---|---|
-| 1 | Vendor record | vendor=intel; render node; Vulkan `vk@dr`; no NVIDIA-only level; fsr2 offered; no nvenc/cuda in any command |
+| 1 | Vendor record | vendor=intel; render node (picked at run time: vendor 0x8086 in `/dev/dri`, else the only node); Vulkan `vk:0` (index; name match `vk:Intel` when several GPU nodes are visible); no NVIDIA-only level; fsr2 offered; no nvenc/cuda in any command |
 | 2 | FSRCNNX 360p to 1080p, software decode | fps >= 100; xpsnr >= bicubic + 0.5 dB |
 | 3 | FSRCNNX 720p to 1080p | end-to-end fps >= 1.2x source; xpsnr >= bicubic + 0.3 dB |
 | 4 | FSRCNNX 1080p to 2160p | scaler-only fps >= 34; end-to-end with QSV >= 1.2x; xpsnr >= bicubic + 0.3 dB |
