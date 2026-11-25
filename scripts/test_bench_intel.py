@@ -157,6 +157,9 @@ EXACT = [
     "plan: row 9 prep cmd: " + PREP,
     "plan: row 9 cmd: " + hw_cmd(H264, HWDEC_CHAIN, f"-c:v ffv1 {RUN}/hwdec-on.mkv"),
     "plan: row 9 cmd: " + run_cmd(H264, shader(1920, 1080), f"{RUN}/hwdec-off.mkv"),
+    # the CPU figure comes from these two (no encoder in either), not from the ffv1 writes above
+    "plan: row 9 cmd: " + hw_cmd(H264, HWDEC_CHAIN, "-f null -"),
+    "plan: row 9 cmd: " + run_cmd(H264, shader(1920, 1080)),
     "plan: row 8 cmd: " + run_cmd("/clips/pan_720p.mkv", FSR2_CHAIN, f"{RUN}/pan-fsr2.mkv"),
     "plan: row 8 cmd: " + run_cmd("/clips/pan_720p.mkv", bicubic(1920, 1080), f"{RUN}/pan-bicubic.mkv"),
     "plan: row 8 cmd: " + xpsnr_cmd(f"{RUN}/pan-fsr2.mkv", "/clips/pan_1080p.mkv"),
@@ -469,11 +472,23 @@ case "$*" in
             fi
         fi;;
     esac
-    # the VA-API decode run uses half the CPU of the software one
+    # CPU seconds: the VA-API decode run uses about half the software one's user time (FAKE_ON_STIME: more system time,
+    # which a user-time-only figure would miss; FAKE_ON_SEQ: the user time of each -f null VA-API run in turn, so one
+    # run can spike). An ffv1 write costs both paths the same FAKE_FFV1_CPU extra user seconds.
     case "$*" in
-    *-hwaccel*) printf 'frame=  240 fps=120\rbench: utime=0.5s stime=0.1s rtime=2.0s\n' >&2;;
-    *) printf 'frame=  240 fps=120\rbench: utime=1.0s stime=0.1s rtime=2.0s\n' >&2;;
-    esac;;
+    *-hwaccel*)
+        ut=0.5; stt=${FAKE_ON_STIME:-0.1}
+        case "$*" in
+        *"-f null -"*)
+            if [ -n "${FAKE_ON_SEQ:-}" ]; then
+                k=$(cat "$FAKE_FFMPEG_LOG.seq" 2>/dev/null || echo 0); k=$((k + 1)); echo $k > "$FAKE_FFMPEG_LOG.seq"
+                ut=$(echo "$FAKE_ON_SEQ" | cut -d' ' -f$k)
+            fi;;
+        esac;;
+    *) ut=1.0; stt=0.1;;
+    esac
+    case "$*" in *"-c:v ffv1"*) ut=$(awk -v a="$ut" -v b="${FAKE_FFV1_CPU:-1.0}" 'BEGIN { printf "%.2f", a + b }');; esac
+    printf 'frame=  240 fps=120\rbench: utime=%ss stime=%ss rtime=2.0s\n' "$ut" "$stt" >&2;;
 *-loop*)
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4;;
 esac
@@ -514,7 +529,10 @@ case "$*" in
     *) exit 1;;
     esac;;
 *height,codec_name*) echo h264,1080;;
-*) echo h264;;
+*)
+    # FAKE_CODEC: what the segment holds (row 10); FAKE_CODEC_EXTRA=1 adds a second stream line after it
+    echo "${FAKE_CODEC:-h264}"
+    [ -z "${FAKE_CODEC_EXTRA:-}" ] || echo hevc;;
 esac
 '''
 
@@ -523,6 +541,12 @@ esac
 DATE_STUB = ('#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${FAKE_HM:-}" ]; then\n'
              '    [ -z "${FAKE_TZ_LOG:-}" ] || echo "${TZ:-}" >> "$FAKE_TZ_LOG"\n    echo "$FAKE_HM"; exit 0\n  fi\n'
              'done\nexec "$REAL_DATE" "$@"\n')
+
+# `sleep 5` (row 10's measuring window) is the only thing it fakes: with FAKE_VANISH set to a directory, the second of the two
+# 5 s sleeps (the load reader's and the fdinfo sampler's, in whichever order they start) removes it, so a stand-in /proc
+# entry vanishes mid-window as an exited transcode does. mkdir of FAKE_VANISH_LOCK is the atomic "first caller" test.
+SLEEP_STUB = ('#!/bin/sh\nif [ -n "${FAKE_VANISH:-}" ] && [ "$1" = 5 ]; then\n'
+              '  mkdir "$FAKE_VANISH_LOCK" 2>/dev/null || rm -rf "$FAKE_VANISH"\nfi\nexec @SLEEP@ "$@"\n')
 
 # A fake Jellyfin: serves JSON by URL path from $FAKE_DIR/scenario.json, logs every call (argv, stdin,
 # POST body) to $FAKE_DIR/log.jsonl, and keeps the plugin configuration and started sessions in state.json.
@@ -636,7 +660,7 @@ if path.startswith("/JellyfinPlus/Session/"):
     if cfg_max > 0 and s["neural"] and s["src_height"] > cfg_max:
         routing = "neural %s NOT run: the source is %dp, taller than NeuralMaxSourceHeight %d, so the shader path ran" % (
             s["neural"], s["src_height"], cfg_max)
-    out({"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False),
+    out({"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False), "Encoder": sc.get("encoder"),
          "NeuralDevice": sc.get("device", "openvino"), "NeuralRouting": sc["routing"] if "routing" in sc else routing})
 if path.endswith("/master.m3u8"):
     if sc.get("fail_master"):
@@ -671,6 +695,7 @@ def stub_bin(tmp, fake_api=False):
         "ffmpeg": FFMPEG_STUB,
         "ffprobe": FFPROBE_STUB,
         "date": DATE_STUB,
+        "sleep": SLEEP_STUB.replace("@SLEEP@", shutil.which("sleep") or "/bin/sleep"),
         "curl": FAKE_CURL.replace("@PY@", sys.executable) if fake_api else "#!/bin/sh\nexit 22\n",
     }
     for name, body in bodies.items():
@@ -820,6 +845,16 @@ def test_mutants(tmp):
         ("row9-cut-every-run", '[[ -f "$HWDEC_SRC" ]] && return 0', ':', row9_failures),
         ("row9-no-zerocopy", 'zc=$(zerocopy_note)', 'zc=""', row9_failures),
         ("row9-zerocopy-fatal", 'zc=$(zerocopy_note)', 'zc=$(zerocopy_note); [[ "$zc" != zerocopy=FAIL* ]] || status=FAIL', row9_failures),
+        ("row9-cpu-user-only", "t = u + s", "t = u", row9_failures),
+        ("row9-cpu-ffv1-sink", 'hw) cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" ;;',
+         'hw) cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" "$RUN_OUT/cpu-hw.mkv" ;;', row9_failures),
+        ("row9-cpu-not-median", """printf '%s\\n' "${cpu[@]}" | median""", """printf '%s\\n' "${cpu[@]}" | sort -n | tail -1""", row9_failures),
+        ("row9-cpu-off-hwaccel", '*)  cmd_run "$HWDEC_SRC" "$(chain_shader 1920 1080)" ;;', '*)  cmd_run_hw "$HWDEC_SRC" "$(chain_shader 1920 1080)" ;;', row9_failures),
+        ("row10-redirect-order", """{ tr '\\0' ' ' <"$p/cmdline"; } 2>/dev/null | grep""", """tr '\\0' ' ' <"$p/cmdline" 2>/dev/null | grep""", row10_reason_failures),
+        ("row10-encoder-ignored", 'want=""', 'want=""; enc=""', row10_reason_failures),
+        ("row10-codec-whole-output", "| head -n 1 | tr -d '[:space:]'", "| tr -d '[:space:]'", row10_reason_failures),
+        ("row10-vanished-counted", '[[ -d "$PROC/$pid" ]] || { rm -f "$RUN_OUT/r10-fd"; echo gone >"$RUN_OUT/r10-gone"; }', ':', row10_reason_failures),
+        ("row10-fail-unnamed", "fail=load-vs-fdinfo", "fail=x", row10_reason_failures),
         ("run-dir-shared", 'RUN_OUT="$OUT/run-$RUN_ID"', 'RUN_OUT="$OUT"', quick_stale),
         ("run-dir-reuse-allowed", '[[ ! -e "$RUN_OUT" ]] || die', ': || die', quick_stale),
         ("run-id-fixed", "printf -v RUN_ID '%(%Y%m%dT%H%M%S)T-%d' -1 \"$$\"", "RUN_ID=run", quick_stale),
@@ -1654,19 +1689,29 @@ def row9_failures(script, tmp, tag):
     if not os.path.exists(h264) or os.path.exists(os.path.join(w.out, "tears_1080p_h264.part.mkv")):
         bad.append("h264-file-not-moved-into-place")
     vf = [l for l in runs if " -vf " in l]
-    # three measured runs: the VA-API one, the software control and the zero-copy attempt: all read the H.264 clip
-    if len(vf) != 3 or any(f"-i {h264} " not in l for l in vf):
+    # five measured runs: the VA-API and the software run that write ffv1 (for XPSNR), the same two into a null sink (for the
+    # CPU figure) and the zero-copy attempt: all read the H.264 clip
+    if len(vf) != 5 or any(f"-i {h264} " not in l for l in vf):
         bad.append(f"sources:{[l[:200] for l in vf]}")
     on = [l for l in vf if "-hwaccel vaapi -hwaccel_output_format vaapi" in l and "hwmap=" not in l]
-    if len(on) != 1 or "hwdownload,format=nv12,hwupload,libplacebo=" not in on[0] or not re.search(
-            r"libplacebo=[^ ]*:format=yuv420p,hwdownload,format=yuv420p ", on[0]):
+    if len(on) != 2 or any("hwdownload,format=nv12,hwupload,libplacebo=" not in l or not re.search(
+            r"libplacebo=[^ ]*:format=yuv420p,hwdownload,format=yuv420p ", l) for l in on):
         bad.append(f"on:{on}")
     zc = [l for l in vf if "hwmap=derive_device=vulkan" in l]
     if len(zc) != 1 or " -f null -" not in zc[0] or not zc[0].endswith(" -f null -"):
         bad.append(f"zerocopy-cmd:{zc}")
     off = [l for l in vf if "-hwaccel" not in l]
-    if len(off) != 1 or "libplacebo=" not in off[0]:
+    if len(off) != 2 or any("libplacebo=" not in l for l in off):
         bad.append(f"off:{off}")
+    # the CPU figure is measured without an encoder: one null-sink run per path, the off one without -hwaccel
+    cpu_on = [l for l in on if l.endswith(" -f null -")]
+    cpu_off = [l for l in off if l.endswith(" -f null -")]
+    if len(cpu_on) != 1 or len(cpu_off) != 1 or "-c:v ffv1" in cpu_on[0] + cpu_off[0]:
+        bad.append(f"cpu-sink:{cpu_on}:{cpu_off}")
+    # null sink 0.6 s on against 1.1 s off (user+sys) is 45.5%; the ffv1 pair 1.6 against 2.1 is 23.8%; the old user-only
+    # reading of the ffv1 pair (1.5 against 2.0) was 25.0%
+    if "cpu_gain=45.5%" not in detail or "cpu_gain_ffv1=23.8%" not in detail or "on=0.60s off=1.10s" not in detail:
+        bad.append(f"cpu-figures:{detail[:240]}")
     # the second run reuses the cut: it is made once
     w.run(["--rows", "9"], script=script)
     if len([l for l in ffmpeg_log(w) if "-c:v libx264" in l]) != 1:
@@ -1675,8 +1720,31 @@ def row9_failures(script, tmp, tag):
     w = World(tmp, tag + "-devlost")
     rc, out, err = w.run(["--rows", "9"], script=script, FAKE_ZEROCOPY_FAIL="1")
     st, detail = results(out).get(9, ("", ""))
-    if st != "PASS" or "zerocopy=FAIL(VK_ERROR_DEVICE_LOST" not in detail or "cpu_gain=50.0%" not in detail:
+    if st != "PASS" or "zerocopy=FAIL(VK_ERROR_DEVICE_LOST" not in detail or "cpu_gain=45.5%" not in detail:
         bad.append(f"devlost:{st}:{detail[:120]}")
+
+    # system time counts: 0.5 s of it on the VA-API side leaves 1.0 s against 1.1 s (9.1%), a FAIL that a user-time-only
+    # figure (50%) would have passed
+    w = World(tmp, tag + "-stime")
+    rc, out, err = w.run(["--rows", "9"], script=script, FAKE_ON_STIME="0.5")
+    st, detail = results(out).get(9, ("", ""))
+    if st != "FAIL" or "cpu_gain=9.1%" not in detail:
+        bad.append(f"stime:{st}:{detail[:120]}")
+
+    # the figure is the median of BENCH_RUNS: a spike in one VA-API run (9.0 s of user time) does not move it, the mean would
+    w = World(tmp, tag + "-median")
+    rc, out, err = w.run(["--rows", "9"], script=script, BENCH_RUNS="3", FAKE_ON_SEQ="0.5 9.0 0.5")
+    st, detail = results(out).get(9, ("", ""))
+    runs3 = [l for l in ffmpeg_log(w) if " -vf " in l and l.endswith(" -f null -") and "hwmap=" not in l]
+    if st != "PASS" or "cpu_gain=45.5%" not in detail or len(runs3) != 6:
+        bad.append(f"median:{st}:{len(runs3)}:{detail[:120]}")
+
+    # a gain under the threshold stays a FAIL and prints its real figure (nothing is relaxed)
+    w = World(tmp, tag + "-lowgain")
+    rc, out, err = w.run(["--rows", "9"], script=script, FAKE_ON_STIME="0.8")
+    st, detail = results(out).get(9, ("", ""))
+    if st != "FAIL" or "cpu_gain=" not in detail or "cpu_gain=45.5%" in detail:
+        bad.append(f"lowgain:{st}:{detail[:120]}")
     w = World(tmp, tag + "-plain")
     rc, out, err = w.run(["--rows", "9"], script=script, FAKE_ZEROCOPY_FAIL="plain")
     st, detail = results(out).get(9, ("", ""))
@@ -1925,7 +1993,7 @@ def row10_prime_failures(script, tmp, tag):
         bad.append(f"calls:{len(loads)}:{[round(t - loads[0], 1) for t in loads]}")
     if "gpuBusyPercent=12 " not in detail + " " or "gpuBusyPercent=none" in detail:
         bad.append(f"load:{detail[:120]}")
-    if "fdinfo=not visible from the bench pod" not in detail or "none" in detail.replace("gpuBusyPercent", ""):
+    if "fdinfo=not visible from the bench pod" not in detail or "none" in detail.replace("encoder=none", ""):
         bad.append(f"fdinfo:{detail[:120]}")
     if st != "MANUAL":
         bad.append(f"status:{st}")
@@ -1944,6 +2012,76 @@ def row10_fdinfo_failures(script, tmp, tag, which=("stock", "oidn")):
         st, detail = results(out).get(10, ("", ""))
         if st != "PASS" or "gpuBusyPercent=5" not in detail or "fdinfo_busy=0.0" not in detail:
             bad.append(f"{kind}:{st}:{detail[:120]}")
+    return bad
+
+
+def row10_reason_failures(script, tmp, tag):
+    """rev-qd0mh: the codec is judged against the encoder the session record names (a QSV encoder must produce its own
+    codec; no encoder accepts h264 or hevc and says encoder=none), from the first line ffprobe prints; a process that exits
+    between the /proc scan and the cmdline read prints nothing; a transcode that exited during the window is not
+    measured; every FAIL names its reason."""
+    bad = []
+
+    def one(label, scenario, extra=None, proc="empty", rows="10"):
+        w = World(tmp, f"{tag}-{label}", scenario)
+        if proc == "empty":
+            w.env["BENCH_PROC"] = os.path.join(w.root, "emptyproc")
+            os.makedirs(w.env["BENCH_PROC"])
+        elif proc:
+            w.env["BENCH_PROC"] = proc(w)
+        rc, out, err = w.run(["--rows", rows], script=script, **(extra or {}))
+        st, detail = results(out).get(10, ("", ""))
+        return st, detail, err
+
+    # the encoder matches the segment: no reason to fail, and the figure stands with fdinfo not visible (MANUAL, never FAIL)
+    st, detail, err = one("match", {"load": 85.9, "encoder": "h264_qsv"})
+    if st != "MANUAL" or "segment_codec=h264" not in detail or "encoder=h264_qsv" not in detail or "gpuBusyPercent=85.9" not in detail \
+            or "fail=" in detail or "fdinfo=not visible from the bench pod" not in detail:
+        bad.append(f"match:{st}:{detail[:160]}")
+    # the encoder says hevc and the segment is h264: a FAIL naming both
+    st, detail, err = one("mismatch", {"load": 85.9, "encoder": "hevc_qsv"})
+    if st != "FAIL" or "fail=codec" not in detail or "hevc_qsv" not in detail or "h264" not in detail:
+        bad.append(f"mismatch:{st}:{detail[:160]}")
+    # no encoder in the record: h264 or hevc is accepted, and the detail says there was none
+    st, detail, err = one("no-encoder", {"load": 85.9})
+    if st != "MANUAL" or "encoder=none" not in detail or "fail=" in detail:
+        bad.append(f"no-encoder:{st}:{detail[:160]}")
+    # a segment that is neither h264 nor hevc fails with its reason, with or without an encoder
+    st, detail, err = one("mpeg4", {"load": 85.9}, {"FAKE_CODEC": "mpeg4"})
+    if st != "FAIL" or "fail=codec" not in detail or "mpeg4" not in detail:
+        bad.append(f"mpeg4:{st}:{detail[:160]}")
+    # the codec is the first line, trimmed (a second stream line or trailing blanks are not part of it)
+    st, detail, err = one("first-line", {"load": 85.9, "encoder": "h264_qsv"}, {"FAKE_CODEC": "h264 ", "FAKE_CODEC_EXTRA": "1"})
+    if st != "MANUAL" or "segment_codec=h264 " not in detail + " " or "fail=" in detail:
+        bad.append(f"first-line:{st}:{detail[:160]}")
+
+    # a pid directory with no cmdline (the process exited between the scan and the read) is not an error on stderr
+    def with_gone(w):
+        root = fake_proc(w, "proc-gone", "/usr/lib/jellyfin-ffmpeg/ffmpeg", pid="4242")
+        os.makedirs(os.path.join(root, "1111"))
+        return root
+    st, detail, err = one("gone-cmdline", {"load": 5, "encoder": "h264_qsv"}, proc=with_gone)
+    if "No such file" in err or "cmdline" in err or st != "PASS":
+        bad.append(f"gone-cmdline:{st}:{err[:160]}")
+
+    # the transcode exits during the window: no fdinfo figure, said so, and MANUAL (the plugin figure stands)
+    def vanishing(w):
+        return fake_proc(w, "proc-vanish", "/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg")
+    w = World(tmp, f"{tag}-vanish", {"load": 5, "encoder": "h264_qsv"})
+    w.env["BENCH_PROC"] = vanishing(w)
+    rc, out, err = w.run(["--rows", "10"], script=script, FAKE_VANISH=w.env["BENCH_PROC"] + "/4242",
+                         FAKE_VANISH_LOCK=os.path.join(w.root, "vanish.lock"))
+    st, detail = results(out).get(10, ("", ""))
+    if st != "MANUAL" or "exited" not in detail or "gpuBusyPercent=5" not in detail or "fdinfo_busy=" in detail:
+        bad.append(f"vanish:{st}:{detail[:160]}")
+
+    # plugin and fdinfo far apart: FAIL, and it says which figures
+    w = World(tmp, f"{tag}-apart", {"load": 60, "encoder": "h264_qsv"})
+    w.env["BENCH_PROC"] = fake_proc(w, "proc", "/usr/lib/jellyfin-ffmpeg/ffmpeg")
+    rc, out, err = w.run(["--rows", "10"], script=script)
+    st, detail = results(out).get(10, ("", ""))
+    if st != "FAIL" or "fail=load-vs-fdinfo" not in detail or "60" not in detail or "fdinfo_busy=0.0" not in detail:
+        bad.append(f"apart:{st}:{detail[:160]}")
     return bad
 
 
@@ -2018,6 +2156,8 @@ def test_hermetic_api(tmp):
     check("row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod", not bad, str(bad))
     bad = row10_fdinfo_failures(BENCH, tmp, "row10-fd")
     check("row 10 finds the transcode of the stock and of the oidn ffmpeg", not bad, str(bad))
+    bad = row10_reason_failures(BENCH, tmp, "row10-reason")
+    check("row 10 judges the codec by the session's encoder, tolerates a vanished pid, MANUALs a vanished transcode and names every FAIL", not bad, str(bad))
 
 
 def test_token_rejected(tmp):

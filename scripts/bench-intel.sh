@@ -336,6 +336,8 @@ print_plan() {
             9)  if [[ ! -f "$(hwdec_clip)" ]]; then cmd_h264_cut "${OUT}/${TITLE}_1080p_h264.part.mkv"; printf 'plan: row 9 prep cmd: %s\n' "${CMD[*]}"; fi
                 cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)" "$RUN_OUT/hwdec-on.mkv"; plan_cmd 9
                 cmd_run "$(hwdec_clip)" "$(chain_shader 1920 1080)" "$RUN_OUT/hwdec-off.mkv"; plan_cmd 9
+                cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)"; plan_cmd 9
+                cmd_run "$(hwdec_clip)" "$(chain_shader 1920 1080)"; plan_cmd 9
                 cmd_run_hw "$(hwdec_clip)" "$(chain_zerocopy 1920 1080)"; printf 'plan: row 9 zero-copy cmd: %s\n' "${CMD[*]}"
                 echo "plan: row 9 threshold: cpu gain>=${HWDEC_CPU_GAIN}% xpsnr(on,off)>=${HWDEC_XPSNR_MIN}dB no 'Conversion failed!'" ;;
             10) echo "plan: row 10 cmd: forced transcode through $JF_URL, ffprobe the segment codec, prime $JF_URL/JellyfinPlus/Gpu/Load, read it again ${LOAD_WAIT}s later and compare with the fdinfo figure when the transcode is visible to the bench pod"
@@ -474,7 +476,8 @@ fdinfo_busy() { # pid seconds
 ffmpeg_pid() {
     local p
     for p in "$PROC"/[0-9]*; do
-        if tr '\0' ' ' <"$p/cmdline" 2>/dev/null | grep -qE '^[^ ]*jellyfin-ffmpeg(-oidn)?/ffmpeg( |$)'; then
+        # grouped so the redirection's own open error is silenced too: the process may exit between the glob and here
+        if { tr '\0' ' ' <"$p/cmdline"; } 2>/dev/null | grep -qE '^[^ ]*jellyfin-ffmpeg(-oidn)?/ffmpeg( |$)'; then
             echo "${p#"$PROC"/}"
             return 0
         fi
@@ -927,8 +930,54 @@ zerocopy_note() {
     rm -f "$log"
 }
 
+# cpu_secs: the user+system CPU seconds of the last `bench:` line on stdin (-benchmark); nothing when there is none.
+# System time counts: VA-API decode and hwdownload spend it in the kernel.
+cpu_secs() {
+    tr '\r' '\n' | awk '/^bench:/ {
+        u = s = 0
+        for (i = 1; i <= NF; i++) {
+            v = $i; sub(/s$/, "", v)
+            if ($i ~ /^utime=/) { sub(/utime=/, "", v); u = v + 0 } else if ($i ~ /^stime=/) { sub(/stime=/, "", v); s = v + 0 }
+        }
+        t = u + s; seen = 1
+    } END { if (seen) printf "%.2f\n", t }'
+}
+# gain_pct <with hardware decode> <software>: how much less CPU the first took, in percent (0 when the baseline is 0).
+gain_pct() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f\n", (b > 0 ? (b - a) / b * 100 : 0) }'; }
+
+# run_cpu <hw|sw>: the median user+system CPU seconds of RUNS runs of one of row 9's two paths into a null sink. The ffv1
+# write XPSNR needs costs both paths the same and dilutes the decode saving, so the gate is read here, without an
+# encoder. Returns 98 when a run printed no `bench:` line, 99 when the software path carries -hwaccel (then it is no
+# control), else ffmpeg's status.
+run_cpu() {
+    local i log v cpu=() rc
+    log=$(mktemp)
+    for ((i = 0; i < RUNS; i++)); do
+        case "$1" in
+            hw) cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" ;;
+            *)  cmd_run "$HWDEC_SRC" "$(chain_shader 1920 1080)" ;;
+        esac
+        if [[ "$1" != hw && " ${CMD[*]} " == *" -hwaccel "* ]]; then echo 0; rm -f "$log"; return 99; fi
+        ff_exec 2>"$log" >/dev/null || { rc=$?; echo 0; rm -f "$log"; return "$rc"; }
+        v=$(cpu_secs <"$log")
+        [[ -n "$v" ]] || { echo 0; rm -f "$log"; return 98; }
+        cpu+=("$v")
+    done
+    rm -f "$log"
+    printf '%s\n' "${cpu[@]}" | median
+}
+
+# cpu_fail <run_cpu status> <which path>: the FAIL text of a CPU run that did not complete.
+cpu_fail() {
+    case "$1" in
+        98) echo "$2 cpu run printed no bench: line" ;;
+        99) echo "$2 command carries -hwaccel: it is not a software-decode control" ;;
+        *)  why "$1" "$2 cpu run failed (exit $1)" ;;
+    esac
+}
+
 row_9() {
-    local on_log off_log on_cpu off_cpu gain x status=PASS rc zc on_out="$RUN_OUT/hwdec-on.mkv" off_out="$RUN_OUT/hwdec-off.mkv"
+    local on_log off_log on_cpu off_cpu on_cpu1 off_cpu1 gain gain1 x status=PASS rc zc on_out="$RUN_OUT/hwdec-on.mkv" off_out="$RUN_OUT/hwdec-off.mkv"
     on_log="$RUN_OUT/hwdec-on.log"; off_log="$RUN_OUT/hwdec-off.log"
     hwdec_source || { record 9 FAIL "$HWDEC_ERR"; return; }
     rm -f "$on_out" "$off_out"
@@ -941,18 +990,22 @@ row_9() {
     ff_exec >/dev/null 2>"$off_log" || { rc=$?; record 9 FAIL "$(why "$rc" "software chain failed")"; return; }
     require_fresh 9 "$on_out" "$off_out" || return 0
     zc=$(zerocopy_note)
-    on_cpu=$(tr '\r' '\n' <"$on_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
-    off_cpu=$(tr '\r' '\n' <"$off_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
-    gain=$(awk -v a="${on_cpu:-0}" -v b="${off_cpu:-0}" 'BEGIN { printf "%.1f\n", (b > 0 ? (b - a) / b * 100 : 0) }')
+    # the gated figure: user+system CPU of the two paths into a null sink, median of RUNS runs each
+    on_cpu=$(run_cpu hw) || { rc=$?; record 9 FAIL "$(cpu_fail "$rc" "hardware decode")"; return; }
+    off_cpu=$(run_cpu sw) || { rc=$?; record 9 FAIL "$(cpu_fail "$rc" "software control")"; return; }
+    gain=$(gain_pct "$on_cpu" "$off_cpu")
+    # the same figure from the two ffv1-writing runs (one run each), for the record: the encoder is in both
+    on_cpu1=$(cpu_secs <"$on_log"); off_cpu1=$(cpu_secs <"$off_log")
+    gain1=$(gain_pct "${on_cpu1:-0}" "${off_cpu1:-0}")
     x=$(xpsnr_y "$on_out" "$off_out") || { rc=$?; record 9 FAIL "xpsnr failed ($(why "$rc" "hwdec-on against hwdec-off")) $zc"; return; }
     ge "$gain" "$HWDEC_CPU_GAIN" || status=FAIL
     ge "$x" "$HWDEC_XPSNR_MIN" || status=FAIL
-    record 9 "$status" "cpu_gain=${gain}% xpsnr_on_vs_off=${x}dB source=$(basename "$HWDEC_SRC") $zc (the video-engine-busy and command-identical-when-off checks are made on the served session, row 12)"
+    record 9 "$status" "cpu_gain=${gain}% (user+sys median of $RUNS, no encoder: on=${on_cpu}s off=${off_cpu}s) cpu_gain_ffv1=${gain1}% (ffv1 pair: on=${on_cpu1:-none}s off=${off_cpu1:-none}s) xpsnr_on_vs_off=${x}dB source=$(basename "$HWDEC_SRC") $zc (the video-engine-busy and command-identical-when-off checks are made on the served session, row 12)"
 }
 
 row_10() {
     have_api || { no_api 10 "no Jellyfin API"; return; }
-    local id codec load fd fdnote status=PASS stream_err="" pid
+    local id codec enc want load fd fdnote status=PASS stream_err="" pid fail=""
     item_id "${TITLE}_1080p.mkv" || { record 10 FAIL "$ITEM_ERR"; return; }
     id="$ITEM_ID"
     # Sampled while the stream's segments are being produced; both read the same LOAD_WAIT window. The plugin computes
@@ -964,6 +1017,8 @@ row_10() {
       if [[ -n "$pid" ]]; then
           echo "$pid" >"$RUN_OUT/r10-pid"
           fdinfo_busy "$pid" "$LOAD_WAIT" | sort -k2 -nr | awk 'NR == 1 { print $2 }' >"$RUN_OUT/r10-fd"
+          # a transcode that ended inside the window leaves a partial figure: it is not one
+          [[ -d "$PROC/$pid" ]] || { rm -f "$RUN_OUT/r10-fd"; echo gone >"$RUN_OUT/r10-gone"; }
       fi ) &
     api_stream "$id" 1080 "sr=fsrcnnx" || stream_err="$STREAM_ERR"
     wait
@@ -971,22 +1026,34 @@ row_10() {
     load=$(cat "$RUN_OUT/r10-load" 2>/dev/null || true)
     fd=$(cat "$RUN_OUT/r10-fd" 2>/dev/null || true)
     pid=$(cat "$RUN_OUT/r10-pid" 2>/dev/null || true)
-    codec=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "${STREAM_SEG:-/dev/null}" 2>/dev/null || true)
-    case "$codec" in h264 | hevc) ;; *) status=FAIL ;; esac
+    # the first line only, trimmed: ffprobe prints one line per video stream
+    codec=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "${STREAM_SEG:-/dev/null}" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)
+    # The codec to expect is what the encoder the plugin recorded for this session produces; with no record, either of the two.
+    enc=$(api "/JellyfinPlus/Session/$STREAM_SID" 2>/dev/null | jq -r '.Encoder // empty' 2>/dev/null || true)
+    want=""
+    case "$enc" in h264_qsv) want=h264 ;; hevc_qsv) want=hevc ;; esac
+    if [[ -n "$want" ]]; then
+        [[ "$codec" == "$want" ]] || { status=FAIL; fail+=" fail=codec segment=${codec:-none} but encoder $enc produces $want"; }
+    else
+        case "$codec" in h264 | hevc) ;; *) status=FAIL; fail+=" fail=codec segment=${codec:-none} is neither h264 nor hevc (encoder=${enc:-none})" ;; esac
+    fi
     # The transcode runs in the Jellyfin pod, whose /proc this pod cannot read: then the plugin's figure is all there is.
     if [[ -z "$pid" ]]; then
         fdnote="fdinfo=not visible from the bench pod"
+    elif [[ -f "$RUN_OUT/r10-gone" ]]; then
+        fdnote="fdinfo=none (pid $pid exited during the window)"
     elif [[ -z "$fd" ]]; then
         fdnote="fdinfo_busy=none (pid $pid has no DRM client)"
     else
         fdnote="fdinfo_busy=$fd"
     fi
     if [[ -n "$load" && -n "$fd" ]]; then
-        awk -v a="$load" -v b="$fd" -v t="$LOAD_TOLERANCE" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d <= t) }' || status=FAIL
+        awk -v a="$load" -v b="$fd" -v t="$LOAD_TOLERANCE" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d <= t) }' \
+            || { status=FAIL; fail+=" fail=load-vs-fdinfo plugin ${load}% against fdinfo ${fd}%, more than ${LOAD_TOLERANCE} points apart"; }
     else
         [[ "$status" == PASS ]] && status=MANUAL
     fi
-    record 10 "$status" "segment_codec=${codec:-none} gpuBusyPercent=${load:-none} $fdnote"
+    record 10 "$status" "segment_codec=${codec:-none} encoder=${enc:-none} gpuBusyPercent=${load:-none} $fdnote$fail"
 }
 
 row_11() {
