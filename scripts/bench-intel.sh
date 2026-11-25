@@ -323,7 +323,8 @@ print_plan() {
             5)  cmd_run "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_FRAMES"; plan_cmd 5
                 cmd_run "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_FRAMES"; plan_cmd 5
                 echo "plan: row 5 cmd: a 360p stream with neural=realesr-anime-x2, then NeuralDevice from $JF_URL/JellyfinPlus/Session/<its PlaySessionId>"
-                echo "plan: row 5 threshold: device=openvino; largest NeuralMaxSourceHeight holding >=${E2E_X}x" ;;
+                echo "plan: row 5 threshold: device=openvino; largest NeuralMaxSourceHeight holding >=${E2E_X}x"
+                echo "plan: row 5 diagnosis: the detail carries ffmpeg_ort_<h>p (the ort filter's own fallback line), ort_env (EP libs, OpenCL ICD, render node open) and, when device is not openvino, the session's requested/withheld/routing" ;;
             6)  echo "plan: row 6 cmd: set NeuralMaxSourceHeight=480 (restored after), transcode $(clip 720) with neural=$NEURAL_LEVEL, read Session/<id> NeuralRouting" ;;
             7)  cmd_still "$CLIPS/still_720p.png" "$(chain_fsr2 1920 1080)" "$RUN_OUT/still-fsr2.txt"; plan_cmd 7
                 cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$RUN_OUT/still-control.txt"; plan_cmd 7
@@ -482,6 +483,9 @@ ffmpeg_pid() {
     return 0
 }
 
+# keep_log <file>: copy a run's ffmpeg stderr to $KEEP_LOG when the caller named one (row 5 reads the ort filter's own words from it).
+keep_log() { [[ -z "${KEEP_LOG:-}" ]] || cp -f "$1" "$KEEP_LOG" 2>/dev/null || true; }
+
 # run_fps <clip> <chain> [output] [runs] [frames]: the median fps of <runs> (default RUNS) runs (frames over wall
 # time, from -benchmark). On failure it prints 0 and returns ffmpeg's exit status (124 = timed out, see why); callers
 # run it in $(...), so the status is its return value, not a variable.
@@ -491,7 +495,8 @@ run_fps() {
     for ((i = 0; i < runs; i++)); do
         cmd_run "$1" "$2" "${3:-}" "${5:-}"
         # collected in this shell, not piped into median from the loop: a return inside a pipe is lost
-        ff_exec 2>"$log" >/dev/null || { rc=$?; echo 0; rm -f "$log"; return "$rc"; }
+        ff_exec 2>"$log" >/dev/null || { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }
+        keep_log "$log"
         # -stats separates its updates with \r, so the bench: line can share a line with the last one
         tr '\r' '\n' <"$log" >"$log.n"
         n=$(awk '/^frame=/ { gsub(/frame= */, ""); f = $1 } END { print f + 0 }' "$log.n")
@@ -774,13 +779,51 @@ row_2() { shader_row 2 360 1920 1080 "$FPS_R2" "$XPSNR_R2" 0; }
 row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1; }
 row_4() { shader_row 4 1080 3840 2160 "$FPS_R4" "$XPSNR_R4" 1; }
 
+# ort_why <ffmpeg stderr log>: the lines that say where the ort filter ran or why it did not (its own `using CPU`
+# warnings, ONNX Runtime's errors, the device line), up to three, joined by `|`. Nothing when the log has none.
+ort_why() {
+    tr '\r' '\n' <"$1" 2>/dev/null | grep -E 'OpenVINO|using CPU|onnxruntime|ONNX|[Ee]rror' | head -3 | cut -c1-240 | paste -sd'|' - || true
+}
+# ort_chain_state <log>: what the direct ort chain's own log says about the provider.
+ort_chain_state() {
+    local t
+    t=$(ort_why "$1")
+    if [[ "$t" == *"using CPU"* ]]; then echo "CPU_FALLBACK[$t]"
+    elif [[ -n "$t" ]]; then echo "log[$t]"
+    else echo "no_ort_line_in_log"; fi
+}
+# ort_env_report: what OpenVINO's GPU device needs from this pod, one `key=value` each: the provider and the GPU plugin
+# beside the core, the plugin's unresolved libraries, an OpenCL ICD and loader (and Level Zero's loader), and whether this
+# process can open the render node. A missing item is the CPU fallback's cause, not a guess at it.
+ort_env_report() {
+    local lib="$PREFIX/ort/lib" f miss="" nf="" icds lc open err gid z=MISSING o=MISSING l=MISSING
+    for f in libonnxruntime_providers_openvino.so libopenvino_intel_gpu_plugin.so; do
+        [[ -e "$lib/$f" ]] || miss+="$f,"
+    done
+    if [[ -e "$lib/libopenvino_intel_gpu_plugin.so" ]] && command -v ldd >/dev/null 2>&1; then
+        nf=$(ldd "$lib/libopenvino_intel_gpu_plugin.so" 2>&1 | awk '/not found/ { printf "%s,", $1 }' || true)
+    fi
+    icds=$(compgen -G "/etc/OpenCL/vendors/*.icd" || true)
+    [[ -z "$icds" ]] || o=present
+    lc=$(ldconfig -p 2>/dev/null || true)
+    [[ "$lc" != *libOpenCL.so.1* ]] || l=present
+    [[ "$lc" != *libze_loader.so.1* ]] || z=present
+    # `<>` creates a missing file, so only a real device node is opened
+    if [[ ! -c "$NODE" ]]; then open="FAIL(not a device node in this pod)"
+    elif err=$( { : <>"$NODE"; } 2>&1 ); then open=ok
+    else open="FAIL(${err##*: })"; fi
+    gid=$(stat -c %g "$NODE" 2>/dev/null || echo "?")
+    echo "ort_env: ep_libs_missing=${miss:-none} gpu_plugin_unresolved=${nf:-none} opencl_icd=$o libOpenCL=$l level_zero_loader=$z render_node=$NODE open=$open node_gid=$gid process_gids=$(id -G | tr ' ' ,)"
+}
+
 row_5() {
     [[ -n "$ORT_MODEL" ]] || { record 5 SKIP "no BENCH_ORT_MODEL"; return; }
-    local f360 f720 rec dev applied status=MANUAL note
-    local rc
-    f360=$(run_fps "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 360p (fps_360p=$f360)")"; return; }
-    f720=$(run_fps "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 720p (fps_720p=$f720)")"; return; }
-    note="fps_360p=$f360 fps_720p=$f720 over the first $ORT_FRAMES frames, one run each, model compile included (real time = source fps; choose NeuralMaxSourceHeight from these)"
+    local f360 f720 rec dev applied status=MANUAL note req withheld routing sumry env_note
+    local rc l360="$RUN_OUT/row5-360p.ffmpeg.log" l720="$RUN_OUT/row5-720p.ffmpeg.log"
+    env_note=$(ort_env_report)
+    f360=$(KEEP_LOG="$l360" run_fps "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 360p (fps_360p=$f360)") ffmpeg_ort_360p=$(ort_chain_state "$l360") $env_note"; return; }
+    f720=$(KEEP_LOG="$l720" run_fps "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 720p (fps_720p=$f720)") ffmpeg_ort_720p=$(ort_chain_state "$l720") $env_note"; return; }
+    note="fps_360p=$f360 fps_720p=$f720 over the first $ORT_FRAMES frames, one run each, model compile included (real time = source fps; choose NeuralMaxSourceHeight from these) requested=device=openvino(device_type=GPU) ffmpeg_ort_360p=$(ort_chain_state "$l360") ffmpeg_ort_720p=$(ort_chain_state "$l720") $env_note"
     if ! have_api; then
         if [[ "$API_WHY" == rejected ]]; then
             record 5 FAIL "$note token rejected (HTTP $API_CODE) by $JF_URL/System/Info"
@@ -799,7 +842,17 @@ row_5() {
     dev=$(jq -r '.NeuralDevice // "none"' <<<"$rec")
     applied=$(jq -r '.NeuralApplied // false' <<<"$rec")
     [[ "$dev" == openvino ]] || status=FAIL
-    record 5 "$status" "$note device=$dev neural_applied=$applied"
+    note+=" device=$dev neural_applied=$applied"
+    if [[ "$dev" != openvino ]]; then
+        # NeuralDevice is null unless the engine built an ort node: none means the session never ran ORT, which is not
+        # an ORT fallback (that reads cpu, with the reason in the direct chain's log above).
+        req=$(jq -r '.NeuralRequested // "off"' <<<"$rec")
+        withheld=$(jq -r '.Record.GpuWithheldUnmeasured // empty' <<<"$rec")
+        routing=$(jq -r '.NeuralRouting // empty' <<<"$rec")
+        sumry=$(jq -r '.Record.Summary // empty' <<<"$rec")
+        note+=" session_neural_requested=$req session_withheld=${withheld:-none} session_routing=${routing:-none} session_summary=${sumry:0:300}"
+    fi
+    record 5 "$status" "$note"
 }
 
 # The plugin's configuration is changed for row 6 and put back as it was found, on any exit.
@@ -847,7 +900,7 @@ row_6() {
     if [[ "$routing" == *"NOT run"* && "$applied" != true ]]; then
         record 6 PASS "NeuralRouting=$routing"
     else
-        record 6 FAIL "a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied"
+        record 6 FAIL "a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied neural_requested=$(jq -r '.NeuralRequested // "off"' <<<"$rec") session_withheld=$(jq -r '.Record.GpuWithheldUnmeasured // "none"' <<<"$rec")"
     fi
 }
 

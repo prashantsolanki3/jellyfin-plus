@@ -439,6 +439,8 @@ case "$*" in
 *-benchmark*)
     [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4
+    # FAKE_ORT_WARN: what the ort filter says on stderr when the OpenVINO provider is not there (vf_ort.c append_openvino)
+    case "$*" in *ort=*) [ -z "${FAKE_ORT_WARN:-}" ] || echo "[Parsed_ort_3 @ 0x1] $FAKE_ORT_WARN" >&2;; esac
     # an ffv1 write leaves its output (the last argument) as ffmpeg does. FAKE_FFV1_FAIL / _SKIP / _STALE hold a substring
     # of the output path they apply to: _FAIL exits 1 (a full disk), _SKIP exits 0 and writes nothing, _STALE writes it
     # with a year-2000 mtime, as a leftover of an earlier run would be.
@@ -802,7 +804,7 @@ def test_mutants(tmp):
         ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
         ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
-        ("run-fps-lost-failure", '|| { rc=$?; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
+        ("run-fps-lost-failure", '|| { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
         ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"',
          'curl -fsS -H "Authorization: MediaBrowser Token=\\"$JF_TOKEN\\"" "$@" "$JF_URL$p"', token_failures),
         ("legacy-header", 'Authorization: MediaBrowser Token=\\\\"%s\\\\"', "X-Emby-Token: %s", token_failures),
@@ -2211,6 +2213,28 @@ def test_row_5(tmp):
     w = World(tmp, "r5-nostream", {"fail_master": True}, extra)
     st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
     check("row 5 FAILs when its stream cannot start", st == "FAIL", f"{st} {detail}")
+
+    # the exact fallback reason: the ort filter's own warning, the environment's answers, and what the session record says
+    warn = "OpenVINO execution provider unavailable (Device GPU is not available), using CPU"
+    w = World(tmp, "r5-reason", {"device": None, "applied": False,
+                                 "routing": "neural realesr-anime-x2 NOT run: not measured on Intel"},
+              dict(extra, FAKE_ORT_WARN=warn))
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 prints the ort filter's fallback reason for both clips",
+          detail.count("CPU_FALLBACK[") == 2 and "Device GPU is not available" in detail, detail)
+    check("row 5 prints the environment's answers",
+          all(k in detail for k in ("ep_libs_missing=", "gpu_plugin_unresolved=", "opencl_icd=", "libOpenCL=",
+                                    "level_zero_loader=", "open=FAIL(", "process_gids=")), detail)
+    check("row 5 says a null device is a session that never ran ORT, with the routing it recorded",
+          st == "FAIL" and "device=none" in detail and "session_neural_requested=" in detail and "NOT run: not measured on Intel" in detail, f"{st} {detail}")
+    check("row 5 keeps each chain's ffmpeg log in the run directory",
+          all(os.path.isfile(os.path.join(w.out, "run-w1", f"row5-{h}p.ffmpeg.log")) for h in (360, 720)), os.listdir(w.out))
+    w = World(tmp, "r5-quiet", extra=extra)
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 without a fallback line says so instead of claiming openvino", "ffmpeg_ort_360p=no_ort_line_in_log" in detail, detail)
+    w = World(tmp, "r5-chainfail", extra=dict(extra, FAKE_FFMPEG_FAIL="1"))
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 FAILs with the environment report when the ort chain dies", st == "FAIL" and "ort_env:" in detail, f"{st} {detail}")
 
 
 def stage_meta_check(tmp, label, guid, abi, strip_source):
