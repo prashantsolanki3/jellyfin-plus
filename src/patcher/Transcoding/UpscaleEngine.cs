@@ -2976,12 +2976,24 @@ namespace Jellyfin.Plugin.Plus.Patcher
             + " and the reactive mask is empty (jitter is still measured)";
 
         /// <summary>
-        /// Whether the patched ffmpeg was built to run fsr2 without CUDA (the marker beside the models
-        /// directory), on a detected Intel GPU. False everywhere else. Says nothing about whether fsr2
-        /// actually runs here: that is <see cref="NoCudaGameNow"/>. Never throws.
+        /// Off: without CUDA the build zeroes fsr2's motion vectors every frame, so moving video ghosts
+        /// (rev-sr6bf). Nothing in production sets this; it exists for the harness and the mestimate experiment.
+        /// </summary>
+        internal static bool NoCudaGameEnabled { get; set; } = false;
+
+        /// <summary>
+        /// Whether fsr2 without CUDA is switched on (<see cref="NoCudaGameEnabled"/>) and the patched ffmpeg
+        /// was built for it (the marker beside the models directory), on a detected Intel GPU. False
+        /// everywhere else. Says nothing about whether fsr2 actually runs here: that is
+        /// <see cref="NoCudaGameNow"/>. Never throws.
         /// </summary>
         internal static bool NoCudaGameBuilt()
         {
+            if (!NoCudaGameEnabled)
+            {
+                return false;
+            }
+
             try
             {
                 GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);

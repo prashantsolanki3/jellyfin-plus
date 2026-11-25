@@ -261,7 +261,9 @@ vectors, empty reactive mask, jitter still measured); the default build keeps th
 start and degrades only a failed NVOFA init. `GPU_VENDOR=intel WITH_FSR2=1 scripts/build-ffmpeg.sh` (or
 `ORT_EP=openvino WITH_FSR2=1`) builds it (patch `ffmpeg/0016`) and leaves `<prefix>/fsr2-nocuda` (any other build
 removes it); with that file and a detected Intel GPU `GpuCapability.NoCudaGameAvailable` is true, and the probe
-offers `fsr2` (not `dlss`/`dlaa`) only once a one-frame fsr2 run of the patched ffmpeg has passed, started at
+would offer `fsr2` (not `dlss`/`dlaa`) only once a one-frame fsr2 run of the patched ffmpeg has passed, but
+`UpscaleEngine.NoCudaGameEnabled` is off (rev-sr6bf: zero motion vectors ghost moving video), so Intel never
+offers it; the probe, when enabled, is started at
 plugin load and never on a request (`CachedProbe`: a pass is kept, a failure is retried every 5 minutes). Until
 then fsr2 is withheld with its own reason. `SessionRecord.GameMotionNote` says the vectors are zero. Without the
 file everything is as before. NVIDIA is unchanged. Not compiled or run on an Intel GPU; `scripts/test-gu-inputs.sh`

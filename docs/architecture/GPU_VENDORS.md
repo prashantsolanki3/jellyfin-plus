@@ -504,7 +504,7 @@ is stated, never silent:
 |---|---|---|
 | Denoise | `optix`, `optix-temporal` (and the unlisted `optix-hdr`) | OptiX needs CUDA frames |
 | Neural | `dlpp-1` to `dlpp-4`, `vsr-rtcuda` (and the retired `vsr`) | NVIDIA RTX DLPP / VSR libraries over CUDA |
-| Game | `dlss`, `dlaa`; and `fsr2` unless the ffmpeg is the PR 6 CUDA-free build | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), and is offered on Intel only when the build left the `fsr2-nocuda` marker and a one-frame fsr2 probe has passed (section 5.5) |
+| Game | `dlss`, `dlaa`; and `fsr2` unless the ffmpeg is the PR 6 CUDA-free build | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), and is not offered on Intel: `UpscaleEngine.NoCudaGameEnabled` is off because the zero motion vectors ghost moving video (rev-sr6bf, section 5.5) |
 
 Each is removed from the probe lists (`Levels.Denoise`, `Neural`, `Game`, `GameOptionLevels` and the
 label maps), so the client, which builds its menu from the probe, never offers it. A server whose
@@ -725,6 +725,11 @@ OptiX patches, so an OpenVINO build applies the standalone
 registers `fsr2` with no `ffnvcodec` dependency, and compiles with `-DGU_NO_NVOF`. The build leaves a
 marker, `fsr2-nocuda`, beside the models directory's parent, as the OpenVINO build leaves its provider; every
 other build deletes a stale one. `GPU_VENDOR=intel WITH_FSR2=1` takes the same path (section 5.7).
+
+**Switched off (rev-sr6bf).** Bench row 8 found the zero motion vectors ghost moving video, so
+`UpscaleEngine.NoCudaGameEnabled` is false and `NoCudaGameBuilt()` returns false before it looks at the marker:
+on Intel `fsr2` is withheld as "needs NVIDIA" and the probe below never starts. The text that follows describes
+the machinery as it stays for the motion-vector experiment, not what a server does today.
 
 **The plugin.** `GpuCapability.NoCudaGameAvailable` is true only when an Intel GPU was seen and that
 marker exists. That is not yet enough to offer `fsr2`: the marker says the build was made for it, not that
@@ -1003,14 +1008,14 @@ never `PASS`.
 
 | Row | What | Must pass |
 |---|---|---|
-| 1 | Vendor record | vendor=intel; render node (picked at run time: vendor 0x8086 in `/dev/dri`, else the only node); Vulkan `vk:0` (index; name match `vk:Intel` when several GPU nodes are visible); no NVIDIA-only level; fsr2 offered; no nvenc/cuda in any command |
+| 1 | Vendor record | vendor=intel; render node (picked at run time: vendor 0x8086 in `/dev/dri`, else the only node); Vulkan `vk:0` (index; name match `vk:Intel` when several GPU nodes are visible); no NVIDIA-only level; fsr2 not offered (offered, with the marker, under `BENCH_FSR2=1`); no nvenc/cuda in any command |
 | 2 | FSRCNNX 360p to 1080p, software decode | fps >= 100; xpsnr >= bicubic + 0.5 dB |
 | 3 | FSRCNNX 720p to 1080p | end-to-end fps >= 1.2x source; xpsnr >= bicubic + 0.3 dB |
 | 4 | FSRCNNX 1080p to 2160p | scaler-only fps >= 34; end-to-end with QSV >= 1.2x; xpsnr >= bicubic + 0.3 dB |
 | 5 | Neural (ORT on OpenVINO) | a 360p neural stream's session record says `openvino`, not CPU (`FAIL` otherwise); fps measured at 360p and 720p; slower than real time is a valid result (`MANUAL`) |
 | 6 | Routing by source height | `NeuralMaxSourceHeight=480` sends a 720p source to the shader path, and the record says why. The row sets it through the plugin configuration API (`/Plugins`, `/Plugins/{id}/Configuration`), checks the probe shows 480, streams `BENCH_NEURAL_LEVEL`, and puts the configuration back as found, on any exit |
 | 7 | fsr2 without CUDA, still pixels | after the first ceil(8*scale^2) frames (72 at 3x, 32 at 2x, 18 at 1.5x): mean consecutive-frame luma difference <= 0.5, per-frame max <= 16 in 99% of frames; FSRCNNX control exactly 0 |
-| 8 | fsr2 without CUDA, moving content | xpsnr on the panning cut >= bicubic (a miss is a result, not a blocker) |
+| 8 | fsr2 without CUDA, moving content | SKIP with a reason (zero motion vectors, rev-sr6bf) unless `BENCH_FSR2=1`; then xpsnr on the panning cut >= bicubic (a miss is a result, not a blocker) |
 | 9 | Hardware decode off/on | on: `-hwaccel vaapi`, `hwmap=derive_device=vulkan`, no `Conversion failed!`, cpu time per frame >= 30% lower, xpsnr(on,off) >= 50 dB |
 | 10 | QSV encode | `h264_qsv`/`hevc_qsv` chosen; served segment codec matches; `/Gpu/Load` within 10 points of the fdinfo figure |
 | 11 | Contention with one Plex hardware transcode | fps >= 36 while it runs (the caller asserts the Plex transcode) |

@@ -1349,6 +1349,19 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("Intel node + marker: NoCudaGameAvailable", GpuDetector.Resolve("auto", Path.Combine(Rig(), "models"), WithFile(Machine("renderD128", "0x8086"), marker)).NoCudaGameAvailable);
             Check("Intel chosen, no Intel node, marker: no NoCudaGameAvailable", !GpuDetector.Resolve("intel", Path.Combine(Rig(), "models"), WithFile(Machine("renderD128", "0x10de"), marker)).NoCudaGameAvailable);
 
+            // rev-sr6bf: switched off (the default), fsr2 stays withheld on Intel with the marker and a passing probe.
+            Check("fsr2 without CUDA is off by default", !UpscaleEngine.NoCudaGameEnabled);
+            UseFsr2Probe(Fsr2Passed);
+            GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x8086"), marker));
+            UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
+            JsonElement disabled = Probe();
+            Check("default off, Intel + marker + passing probe: not built, not run", !UpscaleEngine.NoCudaGameBuilt() && !UpscaleEngine.NoCudaGameNow());
+            Equal("default off, Intel + marker: Game is off alone", "off", string.Join(",", Strings(disabled, "Game")));
+            Equal("default off, Intel + marker: fsr2 says needs NVIDIA", UpscaleEngine.NeedsNvidia, disabled.GetProperty("Withheld").GetProperty("Game").GetProperty("fsr2").GetString());
+            Check("default off, Intel + marker: the fsr2 probe was never run", _fsr2ProbeCalls == 0, _fsr2ProbeCalls + " calls");
+            UpscaleEngine.NoCudaGameEnabled = true;
+
             // Without the marker the Intel probe is what PR 3 made it: no game level, and the fsr2 probe never runs
             // even though one that would pass is installed.
             UseFsr2Probe(Fsr2Passed);
@@ -1462,6 +1475,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("the level classification is unchanged", ShaderLibrary.IsNvidiaOnlyGame("fsr2") && ShaderLibrary.IsCudaFreeGame("fsr2") && !ShaderLibrary.IsCudaFreeGame("dlss") && !ShaderLibrary.IsCudaFreeGame("dlaa") && !ShaderLibrary.IsCudaFreeGame("off") && !ShaderLibrary.IsCudaFreeGame(null));
 
             GpuDetector.UseEnvironment(null);
+            UpscaleEngine.NoCudaGameEnabled = false;
             UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe();
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
@@ -1695,6 +1709,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 if (pair.Key == "game")
                 {
                     // PR 6's review: fsr2 runs on Intel only once its start-up probe has passed, so it has to have.
+                    UpscaleEngine.NoCudaGameEnabled = true;
                     GpuDetector.UseEnvironment(marked);
                     UpscaleEngine.Settings = HwSettings(true);
                     UseFsr2Probe(Fsr2Passed);
@@ -1710,6 +1725,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 Check("the chain is the software chain" + tag, UpscaleEngine.BuildChain(cpu).StartsWith("format=yuv420p"), UpscaleEngine.BuildChain(cpu));
             }
 
+            UpscaleEngine.NoCudaGameEnabled = false;
             UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe();
 
             // A GPU-side Vulkan denoise rides along only when the patched binary can compile it.

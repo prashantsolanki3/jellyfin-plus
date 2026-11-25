@@ -33,6 +33,7 @@
 #   BENCH_DRI_DIR         the pod's device nodes               /dev/dri
 #   BENCH_SHADER          the FSRCNNX shader             /usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl
 #   BENCH_ORT_MODEL       an ONNX model for row 5        (none: row 5 SKIPs)
+#   BENCH_FSR2=1          run the fsr2-without-CUDA experiment: row 8 runs (else SKIP) and row 1 requires fsr2 offered and the marker (else it requires fsr2 not offered)   (off)
 #   BENCH_FSR2_OPTS       extra fsr2 filter options      (none)
 #   BENCH_RUNS            runs per figure                3          (row 5 runs once per clip, see ORT_FRAMES)
 #   BENCH_RUN_TIMEOUT     seconds each measured ffmpeg may run (then TERM, KILL 10 s later; the row records FAIL timeout after Ns)   240
@@ -96,6 +97,11 @@ pick_render_node
 SHADER="${BENCH_SHADER:-/usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl}"
 ORT_MODEL="${BENCH_ORT_MODEL:-}"
 FSR2_OPTS="${BENCH_FSR2_OPTS:-}"
+# fsr2 without CUDA gets zero motion vectors and ghosts moving video (rev-sr6bf): the shim does not offer it on Intel and
+# row 8 is SKIP, unless BENCH_FSR2=1 asks for the experiment. An empty value is unset.
+FSR2_ON=0
+[[ "${BENCH_FSR2:-}" == 1 ]] && FSR2_ON=1
+FSR2_SKIP="fsr2 without CUDA gets zero motion vectors, so moving video ghosts and the shim does not offer it on Intel (rev-sr6bf, docs/intel-patched-ffmpeg-libplacebo.md); set BENCH_FSR2=1 to run the experiment"
 RUNS="${BENCH_RUNS:-3}"
 RUN_TIMEOUT="${BENCH_RUN_TIMEOUT:-240}"
 # Row 5 (Real-ESRGAN x2 through ORT on OpenVINO) runs ~1-2 fps on an A380 and compiles the model on every
@@ -143,14 +149,16 @@ row_title() {
 
 row_must() {
     case "$1" in
-        1)  echo "vendor=intel; render node $NODE; Vulkan vk:$VK_DEV; no NVIDIA-only level offered; fsr2 offered (marker present); no nvenc/cuda string in any command line" ;;
+        1)  if [[ "$FSR2_ON" == 1 ]]; then echo "vendor=intel; render node $NODE; Vulkan vk:$VK_DEV; no NVIDIA-only level offered; fsr2 offered (marker present); no nvenc/cuda string in any command line"
+            else echo "vendor=intel; render node $NODE; Vulkan vk:$VK_DEV; no NVIDIA-only level offered; fsr2 not offered (zero motion vectors, rev-sr6bf); no nvenc/cuda string in any command line"; fi ;;
         2)  echo "fps>=100; xpsnr>=bicubic+0.5dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
         3)  echo "end-to-end fps>=1.2x source fps; xpsnr>=bicubic+0.3dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
         4)  echo "scaler-only fps>=34; end-to-end with QSV encode >=1.2x source fps; xpsnr>=bicubic+0.3dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
         5)  echo "session record device=openvino (not a CPU fallback); fps measured at 360p and 720p; xpsnr>=FSRCNNX where it runs; slower than real time is a valid result" ;;
         6)  echo "NeuralMaxSourceHeight=480: a 720p source goes to the shader path and the record says why" ;;
         7)  echo "after the first ceil(8*scale^2) frames: mean consecutive-frame luma difference<=0.5, per-frame max<=16 in 99% of frames; FSRCNNX control exactly 0" ;;
-        8)  echo "xpsnr on the panning cut >= bicubic (a miss means the image ships without fsr2-nocuda: a result, not a blocker)" ;;
+        8)  if [[ "$FSR2_ON" == 1 ]]; then echo "xpsnr on the panning cut >= bicubic (a miss means the image ships without fsr2-nocuda: a result, not a blocker)"
+            else echo "SKIP unless BENCH_FSR2=1: fsr2 without CUDA has zero motion vectors and the shim does not offer it (rev-sr6bf)"; fi ;;
         9)  echo "on, an H.264 1080p source: -hwaccel vaapi, download and upload into libplacebo (the zero-copy hwmap=derive_device=vulkan is tried once and its failure recorded, not failed on), no 'Conversion failed!', video engine busy, cpu time per frame >=30% lower, xpsnr(on,off)>=50dB; off: command identical to a build without hardware decode" ;;
         10) echo "h264_qsv/hevc_qsv chosen; the served segment's codec matches; encoderSessions counts the session; /Gpu/Load (primed, read again >=5 s later) within +-10 points of the fdinfo figure when the transcode is visible to the bench pod, else MANUAL with the plugin's figure" ;;
         11) echo "one stream holds fps>=36 while one Plex hardware transcode runs" ;;
@@ -329,7 +337,8 @@ print_plan() {
                 cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$RUN_OUT/still-control.txt"; plan_cmd 7
                 echo "plan: row 7 skip frames: 3x=$(still_skip 3) 2x=$(still_skip 2) 1.5x=$(still_skip 1.5)"
                 echo "plan: row 7 threshold: mean<=$STILL_MEAN_MAX peak<=$STILL_PEAK_MAX in ${STILL_PEAK_PCT}% control==0" ;;
-            8)  read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"
+            8)  if [[ "$FSR2_ON" != 1 ]]; then echo "plan: row 8 SKIP: $FSR2_SKIP"; continue; fi
+                read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"
                 plan_pair 8 "write-candidate write-bicubic xpsnr-candidate xpsnr-bicubic" "$CLIPS/pan_720p.mkv" chain_fsr2 \
                     "$RUN_OUT/pan-fsr2.mkv" "$RUN_OUT/pan-bicubic.mkv" "$CLIPS/pan_1080p.mkv" "$ow" "$oh"
                 echo "plan: row 8 threshold: xpsnr(fsr2)>=xpsnr(bicubic)" ;;
@@ -677,7 +686,7 @@ api_stream() {
 
 row_1() {
     have_api || { no_api 1 "no Jellyfin API: set BENCH_JELLYFIN_URL and BENCH_JELLYFIN_TOKEN"; return; }
-    local st probe bad="" why="" offered
+    local st probe bad="" why="" offered fsr2_note
     st=$(api /JellyfinPlus/Status) || { record 1 FAIL "GET /JellyfinPlus/Status failed"; return; }
     probe=$(api /JellyfinPlus/Session/bench-probe) || { record 1 FAIL "GET /JellyfinPlus/Session failed"; return; }
     [[ "$(jq -r '.Gpu.Vendor' <<<"$st")" == intel ]] || bad+=" vendor=$(jq -r '.Gpu.Vendor' <<<"$st")"
@@ -687,8 +696,14 @@ row_1() {
     for lvl in optix optix-temporal dlpp-1 dlpp-2 dlpp-3 dlpp-4 vsr-rtcuda dlss dlaa; do
         [[ " $offered " != *" $lvl "* ]] || bad+=" offered:$lvl"
     done
-    [[ " $offered " == *" fsr2 "* ]] || bad+=" fsr2-not-offered"
-    [[ -f "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-missing"
+    if [[ "$FSR2_ON" == 1 ]]; then
+        [[ " $offered " == *" fsr2 "* ]] || bad+=" fsr2-not-offered"
+        [[ -f "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-missing"
+        fsr2_note="fsr2 offered"
+    else
+        [[ " $offered " != *" fsr2 "* ]] || bad+=" fsr2-offered"
+        fsr2_note="fsr2 not offered"
+    fi
     if [[ -r "$SHIM_LOG" ]]; then
         local hits
         hits=$(shim_log_new | grep -ciE 'nvenc|cuda' || true)
@@ -698,7 +713,7 @@ row_1() {
     fi
     "$PATCHED_FFMPEG" -hide_banner -nostdin -init_hw_device "vulkan=vk:$VK_DEV" \
         -f lavfi -i nullsrc=s=64x64 -frames:v 1 -f null - >/dev/null 2>&1 || bad+=" vulkan-vk:$VK_DEV-failed"
-    if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, fsr2 offered, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
+    if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, $fsr2_note, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
 }
 
 xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB, signed (+1.25, -0.40: callers print it as is); non-zero (xpsnr_y's status) when either score is missing
@@ -873,6 +888,7 @@ row_7() {
 }
 
 row_8() {
+    [[ "$FSR2_ON" == 1 ]] || { record 8 SKIP "$FSR2_SKIP"; return; }
     [[ -f "$CLIPS/pan_720p.mkv" && -f "$CLIPS/pan_1080p.mkv" ]] || { record 8 SKIP "no pan_720p.mkv / pan_1080p.mkv"; return; }
     local d ow oh rc=0 fsr2_out="$RUN_OUT/pan-fsr2.mkv" bicubic_out="$RUN_OUT/pan-bicubic.mkv"
     read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"

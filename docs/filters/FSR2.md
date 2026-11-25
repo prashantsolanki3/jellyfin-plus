@@ -38,10 +38,11 @@ Lanczos upsample**. That is not super-resolution, and the menu says so.
 WITH_FSR2=1` build of `scripts/build-ffmpeg.sh`) has no optical flow: the motion vectors are zero and
 the reactive mask is empty. A default build whose CUDA will not start is an error, not this. Jitter (phase
 correlation) and depth (the model, or flat) are unchanged. Ghosting on moving content is then likely and
-has not been measured. The plugin offers `fsr2` on Intel only when that build left `fsr2-nocuda` beside the
-models directory's parent and a one-frame fsr2 run has passed on this GPU, and says in the session record
-that the vectors are zero
-([GPU_VENDORS.md](../architecture/GPU_VENDORS.md) section 5.5). `dlss` and `dlaa` stay NVIDIA-only.
+has not been measured. Bench row 8 measured it (-38 dB against bicubic on a pan), so the plugin does **not** offer
+`fsr2` on Intel: `UpscaleEngine.NoCudaGameEnabled` is off
+([intel-patched-ffmpeg-libplacebo.md](../intel-patched-ffmpeg-libplacebo.md), rev-sr6bf). The marker and probe code
+stays for the motion-vector experiment ([GPU_VENDORS.md](../architecture/GPU_VENDORS.md) section 5.5). `dlss` and
+`dlaa` stay NVIDIA-only.
 
 **Expect ghosting.** The reactive mask (`reactive=flow`, the default) is FSR2's own designed control
 for it and it is supplied, but from flow inconsistency, which finds occlusion and disocclusion and

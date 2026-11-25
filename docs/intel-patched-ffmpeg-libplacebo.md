@@ -66,6 +66,15 @@ so a good `frame1` with a collapsed `frames2+` confirms the cause is temporal (z
 means the fault is in the per-frame path (packing, colour range, pairing). `scripts/test_bench_intel.py` covers the
 format. Not yet run on the Arc.
 
+**Decision (bead rev-sr6bf): the shim no longer offers fsr2 on Intel, and bench row 8 is SKIP.** PR 47 found the cause
+(zero motion vectors, above). `UpscaleEngine.NoCudaGameEnabled` is false and nothing in production sets it, so
+`NoCudaGameBuilt()` is false on Intel and fsr2 is withheld ("needs NVIDIA") exactly as on a build with no marker.
+`BENCH_FSR2=1 scripts/bench-intel.sh` brings row 8 and the fsr2 half of row 1 back for the experiment. Still open, owner
+choice: remove `fsr2-nocuda` from the image itself. `docker/intel/Dockerfile:208` and
+`.github/workflows/build-arc-image.yml` (the marker and `fsr2` checks) require both today, so that needs a workflow edit
+by the owner. Not run: feeding `mestimate` (CPU), a Vulkan block-matching flow shader, or VA-API/QSV encoder motion
+estimation (FEI, deprecated) into fsr2 on a 10 s fixture, which would report per-frame XPSNR and fps.
+
 **Recommendation: ship the image without fsr2-nocuda** (the row's own threshold text says a miss means exactly this).
 No fix is shipped here, because the one candidate is not small and cannot be shown to help:
 a uniform motion field built from the phase-correlation shift (already measured, `gu_inputs.h:245`) would fix pans but

@@ -185,6 +185,8 @@ def clean_env(extra=None, path=None):
     # no render node in sight: the script falls back to renderD128, so the plan goldens do not depend on the host's GPUs
     env["BENCH_SYSFS_DRM"] = "/nonexistent/sys-class-drm"
     env["BENCH_DRI_DIR"] = "/nonexistent/dev-dri"
+    # row 8 and the fsr2 half of row 1 are opt-in (rev-sr6bf): every test below that is about them runs with the experiment on
+    env["BENCH_FSR2"] = "1"
     env.update(extra or {})
     return env
 
@@ -628,7 +630,7 @@ if path.startswith("/JellyfinPlus/Session/"):
         shimlog(sc.get("probe_logs"))
     s = st["sessions"].get(sid)
     if s is None:
-        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": ["off", "fsr2"]}
+        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": sc.get("game_levels", ["off", "fsr2"])}
         if cfg_max > 0 and sc.get("config_applies", True):
             levels["NeuralMaxSourceHeight"] = cfg_max
         out({"Known": False, "Levels": levels})
@@ -2062,6 +2064,56 @@ def test_row_1_scope(tmp):
     check("row 12 passes on a libplacebo line written during the run", results(out).get(12, ("",))[0] == "PASS", str(results(out)))
 
 
+def test_fsr2_withheld(tmp):
+    """rev-sr6bf: without BENCH_FSR2=1 the shim must not offer fsr2 and row 8 is SKIP with the reason, never FAIL."""
+    off = {"BENCH_FSR2": ""}
+    rc, out, err = run(BENCH, ["--dry-run", "--rows", "8"], clean_env(off))
+    lines = out.splitlines()
+    must = [l for l in lines if l.startswith("plan: row 8 must pass: ")]
+    check("dry-run without BENCH_FSR2 names the SKIP and its reason, with no row 8 command",
+          rc == 0 and any(l.startswith("plan: row 8 SKIP: ") and "rev-sr6bf" in l and "BENCH_FSR2=1" in l for l in lines)
+          and not any(l.startswith("plan: row 8 cmd: ") or l.startswith("plan: row 8 threshold") for l in lines), out)
+    check("row 8's must text no longer says to ship without fsr2-nocuda",
+          len(must) == 1 and "ship" not in must[0] and "SKIP" in must[0], str(must))
+    rc, out, err = run(BENCH, ["--dry-run", "--rows", "8"], clean_env({"BENCH_FSR2": "1"}))
+    check("BENCH_FSR2=1 keeps the row 8 commands in the plan", rc == 0 and out.count("plan: row 8 cmd: ") == 4 and "plan: row 8 SKIP" not in out, out)
+
+    w = World(tmp, "r8-skip", extra=off)
+    pan_clips(w)
+    rc, out, err = w.run(["--rows", "8"])
+    st, detail = results(out).get(8, ("", ""))
+    check("row 8 is SKIP, not FAIL, when the clips are there but BENCH_FSR2 is unset",
+          rc == 0 and st == "SKIP" and "rev-sr6bf" in detail and "motion vectors" in detail, f"rc={rc} {st} {detail} {err}")
+    check("a SKIPped row 8 runs no ffmpeg and writes no pan output",
+          not ffmpeg_runs(w) and not any("pan-" in l for l in open(os.path.join(w.root, "ffmpeg.log")).read().splitlines())
+          if os.path.exists(os.path.join(w.root, "ffmpeg.log")) else True, str(ffmpeg_runs(w)))
+    check("the SKIP reaches results.jsonl", any('"status":"SKIP"' in l and '"row":8' in l for l in w.jsonl()), str(w.jsonl()))
+    w = World(tmp, "r8-skip-empty", extra=off)
+    rc, out, err = w.run(["--rows", "8"])
+    check("row 8 with no clips and no BENCH_FSR2 is still SKIP", results(out).get(8, ("",))[0] == "SKIP", out)
+
+    w = World(tmp, "r8-on", extra={"BENCH_FSR2": "1"})
+    pan_clips(w)
+    rc, out, err = w.run(["--rows", "8"])
+    check("row 8 runs its ffmpeg commands with BENCH_FSR2=1", len(ffmpeg_runs(w)) >= 2 and results(out).get(8, ("",))[0] == "PASS", f"{results(out)} {err}")
+
+    w = World(tmp, "r1-withheld", {"game_levels": ["off"]}, off)
+    os.remove(os.path.join(w.stubs, "fsr2-nocuda"))
+    rc, out, err = w.run(["--rows", "1"])
+    st, detail = results(out).get(1, ("", ""))
+    check("row 1 PASSes when fsr2 is not offered and the marker is absent, BENCH_FSR2 unset",
+          st == "PASS" and "fsr2 not offered" in detail, f"{st} {detail} {err}")
+    w = World(tmp, "r1-offered", None, off)
+    rc, out, err = w.run(["--rows", "1"])
+    st, detail = results(out).get(1, ("", ""))
+    check("row 1 FAILs fsr2-offered when the shim offers fsr2 and BENCH_FSR2 is unset",
+          st == "FAIL" and "fsr2-offered" in detail, f"{st} {detail} {err}")
+    w = World(tmp, "r1-on-missing", {"game_levels": ["off"]}, {"BENCH_FSR2": "1"})
+    rc, out, err = w.run(["--rows", "1"])
+    st, detail = results(out).get(1, ("", ""))
+    check("row 1 with BENCH_FSR2=1 still FAILs fsr2-not-offered", st == "FAIL" and "fsr2-not-offered" in detail, f"{st} {detail}")
+
+
 def drm_fixture(root, cards, in_dri):
     """A fake /sys/class/drm (renderDnnn/device/vendor for every card) and /dev/dri (a file per name in in_dri)."""
     sysdrm = os.path.join(root, "sys-class-drm")
@@ -2288,7 +2340,7 @@ def main():
         return 1
     with tempfile.TemporaryDirectory() as tmp:
         for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
-                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_render_node_pick, test_row_6, test_row_5,
+                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_fsr2_withheld, test_render_node_pick, test_row_6, test_row_5,
                      test_shared_files, test_scored_inputs):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
