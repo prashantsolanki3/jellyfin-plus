@@ -155,7 +155,7 @@ esbuild) support natively.
 
 | file | what it is |
 |---|---|
-| `docker/intel/Dockerfile` | the production Jellyfin image plus the `GPU_VENDOR=intel` ffmpeg, plugin, patcher, shim, shaders and injected web client; pinned base digest, FSR2 commit and .NET SDK sha512; fails the build on a missing filter, an unresolved library or a changed stock ffmpeg |
+| `docker/intel/Dockerfile` | the production Jellyfin image plus the `GPU_VENDOR=intel` ffmpeg, plugin, patcher, shim, shaders and injected web client; pinned base digest and .NET SDK sha512; builds no fsr2; fails the build on a missing filter, an unresolved library or a changed stock ffmpeg |
 | `docker/intel/stage-plugin.sh` | the image-time half of `proxmox-build.sh`: publishes the plugin and patcher against the image's own Jellyfin assemblies and writes `meta.json`; sources `scripts/plugin-meta.sh` |
 | `scripts/plugin-meta.sh` | the plugin GUID, name, target ABI and `plugin_first_meta`, sourced by `proxmox-build.sh` and `stage-plugin.sh` (never by `bench-intel.sh`: the image's final stage does not carry it) |
 | `docker/intel/entrypoint.py` | the image's ENTRYPOINT: seeds `$JELLYFIN_DATA_DIR/plugins/JellyfinPlus_<ver>` from `/usr/lib/jellyfin-plus-dist` (idempotent, keeps user config, fails soft), then execs `/jellyfin/jellyfin`; `seed`, `main` |

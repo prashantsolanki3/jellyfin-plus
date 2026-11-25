@@ -18,8 +18,8 @@ Needs no GPU, ffmpeg, docker, network or Jellyfin. It runs the real scripts/benc
   - a row scores only files its own run wrote (rev-hxlit): a fresh run-<id> directory per run, a used id
     refused, any failed write a FAIL, a missing or old scored file a FAIL;
   - scripts/plugin-meta.sh holds the plugin GUID and target ABI once (Plugin.cs and manifest.json agree);
-  - docker/intel/Dockerfile keeps its pins (base digest, FSR2 commit, SDK sha512), builds the Intel
-    variant, carries the acceptance checks, and its digest matches the spec page;
+  - docker/intel/Dockerfile keeps its pins (base digest, SDK sha512), builds the Intel
+    variant without fsr2, carries the acceptance checks, and its digest matches the spec page;
   - mutation: each deliberate breakage of bench-intel.sh is caught by the plan checks.
 
 It does not build the image and does not run a row against a GPU. Exit status: 0 every check passed,
@@ -141,7 +141,7 @@ THRESHOLD = {
 
 EXACT = [
     "plan: bench-intel: rows=1 2 3 4 5 6 7 8 9 10 11 12 13 runs=3 mode=dry-run",
-    "plan: required filters: oidn ort fsr2",
+    "plan: required filters: oidn ort",
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), ff=STOCK),
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), f"{RUN}/r2-shader.mkv", ff=STOCK),
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080), f"{RUN}/r2-bicubic.mkv", ff=STOCK),
@@ -389,7 +389,11 @@ FFMPEG_STUB = r'''#!/bin/sh
 [ -z "${FAKE_FFMPEG_LOG:-}" ] || echo "$*" >> "$FAKE_FFMPEG_LOG"
 case "$*" in
 *-filters*)
-    for f in oidn ort fsr2 libplacebo xpsnr; do echo " T.. $f  V->V stub"; done
+    for f in oidn ort fsr2 libplacebo xpsnr; do
+        # FAKE_NO_FSR2=1: the Intel image's binary, which carries no fsr2 filter
+        [ "$f" = fsr2 ] && [ "${FAKE_NO_FSR2:-}" = 1 ] && continue
+        echo " T.. $f  V->V stub"
+    done
     i=0; while [ $i -lt 4000 ]; do echo " T.. pad$i  V->V padding so the pipe fills"; i=$((i + 1)); done
     exit 0;;
 *xpsnr=*)
@@ -628,7 +632,7 @@ if path.startswith("/JellyfinPlus/Session/"):
         shimlog(sc.get("probe_logs"))
     s = st["sessions"].get(sid)
     if s is None:
-        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": ["off", "fsr2"]}
+        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": sc.get("game_levels", ["off", "fsr2"])}
         if cfg_max > 0 and sc.get("config_applies", True):
             levels["NeuralMaxSourceHeight"] = cfg_max
         out({"Known": False, "Levels": levels})
@@ -855,8 +859,7 @@ def test_mutants(tmp):
 def build_apt_checks(df):
     """The build stage's apt line carries every dev package build-ffmpeg.sh installs for the Intel build.
 
-    The FSR2 compile runs before the script's own apt step, and a header missing there (vulkan/vulkan.h)
-    failed the first CI build.
+    A header missing there (vulkan/vulkan.h) failed the first CI build.
     """
     stage = re.search(r"^FROM \S+ AS build\n(.*?)(?=^FROM )", df, re.M | re.S)
     check("the Dockerfile has a build stage", bool(stage))
@@ -876,9 +879,7 @@ def build_apt_checks(df):
     missing = [p for p in wanted if p not in pkgs]
     check("the build stage installs everything build-ffmpeg.sh apt-installs for intel", not missing, str(missing))
 
-    fetch = body.find("git fetch")
-    at = apt.start() if apt else -1
-    check("the apt install comes before the FSR2 fetch and compile", 0 <= at < fetch, f"{at} {fetch}")
+    check("the build stage fetches no FSR2 source", "git fetch" not in body and "FidelityFX" not in body)
     check("the distro shaderc is not installed (it broke nlmeans_vulkan)", "libshaderc" not in " ".join(pkgs))
     check("build-ffmpeg.sh apt-installs zlib1g-dev for intel (png needs zlib)", "zlib1g-dev" in (intel.group(1).split() if intel else []))
     check("build-ffmpeg.sh passes --enable-zlib for intel", bool(re.search(r"HWACCEL_FLAGS=\([^)]*--enable-zlib", script.split("else\n    VENDOR_PATCHES=(")[0])))
@@ -1075,20 +1076,21 @@ def dockerfile_checks(tmp):
     digest = re.search(r"^ARG JELLYFIN_IMAGE=(\S+@sha256:[0-9a-f]{64})$", df, re.M)
     check("base image is pinned by digest", bool(digest))
     check("the spec page names the same base image", bool(digest) and digest.group(1).split("docker.io/")[1] in spec)
-    commit = re.search(r"^ARG FSR2_COMMIT=([0-9a-f]{40})$", df, re.M)
-    check("FSR2 is pinned to a full commit", bool(commit))
-    check("the spec page names the FSR2 commit", bool(commit) and commit.group(1) in spec)
+    check("the image builds no fsr2 (zero motion vectors without CUDA): no SDK, no WITH_FSR2",
+          not re.search(r"WITH_FSR2|FSR2_|gen_perm|fsr2compat|FidelityFX", df))
+    check("the build acceptance requires the fsr2 marker absent and the filter absent",
+          "test ! -e /usr/lib/jellyfin-ffmpeg-oidn/fsr2-nocuda" in df and "carries fsr2: not shipped on Intel" in df)
     check("the .NET SDK sha512 is pinned and checked",
           bool(re.search(r"^ARG DOTNET_SDK_SHA512=[0-9a-f]{128}$", df, re.M)) and "sha512sum -c" in df)
     check("no :latest", ":latest" not in df)
     froms = re.findall(r"^FROM (\S+)", df, re.M)
     check("every stage starts from the pinned base", froms and all(f == "${JELLYFIN_IMAGE}" for f in froms), str(froms))
-    for needle in ["GPU_VENDOR=intel", "WITH_ORT=1", "ORT_EP=openvino", "WITH_FSR2=1", "FSR2_SDK=", "FSR2_LIB=",
-                   "PREFIX=/usr/lib/jellyfin-ffmpeg-oidn", "scripts/build-ffmpeg.sh", "fsr2-nocuda",
+    for needle in ["GPU_VENDOR=intel", "WITH_ORT=1", "ORT_EP=openvino",
+                   "PREFIX=/usr/lib/jellyfin-ffmpeg-oidn", "scripts/build-ffmpeg.sh",
                    "ffmpeg_required_filters intel", "-hwaccels", "h264_qsv", "-encoders | grep -qE '^ V.{5} png '",
                    "-decoders | grep -qE '^ V.{5} png '", "cmp /tmp/base-ffmpeg",
                    "not found", "S=/usr/lib/jellyfin-ffmpeg/lib", "libvulkan.so.1 libshaderc_shared.so.1",
-                   'loads $so from $got, not $S', "git rev-parse HEAD", "FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
+                   'loads $so from $got, not $S',"FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
                    "/var/cache/jellyfin/jellyfin-upscale.json", "jellyfin-ffmpeg-upscale"]:
         check(f"Dockerfile carries {needle}", needle in df)
     check("Dockerfile publishes nothing and sets no USER", not re.search(r"docker push|^USER ", df, re.M))
@@ -1107,7 +1109,7 @@ def dockerfile_checks(tmp):
     check("dockerignore keeps what the build needs", not [n for n in need if n in ignore], str(ignore))
     for rel in ["shim/jellyfin-ffmpeg-upscale", "scripts/bench-intel.sh", "scripts/ffmpeg-vendor.sh", "scripts/build-ffmpeg.sh",
                 "scripts/install-shaders.sh", "scripts/jellyfin-plus-webinject", "scripts/build-web-panel.sh",
-                "ffmpeg/gen_perm.py", "ffmpeg/fsr2compat.h", "web/theme/jellyfinplus.css", "web/package-lock.json",
+                "web/theme/jellyfinplus.css", "web/package-lock.json",
                 "assets/jellyfinplus.png", "assets/plugin-meta.json", "docker/intel/stage-plugin.sh",
                 "docker/intel/entrypoint.py", "docker/intel/accept-plugin.sh", "scripts/test_entrypoint.py"]:
         check(f"{rel} exists", os.path.isfile(os.path.join(REPO, rel)))
@@ -2062,6 +2064,32 @@ def test_row_1_scope(tmp):
     check("row 12 passes on a libplacebo line written during the run", results(out).get(12, ("",))[0] == "PASS", str(results(out)))
 
 
+def test_no_fsr2(tmp):
+    """The Intel image ships no fsr2 filter: rows 7 and 8 are SKIP with the reason, row 1 wants it withheld."""
+    w = World(tmp, "nofsr2", {"game_levels": ["off"]}, extra={"FAKE_NO_FSR2": "1"})
+    pan_clips(w)
+    os.remove(os.path.join(w.stubs, "fsr2-nocuda"))
+    rc, out, err = w.run(["--rows", "1,7,8"])
+    res = results(out)
+    check("without an fsr2 filter the run is not refused", rc == 0 and "not the Intel build" not in err, f"rc={rc} {err}")
+    for row in (7, 8):
+        st, detail = res.get(row, ("", ""))
+        check(f"row {row} is SKIP, not FAIL, on a binary without fsr2",
+              st == "SKIP" and "no fsr2 filter" in detail and "zero motion vectors without CUDA" in detail, f"{st} {detail}")
+    check("row 8 runs no ffmpeg when it skips", not [l for l in ffmpeg_log(w) if "pan_" in l], str(ffmpeg_log(w)))
+    st, detail = res.get(1, ("", ""))
+    check("row 1 passes with fsr2 withheld and no marker", st == "PASS" and "fsr2 not offered" in detail, f"{st} {detail}")
+
+    w = World(tmp, "nofsr2-offered", {"game_levels": ["off", "fsr2"]}, extra={"FAKE_NO_FSR2": "1"})
+    os.remove(os.path.join(w.stubs, "fsr2-nocuda"))
+    st, detail = results(w.run(["--rows", "1"])[1]).get(1, ("", ""))
+    check("row 1 fails when fsr2 is still offered", st == "FAIL" and "offered:fsr2" in detail, f"{st} {detail}")
+
+    w = World(tmp, "nofsr2-marker", {"game_levels": ["off"]}, extra={"FAKE_NO_FSR2": "1"})
+    st, detail = results(w.run(["--rows", "1"])[1]).get(1, ("", ""))
+    check("row 1 fails when the marker is left in the image", st == "FAIL" and "marker-present" in detail, f"{st} {detail}")
+
+
 def drm_fixture(root, cards, in_dri):
     """A fake /sys/class/drm (renderDnnn/device/vendor for every card) and /dev/dri (a file per name in in_dri)."""
     sysdrm = os.path.join(root, "sys-class-drm")
@@ -2288,7 +2316,7 @@ def main():
         return 1
     with tempfile.TemporaryDirectory() as tmp:
         for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
-                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_render_node_pick, test_row_6, test_row_5,
+                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_no_fsr2, test_render_node_pick, test_row_6, test_row_5,
                      test_shared_files, test_scored_inputs):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
