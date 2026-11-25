@@ -511,6 +511,8 @@ xpsnr_y() {
     log=$(mktemp)
     cmd_xpsnr "$1" "$2" "$RUN_OUT/xpsnr.txt"
     ff_exec 2>"$log" >/dev/null || { rc=$?; rm -f "$log"; return "$rc"; }
+    # the stats file is per frame and the next call overwrites it: keep this candidate's for xpsnr_frames
+    cp -f "$RUN_OUT/xpsnr.txt" "$RUN_OUT/xpsnr-$(basename "$1").txt" 2>/dev/null || true
     # ffmpeg prints `XPSNR  y: 14.4167  u: ...`: two spaces after XPSNR, so match on whitespace, not one blank
     # an identical pair scores `inf`, which some awks read as 0: it is a very high score, not a failed one
     v=$(awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") v = $(i + 1) } END { if (v != "") print (v ~ /^[+-]?[Ii]nf/ ? 999 : v + 0) }' "$log")
@@ -707,6 +709,15 @@ xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB, si
     awk -v c="$c" -v b="$b" 'BEGIN { printf "%+.2f\n", c - b }'
 }
 
+# xpsnr_frames <stats-file>: "frame1=Xdb frames2+=Ydb" from xpsnr's per-frame luma stats (frame 1 is the one with no
+# history, so a score that collapses after it is temporal). Prints nothing when the file is missing or has no frames.
+xpsnr_frames() {
+    [[ -s "$1" ]] || return 0
+    awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") { v = $(i + 1); v = (v ~ /^[+-]?[Ii]nf/ ? 99 : v + 0); break }
+                       n++; if (n == 1) f = v; else { s += v; r++ } }
+         END { if (n) printf "frame1=%.2fdB frames2+=%s", f, r ? sprintf("%.2fdB", s / r) : "none" }' "$1"
+}
+
 shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size
     local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d cu status=PASS detail="" src ow oh rc=0 xrc=0
     local shader_out="$RUN_OUT/r$row-shader.mkv" bicubic_out="$RUN_OUT/r$row-bicubic.mkv"
@@ -872,7 +883,8 @@ row_8() {
     require_fresh 8 "$fsr2_out" "$bicubic_out" || return 0
     score_inputs 8 "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv" || return 0
     d=$(xpsnr_delta "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv") || { rc=$?; record 8 FAIL "xpsnr failed ($(why "$rc" "the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv"))"; return; }
-    if ge "$d" 0; then record 8 PASS "xpsnr_delta=${d}dB"; else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda"; fi
+    if ge "$d" 0; then record 8 PASS "xpsnr_delta=${d}dB"
+    else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda ($(xpsnr_frames "$RUN_OUT/xpsnr-$(basename "$fsr2_out").txt"); fsr2 gets zero motion vectors without CUDA, docs/intel-patched-ffmpeg-libplacebo.md)"; fi
 }
 
 # hwdec_source: the H.264 1080p clip row 9 reads, cut once from the lossless master when there is none. Called

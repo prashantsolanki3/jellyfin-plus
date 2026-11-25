@@ -406,6 +406,15 @@ case "$*" in
     # FAKE_XPSNR_GREEN=1: the shader outputs keep their luma score but have lost their chroma, as ANV's green frames did
     c=$y
     case "$*" in *shader.mkv*) [ "${FAKE_XPSNR_GREEN:-}" = 1 ] && c=3;; esac
+    # the per-frame stats file (`n:    1  XPSNR y: ...`); FAKE_XPSNR_COLLAPSE=1: the fsr2 pan scores well on frame 1 and badly after
+    all="$*"; sf=${all##*stats_file=}; sf=${sf%% *}
+    : > "$sf"
+    n=1; while [ $n -le 4 ]; do
+        fy=$y
+        case "$*" in *pan-fsr2.mkv*) [ "${FAKE_XPSNR_COLLAPSE:-}" = 1 ] && [ $n -gt 1 ] && fy=10;; esac
+        echo "n:    $n  XPSNR y: $fy.0000  XPSNR u: $c.0000  XPSNR v: $c.0000" >> "$sf"
+        n=$((n + 1))
+    done
     # FAKE_XPSNR_INF=1: an identical pair, which ffmpeg scores as infinity
     if [ "${FAKE_XPSNR_INF:-}" = 1 ]; then
         echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: inf  u: inf  v: inf" >&2
@@ -1547,6 +1556,12 @@ def signed_failures(script, tmp, tag):
             bad.append(f"neg-row{row}:{st}:{detail[:60]}")
     if "+-" in out:
         bad.append("plus-minus-in-log")
+    w = World(tmp, tag + "-collapse")
+    pan_clips(w)
+    rc, out, err = w.run(["--rows", "8"], script=script, FAKE_XPSNR_SWAP="1", FAKE_XPSNR_COLLAPSE="1")
+    st, detail = results(out).get(8, ("", ""))
+    if st != "FAIL" or "frame1=30.00dB frames2+=10.00dB" not in detail:
+        bad.append(f"collapse-row8:{st}:{detail[:140]}")
     w = World(tmp, tag + "-pos")
     pan_clips(w)
     rc, out, err = w.run(["--rows", "2,3,4,8"], script=script)

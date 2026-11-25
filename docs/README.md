@@ -33,7 +33,7 @@ applies it, and what was measured and rejected.
 
 | File | About |
 |---|---|
-| [intel-patched-ffmpeg-libplacebo.md](intel-patched-ffmpeg-libplacebo.md) | Why the patched Intel ffmpeg's libplacebo output is wrong (4.7 dB against 25.7 dB on stock): how each build is made, the likely cause, the experiments and the proposed fix |
+| [intel-patched-ffmpeg-libplacebo.md](intel-patched-ffmpeg-libplacebo.md) | Why the patched Intel ffmpeg's libplacebo output is wrong (4.7 dB against 25.7 dB on stock): how each build is made, the likely cause, the experiments and the proposed fix; and why fsr2 without CUDA fails on moving content (bench row 8) |
 
 ## filters/ — one document per custom ffmpeg filter
 
