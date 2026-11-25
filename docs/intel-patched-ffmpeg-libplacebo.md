@@ -1,5 +1,15 @@
 # Intel patched ffmpeg: why its libplacebo output is wrong
 
+**Status (step 5):** `scripts/build-ffmpeg.sh` now builds libplacebo at jellyfin-ffmpeg's pinned commit
+`cee9b076f2c6` (not tag `v7.351.0`: the patch's third hunk edits `map_vk_fmt()`, which that tag does not have),
+applies `builder/patches/libplacebo/*.patch` (jellyfin's `0001`, libplacebo issue 349) and passes
+`--buildtype=release -Dvk-proc-addr=enabled -Dglslang=disabled -Dtests=false -Dbench=false -Dfuzz=false`. The libplacebo
+stamp now covers the ref, the patches and the flags. Not yet proven: that the patch applies to that commit and
+that it fixes the output. Check after the next Arc image build: bench row 8 (fsr2) and a plain
+`hwupload,libplacebo,hwdownload` chain on the patched binary must score close to stock (25.7 dB; patched was 4.73 dB),
+`-filters` still lists `oidn ort fsr2`, and `ldd` shows no `not found`. The tables below describe the build as it
+was before this change.
+
 Bead rev-hxlit, step 4. Research only: no Dockerfile or script changed. It blocks moving-video fsr2,
 because fsr2 exists only in the patched build (`/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg`) and bench row 8
 (`scripts/bench-intel.sh:199`, `chain_fsr2`) ends in a plain `hwupload,libplacebo,hwdownload` tail.
