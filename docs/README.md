@@ -29,6 +29,12 @@ applies it, and what was measured and rejected.
 | [TIMELINE_MARKERS.md](architecture/TIMELINE_MARKERS.md) | Timeline markers: the provider contract, mapping keys and env override for external apps |
 | [GPU_VENDORS.md](architecture/GPU_VENDORS.md) | Running on Intel as well as NVIDIA: detection and the capability record (PR 1), the Intel encoder and load (PR 2), the Vulkan device from the render node and the levels withheld on Intel (PR 3), the ONNX neural level on OpenVINO and routing by source height (PR 5), fsr2 without CUDA (PR 6), the `GPU_VENDOR=intel` ffmpeg build and its per-vendor required filters (PR 8, tested by `scripts/test_build_ffmpeg_vendor.py`), then the planned series (decode, motion vectors without CUDA), with the A380 measurements |
 
+## Investigations
+
+| File | About |
+|---|---|
+| [intel-patched-ffmpeg-libplacebo.md](intel-patched-ffmpeg-libplacebo.md) | Why the patched Intel ffmpeg's libplacebo output is wrong (4.7 dB against 25.7 dB on stock): how each build is made, the likely cause, the experiments and the proposed fix |
+
 ## filters/ — one document per custom ffmpeg filter
 
 Each one covers what the level does, what it costs, and what you must obtain or build yourself.
