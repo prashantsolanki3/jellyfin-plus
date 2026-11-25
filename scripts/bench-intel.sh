@@ -195,6 +195,30 @@ INIT=(-init_hw_device "vulkan=vk:$VK_DEV" -filter_hw_device vk)
 YUV_END="format=yuv420p,hwdownload,format=yuv420p"
 chain_shader() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }
 chain_bicubic() { echo "scale=$1:$2:flags=bicubic,format=yuv420p"; }
+# Row 2's alternatives to FSRCNNX straight to the target (rev-zlqhh: 360p to 1080p scored -0.69 dB against bicubic in run20,
+# 720p and 1080p inputs pass). Each ends at the master's size, as the scorer pairs frames by index. chain_ewa is libplacebo's
+# scaler with no shader. chain_shader_bicubic runs FSRCNNX to ALT_MID_W x ALT_MID_H (set by alt_setup), then scales to $1 x $2.
+ROW2_ALTS="ewa x2-bicubic lowtarget"
+ALT_X2=2
+ALT_LOW=1.5
+ALT_FN=""
+ALT_MID_W=0
+ALT_MID_H=0
+chain_ewa() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:$YUV_END"; }
+chain_shader_bicubic() { echo "format=yuv420p,hwupload,libplacebo=w=$ALT_MID_W:h=$ALT_MID_H:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END,scale=$1:$2:flags=bicubic,format=yuv420p"; }
+# alt_setup <alternative> <source clip>: sets ALT_FN, and for the shader ones ALT_MID_W/H, the source's own size (the nominal 640x360
+# when ffprobe cannot read it) times the factor, rounded to even for yuv420p.
+alt_setup() {
+    local f sw sh
+    case "$1" in
+        ewa) ALT_FN=chain_ewa; return 0 ;;
+        x2-bicubic) f="$ALT_X2" ;;
+        lowtarget) f="$ALT_LOW" ;;
+    esac
+    ALT_FN=chain_shader_bicubic
+    read -r sw sh <<<"$(master_dims "$2" 640 360)"
+    read -r ALT_MID_W ALT_MID_H <<<"$(awk -v w="$sw" -v h="$sh" -v f="$f" 'BEGIN { printf "%d %d\n", int(w * f / 2 + 0.5) * 2, int(h * f / 2 + 0.5) * 2 }')"
+}
 chain_ort() { echo "format=yuv420p,format=gbrpf32le,ort=model=${ORT_MODEL:-MODEL}:device=openvino,format=yuv420p,hwupload,libplacebo=w=$1:h=$2,hwdownload,format=yuv420p"; }
 chain_fsr2() { echo "format=yuv420p,format=gbrpf32le,fsr2=w=$1:h=$2${FSR2_OPTS:+:$FSR2_OPTS},format=yuv420p,hwupload,libplacebo=w=$1:h=$2:$YUV_END"; }
 # chain_hwdec: VA-API frames downloaded, uploaded to Vulkan, libplacebo: the path that works on this ANV.
@@ -298,6 +322,19 @@ plan_shader_row() {
     plan_pair "$1" "$PAIR_STEPS" "$(clip "$2")" chain_shader "$RUN_OUT/r$1-shader.mkv" "$RUN_OUT/r$1-bicubic.mkv" "$master" "$ow" "$oh"
 }
 
+# The steps of one alternative: write it, score it, score the bicubic control again (the delta is candidate minus bicubic).
+ALT_STEPS="write-candidate xpsnr-candidate xpsnr-bicubic"
+# plan_alts <row> <source height> <master height> <nominal w> <nominal h>: the plan's lines for row_alts, same order
+plan_alts() {
+    local ow oh master name
+    master="$(clip "$3")"
+    read -r ow oh <<<"$(master_dims "$master" "$4" "$5")"
+    for name in $ROW2_ALTS; do
+        alt_setup "$name" "$(clip "$2")"
+        plan_pair "$1" "$ALT_STEPS" "$(clip "$2")" "$ALT_FN" "$RUN_OUT/r$1-alt-$name.mkv" "$RUN_OUT/r$1-bicubic.mkv" "$master" "$ow" "$oh"
+    done
+}
+
 print_plan() {
     local r ow oh
     echo "plan: bench-intel: rows=${ROWS[*]} runs=$RUNS mode=dry-run"
@@ -313,6 +350,7 @@ print_plan() {
         case "$r" in
             1)  echo "plan: row 1 cmd: curl $JF_URL/JellyfinPlus/Status (admin token), then $JF_URL/JellyfinPlus/Session/bench-probe" ;;
             2)  plan_shader_row 2 360 1080 1920 1080
+                plan_alts 2 360 1080 1920 1080
                 echo "plan: row 2 threshold: fps>=$FPS_R2 xpsnr>=+$XPSNR_R2" ;;
             3)  plan_shader_row 3 720 1080 1920 1080
                 echo "plan: row 3 cmd: forced transcode of $(clip 720) through $JF_URL (end to end, 5 segments timed)"
@@ -401,6 +439,7 @@ median() { sort -n | awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)
 
 ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
 le() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'; }
+gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
 
 BLOCK_LO=()
 BLOCK_HI=()
@@ -589,6 +628,18 @@ score_inputs() {
     done
 }
 
+# lines_up <file> <master>: score_inputs' size and frame-count test for one file, for a caller that must not record the row.
+# Prints why and returns 1 when the file differs from the master; an unreadable master (`?`) has nothing to compare against.
+lines_up() {
+    local w h pf cr st n mw mh mn
+    read -r mw mh pf cr st mn <<<"$(probe_stream "$2")"
+    read -r w h pf cr st n <<<"$(probe_stream "$1")"
+    if [[ ("$mw" != "?" && "$w" != "$mw") || ("$mh" != "?" && "$h" != "$mh") || ("$mn" != "?" && "$n" != "$mn") ]]; then
+        echo "does not line up with the master, xpsnr not run: ${w}x$h with $n frames, the master is ${mw}x$mh with $mn frames"
+        return 1
+    fi
+}
+
 # ---- Jellyfin API ----------------------------------------------------------------------------------
 
 # api <path> [curl args]: the token goes in on stdin (--config -), so it is never on a command line (ps, /proc).
@@ -718,8 +769,35 @@ xpsnr_frames() {
          END { if (n) printf "frame1=%.2fdB frames2+=%s", f, r ? sprintf("%.2fdB", s / r) : "none" }' "$1"
 }
 
-shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size
-    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d cu status=PASS detail="" src ow oh rc=0 xrc=0
+# row_alts <row> <source height> <master height> <w> <h> <FSRCNNX delta> <bicubic output>: scores each ROW2_ALTS path on the
+# row's own source against the same bicubic control and master, by frame index, and sets ALT_DETAIL to ` alt_<name>=<delta>dB`
+# (or `alt_<name>=FAIL(<why>)`) for each and ` best=<name>` for the highest delta of bicubic (0 by definition), fsrcnnx and
+# the alternatives, the earlier path on a tie. Evidence only: it never touches the row's status.
+ALT_DETAIL=""
+row_alts() {
+    local row="$1" sh="$2" h="$3" ow="$4" oh="$5" fd="$6" bic="$7" name out d why_not rc master src best=bicubic best_d=0
+    master="$(clip "$h")"
+    src="$(clip "$sh")"
+    ALT_DETAIL=""
+    if gt "$fd" "$best_d"; then best=fsrcnnx; best_d="$fd"; fi
+    for name in $ROW2_ALTS; do
+        out="$RUN_OUT/r$row-alt-$name.mkv"
+        alt_setup "$name" "$src"
+        pair_cmd write-candidate "$src" "$ALT_FN" "$out" "$bic" "$master" "$ow" "$oh"
+        if ! write_run "$out"; then ALT_DETAIL+=" alt_$name=FAIL($WRITE_ERR)"; continue; fi
+        if ! fresh_output "$out"; then ALT_DETAIL+=" alt_$name=FAIL(output not written by this run: $out)"; continue; fi
+        if ! why_not=$(lines_up "$out" "$master"); then ALT_DETAIL+=" alt_$name=FAIL($why_not)"; continue; fi
+        rc=0
+        d=$(xpsnr_delta "$out" "$bic" "$master") || rc=$?
+        if [[ "$rc" != 0 ]]; then ALT_DETAIL+=" alt_$name=FAIL($(why "$rc" "xpsnr failed"))"; continue; fi
+        ALT_DETAIL+=" alt_$name=${d}dB"
+        if gt "$d" "$best_d"; then best="$name"; best_d="$d"; fi
+    done
+    ALT_DETAIL+=" best=$best"
+}
+
+shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e] [alts]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size; alts=1 also scores the ROW2_ALTS paths
+    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" alts="${8:-0}" fps d cu status=PASS detail="" src ow oh rc=0 xrc=0
     local shader_out="$RUN_OUT/r$row-shader.mkv" bicubic_out="$RUN_OUT/r$row-bicubic.mkv"
     read -r ow oh <<<"$(master_dims "$(clip "$h")" "$w" "$h")"
     fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$ow" "$oh")") || { rc=$?; record "$row" FAIL "$(why "$rc" "ffmpeg failed")"; return; }
@@ -744,6 +822,10 @@ shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h
     else
         detail+=" xpsnr failed ($(why "$xrc" "ffmpeg xpsnr of the ${ow}x${oh} outputs against $(clip "$h")"))"
         status=FAIL
+    fi
+    if [[ "$alts" == 1 && "$xrc" == 0 ]]; then
+        row_alts "$row" "$sh" "$h" "$ow" "$oh" "$d" "$bicubic_out"
+        detail+="$ALT_DETAIL"
     fi
     if [[ "$fmin" != 0 ]]; then ge "$fps" "$fmin" || status=FAIL; fi
     if [[ "$e2e" == 1 ]]; then
@@ -770,7 +852,7 @@ shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h
     record "$row" "$status" "$detail"
 }
 
-row_2() { shader_row 2 360 1920 1080 "$FPS_R2" "$XPSNR_R2" 0; }
+row_2() { shader_row 2 360 1920 1080 "$FPS_R2" "$XPSNR_R2" 0 1; }
 row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1; }
 row_4() { shader_row 4 1080 3840 2160 "$FPS_R4" "$XPSNR_R4" 1; }
 
