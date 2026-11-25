@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -546,7 +547,10 @@ DATE_STUB = ('#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${F
 # 5 s sleeps (the load reader's and the fdinfo sampler's, in whichever order they start) removes it, so a stand-in /proc
 # entry vanishes mid-window as an exited transcode does. mkdir of FAKE_VANISH_LOCK is the atomic "first caller" test.
 SLEEP_STUB = ('#!/bin/sh\nif [ -n "${FAKE_VANISH:-}" ] && [ "$1" = 5 ]; then\n'
-              '  mkdir "$FAKE_VANISH_LOCK" 2>/dev/null || rm -rf "$FAKE_VANISH"\nfi\nexec @SLEEP@ "$@"\n')
+              '  mkdir "$FAKE_VANISH_LOCK" 2>/dev/null || rm -rf "$FAKE_VANISH"\nfi\n'
+              # row 10's 1/2/5 s waits run at a tenth of their length; the fake plugin's 5 s cache window shrinks with them
+              'if [ -n "${FAKE_FAST_WAIT:-}" ]; then\n  case "$1" in 1) set -- 0.1;; 2) set -- 0.2;; 5) set -- 0.5;; esac\nfi\n'
+              'exec @SLEEP@ "$@"\n')
 
 # A fake Jellyfin: serves JSON by URL path from $FAKE_DIR/scenario.json, logs every call (argv, stdin,
 # POST body) to $FAKE_DIR/log.jsonl, and keeps the plugin configuration and started sessions in state.json.
@@ -635,7 +639,7 @@ if path == "/JellyfinPlus/Gpu/Load":
         if last is None:
             json.dump({"t": now, "v": None}, open(tp, "w"))
             val = None
-        elif now - last["t"] < 5:
+        elif now - last["t"] < (0.5 if os.environ.get("FAKE_FAST_WAIT") else 5):
             val = last["v"]
         else:
             json.dump({"t": now, "v": val}, open(tp, "w"))
@@ -737,7 +741,7 @@ class World:
             "BENCH_JELLYFIN_URL": "http://jf.test", "BENCH_JELLYFIN_TOKEN": TOKEN, "BENCH_SHIM_LOG": self.shim,
             "BENCH_RUNS": "1", "BENCH_CONFIRM_NO_GATES": "1", "FAKE_DIR": self.fake, "FAKE_SHIM_LOG": self.shim,
             "FAKE_TOKEN": TOKEN, "FAKE_FFMPEG_LOG": os.path.join(self.root, "ffmpeg.log"),
-            "REAL_DATE": REAL_DATE or "date"}, **(extra or {})), path=self.stubs)
+            "FAKE_FAST_WAIT": "1", "REAL_DATE": REAL_DATE or "date"}, **(extra or {})), path=self.stubs)
 
     def run(self, args, script=BENCH, **extra):
         # the quiet-box gates read the real clock and /proc: the gate tests call run() themselves
@@ -819,6 +823,8 @@ def test_mutants(tmp):
         rc, out, _ = run(path, ["--dry-run"])
         check(f"mutant {name} is caught", rc != 0 or bool(plan_failures(out)))
 
+    pool = ThreadPoolExecutor(max_workers=8)
+    pending = []
     for name, old, new, fn in [
         ("octal-hhmm", 'hm=$((10#$(TZ="$BLOCK_TZ" date +%H%M)))', 'hm=$(TZ="$BLOCK_TZ" date +%H%M)', gate_failures),
         ("octal-window-start", "lo=$((10#${item%-*}))", "lo=$((${item%-*}))", gate_failures),
@@ -883,8 +889,12 @@ def test_mutants(tmp):
         ("row10-oidn-unmatched", "jellyfin-ffmpeg(-oidn)?/ffmpeg", "jellyfin-ffmpeg/ffmpeg",
          lambda sc, t, g: row10_fdinfo_failures(sc, t, g, ("oidn",))),
     ]:
-        path = mutant_dir(tmp, name, old, new)
-        check(f"mutant {name} is caught by its behaviour check", bool(fn(path, tmp, "mut-" + name)))
+        # each behaviour check is hermetic (its own World dirs under a tag of its own) and mostly waits on stub sleeps, so
+        # they run side by side; the verdicts are recorded here, in table order
+        pending.append((name, pool.submit(fn, mutant_dir(tmp, name, old, new), tmp, "mut-" + name)))
+    for name, fut in pending:
+        check(f"mutant {name} is caught by its behaviour check", bool(fut.result()))
+    pool.shutdown()
 
 
 def build_apt_checks(df):
@@ -1989,7 +1999,7 @@ def row10_prime_failures(script, tmp, tag):
     rc, out, err = w.run(["--rows", "10"], script=script)
     st, detail = results(out).get(10, ("", ""))
     loads = [e["t"] for e in w.log() if e["url"].endswith("/JellyfinPlus/Gpu/Load")]
-    if len(loads) < 2 or loads[-1] - loads[0] < 5:
+    if len(loads) < 2 or loads[-1] - loads[0] < 0.5:  # 5 s at FAKE_FAST_WAIT's tenth-length waits
         bad.append(f"calls:{len(loads)}:{[round(t - loads[0], 1) for t in loads]}")
     if "gpuBusyPercent=12 " not in detail + " " or "gpuBusyPercent=none" in detail:
         bad.append(f"load:{detail[:120]}")
