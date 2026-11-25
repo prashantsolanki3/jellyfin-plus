@@ -32,6 +32,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+WORKERS = 8
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -190,13 +194,17 @@ FAILS = []
 PASSES = 0
 
 
+LOCK = threading.Lock()
+
+
 def check(name, ok, detail=""):
     global PASSES
-    if ok:
-        PASSES += 1
-    else:
-        FAILS.append(name)
-        print(f"FAIL {name} {detail}".rstrip())
+    with LOCK:
+        if ok:
+            PASSES += 1
+        else:
+            FAILS.append(name)
+            print(f"FAIL {name} {detail}".rstrip())
 
 
 def clean_env(extra=None, path=None):
@@ -828,6 +836,7 @@ def test_mutants(tmp):
         rc, out, _ = run(path, ["--dry-run"])
         check(f"mutant {name} is caught", rc != 0 or bool(plan_failures(out)))
 
+    behaviour = []
     for name, old, new, fn in [
         ("octal-hhmm", 'hm=$((10#$(TZ="$BLOCK_TZ" date +%H%M)))', 'hm=$(TZ="$BLOCK_TZ" date +%H%M)', gate_failures),
         ("octal-window-start", "lo=$((10#${item%-*}))", "lo=$((${item%-*}))", gate_failures),
@@ -889,7 +898,18 @@ def test_mutants(tmp):
          lambda sc, t, g: row10_fdinfo_failures(sc, t, g, ("oidn",))),
     ]:
         path = mutant_dir(tmp, name, old, new)
-        check(f"mutant {name} is caught by its behaviour check", bool(fn(path, tmp, "mut-" + name)))
+        behaviour.append((name, path, fn))
+
+    # each behaviour check runs the script for seconds (some wait out a stub hang): in parallel, each in its own directory
+    def caught(item):
+        name, path, fn = item
+        sub = os.path.join(tmp, "b-" + name)
+        os.makedirs(sub)
+        return name, bool(fn(path, sub, "mut-" + name))
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for name, ok in pool.map(caught, behaviour):
+            check(f"mutant {name} is caught by its behaviour check", ok)
 
 
 def build_apt_checks(df):
@@ -2116,34 +2136,33 @@ def test_hermetic_api(tmp):
     res = results(out)
     check("a stream with no segment is a FAIL, not a 0x PASS", res.get(3, ("",))[0] == "FAIL" and res.get(12, ("",))[0] == "FAIL", str(res))
 
-    bad = token_failures(BENCH, tmp, "token")
-    check("the token is on curl's stdin, not its command line", not bad, str(bad))
-    bad = runfps_failures(BENCH, tmp, "runfps")
-    check("a failed ffmpeg run reaches the FAIL branch of rows 2 and 11", not bad, str(bad))
-    bad = size_failures(BENCH, tmp, "sizes")
-    check("rows 2, 3, 4, 8 and 11 scale to the master's letterboxed size, a 16:9 clip keeps 16:9", not bad, str(bad))
-    bad = xpsnr_failures(BENCH, tmp, "xpsnr")
-    check("a failed xpsnr is FAIL 'xpsnr failed' on rows 2, 3, 4, 8 and 9, never +0.00 dB", not bad, str(bad))
-    bad = timeout_failures(BENCH, tmp, "timeouts")
-    check("every measured ffmpeg runs under timeout --kill-after=10 (BENCH_RUN_TIMEOUT, default 240) and a timeout is FAIL 'timeout after Ns'", not bad, str(bad))
-    bad = row5_budget_failures(BENCH, tmp, "row5-budget")
-    check("row 5 runs once per clip and stops after 48 frames; other rows are not cut", not bad, str(bad))
-    bad = item_failures(BENCH, tmp, "items")
-    check("an item lookup HTTP error is its own FAIL, distinct from 'not in the library'", not bad, str(bad))
-    bad = signed_failures(BENCH, tmp, "signed")
-    check("rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-", not bad, str(bad))
-    bad = chroma_failures(BENCH, tmp, "chroma")
-    check("rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not", not bad, str(bad))
-    bad = binary_failures(BENCH, tmp, "binary")
-    check("rows 2, 3 and 4 run the stock ffmpeg (as the shim) and row 8 the patched one, in the plan and in commands.log", not bad, str(bad))
-    bad = row9_failures(BENCH, tmp, "row9")
-    check("row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it", not bad, str(bad))
-    bad = stale_output_failures(BENCH, tmp, "stale")
-    check("a row scores only files this run wrote: a fresh run-<id> directory (a used id is refused), any failed write is FAIL, a missing or old file is FAIL 'not written by this run'", not bad, str(bad))
-    bad = row10_prime_failures(BENCH, tmp, "row10-prime")
-    check("row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod", not bad, str(bad))
-    bad = row10_fdinfo_failures(BENCH, tmp, "row10-fd")
-    check("row 10 finds the transcode of the stock and of the oidn ffmpeg", not bad, str(bad))
+    # each of these runs the script for seconds, some waiting out a stub hang: in parallel, each in its own directory
+    table = [
+        (token_failures, "token", "the token is on curl's stdin, not its command line"),
+        (runfps_failures, "runfps", "a failed ffmpeg run reaches the FAIL branch of rows 2 and 11"),
+        (size_failures, "sizes", "rows 2, 3, 4, 8 and 11 scale to the master's letterboxed size, a 16:9 clip keeps 16:9"),
+        (xpsnr_failures, "xpsnr", "a failed xpsnr is FAIL 'xpsnr failed' on rows 2, 3, 4, 8 and 9, never +0.00 dB"),
+        (timeout_failures, "timeouts", "every measured ffmpeg runs under timeout --kill-after=10 (BENCH_RUN_TIMEOUT, default 240) and a timeout is FAIL 'timeout after Ns'"),
+        (row5_budget_failures, "row5-budget", "row 5 runs once per clip and stops after 48 frames; other rows are not cut"),
+        (item_failures, "items", "an item lookup HTTP error is its own FAIL, distinct from 'not in the library'"),
+        (signed_failures, "signed", "rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-"),
+        (chroma_failures, "chroma", "rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not"),
+        (binary_failures, "binary", "rows 2, 3 and 4 run the stock ffmpeg (as the shim) and row 8 the patched one, in the plan and in commands.log"),
+        (row9_failures, "row9", "row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it"),
+        (stale_output_failures, "stale", "a row scores only files this run wrote: a fresh run-<id> directory (a used id is refused), any failed write is FAIL, a missing or old file is FAIL 'not written by this run'"),
+        (row10_prime_failures, "row10-prime", "row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod"),
+        (row10_fdinfo_failures, "row10-fd", "row 10 finds the transcode of the stock and of the oidn ffmpeg"),
+    ]
+
+    def judged(item):
+        fn, tag, _ = item
+        sub = os.path.join(tmp, "c-" + tag)
+        os.makedirs(sub)
+        return fn(BENCH, sub, tag)
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for (_, _, msg), bad in zip(table, pool.map(judged, table)):
+            check(msg, not bad, str(bad))
 
 
 def test_token_rejected(tmp):
@@ -2413,12 +2432,19 @@ def main():
         print("no bash")
         return 1
     with tempfile.TemporaryDirectory() as tmp:
-        for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
-                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_render_node_pick, test_row_6, test_row_5,
-                     test_shared_files, test_scored_inputs):
+        parts = (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
+                 test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_render_node_pick,
+                 test_row_6, test_row_5, test_shared_files, test_scored_inputs)
+
+        def go(part):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
             part(sub)
+
+        # the parts share nothing but the check() counters: the two long ones (mutants, hermetic API) overlap the rest
+        with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+            for f in [pool.submit(go, p) for p in parts]:
+                f.result()
         dockerfile_checks(tmp)
     print(f"{PASSES} checks passed, {len(FAILS)} failed")
     return 1 if FAILS else 0
