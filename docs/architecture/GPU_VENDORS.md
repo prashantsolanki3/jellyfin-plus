@@ -965,6 +965,7 @@ Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API 
 | FidelityFX-FSR2 | commit `1680d1edd5c034f88ebbbb793d8b88f8842cf804` (a git commit id is a content hash; the build checks `git rev-parse HEAD`) |
 | .NET 10 SDK | `10.0.404` tarball, checked against its published sha512 (`DOTNET_SDK_SHA512`) |
 | Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage; a library the build puts under `/usr/local` (shaderc, which has no package) is copied to `/usr/local/lib` and `ldconfig` runs before the acceptance check |
+| RUNPATH | the patched binary's first RUNPATH entry is `/usr/lib/jellyfin-ffmpeg/lib` (`STOCK_FFMPEG_LIB` in `build-ffmpeg.sh`, read back with `readelf -d`), and the acceptance requires `ldd` to resolve `libvulkan.so.1` and `libshaderc_shared.so.1` from there when the base ships them: the system loader and the `/usr/local` shaderc scored 4.73 dB against 25.70 dB (`docs/intel-patched-ffmpeg-libplacebo.md`) |
 
 **Drivers libvulkan and libva `dlopen`.** The derived package list is `ldd`-based, so it cannot see a
 driver the loader opens at run time. The first Arc bench (rows 2, 3, 4 and 9 failed: no Vulkan device
