@@ -480,6 +480,9 @@ if [[ "$GPU_VENDOR" == "intel" ]]; then
     # zlib: the png encoder and decoder need it, and without zlib1g-dev configure drops them silently.
     # bench-intel.sh row 7 decodes still_720p.png with this binary.
     HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-libdrm --enable-zlib)
+    # The patched binary must load jellyfin-ffmpeg's bundled libvulkan/shaderc, not the system loader and the
+    # /usr/local shaderc it links: same binary, same chain, 4.73 dB against 25.70 dB (rev-hxlit).
+    STOCK_FFMPEG_LIB="${STOCK_FFMPEG_LIB:-/usr/lib/jellyfin-ffmpeg/lib}"
 else
     VENDOR_PATCHES=(
         0006-vulkan-to-cuda-hwmap.patch
@@ -494,6 +497,7 @@ else
     )
     HWACCEL_FLAGS=(--enable-ffnvcodec --enable-cuda --enable-cuvid --enable-nvdec --enable-nvenc)
     [[ -z "$CLANG_CUDA" ]] || CUDA_LLVM_FLAGS=(--enable-cuda-llvm --nvcc="$CLANG_CUDA")
+    STOCK_FFMPEG_LIB=""
 fi
 # ORT_EP=openvino builds on a box without CUDA too, so its bridge test is off whichever vendor asked.
 [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]] && BRIDGE_TEST_DEFAULT=0
@@ -513,6 +517,7 @@ if [[ "$PLAN_ONLY" == "1" ]]; then
     echo "plan: cuda-llvm: ${CUDA_LLVM_FLAGS[*]:-none}"
     echo "plan: required filters: $(ffmpeg_required_filters "$GPU_VENDOR")"
     echo "plan: bridge test default: $BRIDGE_TEST_DEFAULT"
+    [[ -z "$STOCK_FFMPEG_LIB" ]] || echo "plan: rpath: first $STOCK_FFMPEG_LIB"
     if [[ "$WITH_FSR2" == "1" && "$ORT_EP" == "openvino" ]]; then
         echo "plan: fsr2: no CUDA: patch ${FSR2_NOCUDA_PATCH%%-*}, cflag $FSR2_NOCUDA_CFLAG, marker $FSR2_NOCUDA_MARKER"
     fi
@@ -944,6 +949,12 @@ if [[ "$GPU_VENDOR" == "nvidia" && -z "$CLANG_CUDA" ]]; then
     echo "!! no clang found: transpose_cuda and the other CUDA-kernel filters will be missing" >&2
 fi
 
+# Last LDFLAGS export on purpose: each one prepends, so this -rpath is first in the binary's RUNPATH,
+# ahead of the oidn and ort directories and of every system path.
+if [[ -n "$STOCK_FFMPEG_LIB" ]]; then
+    export LDFLAGS="-Wl,-rpath,$STOCK_FFMPEG_LIB ${LDFLAGS:-}"
+fi
+
 say "configure"
 PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}" ./configure \
     --prefix="$PREFIX" \
@@ -1090,6 +1101,16 @@ if [[ ${#CUDA_LLVM_FLAGS[@]} -gt 0 ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\btranspose_cuda\b" \
         && echo "  transpose_cuda: present" \
         || die "transpose_cuda filter missing from the build (--enable-cuda-llvm did not take effect)"
+fi
+
+if [[ -n "$STOCK_FFMPEG_LIB" ]]; then
+    # Captured before grepping, as below. The first entry decides: it is what beats the system loader.
+    dyn_out=$(readelf -d "$PREFIX/ffmpeg" 2>/dev/null) || true
+    first_rp=$(grep -E '\((RUNPATH|RPATH)\)' <<<"$dyn_out" | sed -n '1s/.*\[\(.*\)\].*/\1/p') || true
+    first_rp=${first_rp%%:*}
+    [[ "$first_rp" == "$STOCK_FFMPEG_LIB" ]] \
+        && echo "  rpath: first entry is $STOCK_FFMPEG_LIB" \
+        || die "the built ffmpeg's first RUNPATH entry is not $STOCK_FFMPEG_LIB (got '${first_rp:-none}'): it would load the system libvulkan and /usr/local shaderc"
 fi
 
 if [[ "$GPU_VENDOR" == "intel" ]]; then

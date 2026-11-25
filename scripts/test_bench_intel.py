@@ -1078,7 +1078,8 @@ def dockerfile_checks(tmp):
                    "PREFIX=/usr/lib/jellyfin-ffmpeg-oidn", "scripts/build-ffmpeg.sh", "fsr2-nocuda",
                    "ffmpeg_required_filters intel", "-hwaccels", "h264_qsv", "-encoders | grep -qE '^ V.{5} png '",
                    "-decoders | grep -qE '^ V.{5} png '", "cmp /tmp/base-ffmpeg",
-                   "not found", "git rev-parse HEAD", "FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
+                   "not found", "S=/usr/lib/jellyfin-ffmpeg/lib", "libvulkan.so.1 libshaderc_shared.so.1",
+                   'loads $so from $got, not $S', "git rev-parse HEAD", "FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
                    "/var/cache/jellyfin/jellyfin-upscale.json", "jellyfin-ffmpeg-upscale"]:
         check(f"Dockerfile carries {needle}", needle in df)
     check("Dockerfile publishes nothing and sets no USER", not re.search(r"docker push|^USER ", df, re.M))

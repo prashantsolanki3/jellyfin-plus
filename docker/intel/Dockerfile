@@ -194,6 +194,13 @@ RUN --mount=type=bind,from=base-pkgs,source=/usr/lib/jellyfin-ffmpeg/ffmpeg,targ
     F=/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg; \
     . /usr/local/lib/jellyfin-plus/scripts/ffmpeg-vendor.sh; \
     if ldd "$F" | grep 'not found'; then echo "unresolved libraries in $F" >&2; exit 1; fi; \
+    S=/usr/lib/jellyfin-ffmpeg/lib; \
+    for so in libvulkan.so.1 libshaderc_shared.so.1; do \
+        [ -e "$S/$so" ] || continue; \
+        got=$(ldd "$F" | awk -v n="$so" '$1 == n { print $3 }'); \
+        [ -n "$got" ] || continue; \
+        [ "$(dirname "$got")" = "$S" ] || { echo "$F loads $so from $got, not $S (rev-hxlit)" >&2; exit 1; }; \
+    done; \
     filters=$("$F" -hide_banner -filters); \
     for f in $(ffmpeg_required_filters intel) fsr2 libplacebo xpsnr; do \
         echo "$filters" | grep -qE "^ [A-Z.]+ +$f " || { echo "no $f filter in $F" >&2; exit 1; }; \

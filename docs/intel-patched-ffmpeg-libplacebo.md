@@ -1,5 +1,28 @@
 # Intel patched ffmpeg: why its libplacebo output is wrong
 
+**Root cause (proven in the Arc test pod, image 10a6474, 96 frames, 360p to 1920x858):** the system Vulkan loader
+and/or the `/usr/local` shaderc v2026.4 that the patched binary links, not libplacebo and not FFmpeg. The same
+`/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg` and the same libplacebo chain:
+
+| Run | Score |
+|---|---|
+| patched binary as built | 4.73 dB |
+| same binary, `LD_LIBRARY_PATH=/usr/lib/jellyfin-ffmpeg/lib` | 25.70 dB, identical to stock |
+| upload and download only, no libplacebo | 37.35 dB (fine) |
+
+**Fix:** `scripts/build-ffmpeg.sh` (Intel only) puts `/usr/lib/jellyfin-ffmpeg/lib` first in the binary's RUNPATH
+(`STOCK_FFMPEG_LIB`, last `LDFLAGS` prepend), reads it back from `readelf -d` and dies if it is not first, and
+`docker/intel/Dockerfile` requires `ldd` to resolve `libvulkan.so.1` and `libshaderc_shared.so.1` from there
+whenever the base ships them. `scripts/test_build_ffmpeg_vendor.py` pins the wiring. Not yet proven: that a RUNPATH
+is as good as the `LD_LIBRARY_PATH` of the experiment (RUNPATH is not transitive, so libraries the Vulkan loader
+dlopens still resolve their own dependencies as before). Check after the next image build: bench row 8 (fsr2) and a
+plain `hwupload,libplacebo,hwdownload` chain on the patched binary score close to stock, and the QSV and VAAPI rows
+still pass (the bundled libva, libvpl and libdrm now win too). If the RUNPATH is not enough, the fallback is the
+shim and the bench exporting `LD_LIBRARY_PATH` for the patched binary.
+
+The libplacebo-version hypothesis below is therefore **not** the cause; it is kept as the record of what was
+suspected. The `libplacebo` pin and patch from step 5 stay in the build, unproven as to any effect.
+
 **Status (step 5):** `scripts/build-ffmpeg.sh` now builds libplacebo at jellyfin-ffmpeg's pinned commit
 `cee9b076f2c6` (not tag `v7.351.0`: the patch's third hunk edits `map_vk_fmt()`, which that tag does not have),
 applies `builder/patches/libplacebo/*.patch` (jellyfin's `0001`, libplacebo issue 349) and passes
@@ -72,7 +95,7 @@ jellyfin-ffmpeg's builder script (`builder/scripts.d/50-libplacebo.sh` on the `j
 | libvulkan, shaderc | distro loader, shaderc v2026.4 in `/usr/local` | bundled beside the binary |
 | Vulkan headers | v1.3.280 | not retrieved (the likely script names returned 404) |
 
-## Most likely cause (hypothesis, not proven)
+## Earlier hypothesis (superseded: libplacebo is not the cause, see the top of this page)
 
 **The patched build's libplacebo plus vanilla FFmpeg Vulkan code map and write yuv420p Vulkan frames
 wrongly on ANV, because it lacks the fixes jellyfin-ffmpeg carries.**
@@ -104,10 +127,11 @@ Pointing away, or still open:
 4. `ldd` on both binaries and `strings ... | grep -i libplacebo` for the versions actually in use.
 5. Run both binaries with `vulkan=vk@dr` as well as `vk:0`, to rule out the device-selection confound.
 
-## Proposed fix, in order (a later PR; this one does not touch the Dockerfile)
+## Proposed fix, in order (superseded: experiment 3 settled it, the RUNPATH above is the fix)
 
 1. Run experiments 1-5 first. Each is minutes, and they separate libplacebo from FFmpeg Vulkan from the loader.
-2. If libplacebo is the cause (the likely result): in `scripts/build-ffmpeg.sh` build libplacebo at
+   Experiment 3 and the no-libplacebo round trip were run: see the table at the top.
+2. If libplacebo had been the cause: in `scripts/build-ffmpeg.sh` build libplacebo at
    jellyfin-ffmpeg's pinned commit, apply its libplacebo patch, and use its meson flags (`vk-proc-addr`,
    `vulkan-registry`, `glslang=disabled`). Take the pin and patch from the jellyfin-ffmpeg tag the base image
    ships (so the two builds move together), and align the Vulkan-Headers and shaderc versions to that tag's
