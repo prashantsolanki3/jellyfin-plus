@@ -33,6 +33,47 @@ that it fixes the output. Check after the next Arc image build: bench row 8 (fsr
 `-filters` still lists `oidn ort fsr2`, and `ldd` shows no `not found`. The tables below describe the build as it
 was before this change.
 
+## fsr2 without CUDA on moving content (bead rev-cpmuj, bench row 8: -38.10 dB)
+
+With the libplacebo tail fixed (above), what is left is inside `fsr2`. Read from source; **not reproduced here** (no
+Arc, no clips in this session), so the cause is the likely one, not a measured one.
+
+**Likely cause: the no-CUDA build feeds FSR2 zero motion vectors, and a pan is nothing but motion.** What FSR2 needs
+per frame, and what the Intel build supplies:
+
+| FSR2 input | Needs | Intel build (`-DGU_NO_NVOF`, `scripts/build-ffmpeg.sh:507`) | Where |
+|---|---|---|---|
+| motion vectors | per-pixel, previous position of each pixel | **all zero, every frame**: `memset(g->flow, 0, ...)` | `ffmpeg/gu_inputs.h:996`, uploaded at `ffmpeg/vf_fsr2.c:690` |
+| history reset | on a cut or first frame | only frames 0 and 1 (`frame_index <= 1`); no scene-cut reset | `vf_fsr2.c:715` |
+| jitter | the sub-pixel offsets the renderer used | the fractional part of a global phase-correlation shift, which on a pan is the pan | `gu_inputs.h:959-964`, `vf_fsr2.c:705-706` |
+| depth | real depth, for disocclusion and MV dilation | constant 0.5, so those passes are no-ops | `gu_inputs.h:1017` |
+| reactive mask | where history is untrustworthy | all zero (it is built from NVOFA flow) | `gu_inputs.h:1005` |
+
+With zero vectors FSR2 reprojects its history to the same pixel, so on a pan it blends each frame with the previous one
+shifted by the pan. Nothing else (no depth, no reactive mask, no reset) tells it the history is wrong, so the output is
+ghosted and smeared; the jitter it is also given (the pan's fractional part) is wrong in the same direction. A fixed
+camera is the one case where zero vectors are true, which is why a still is fine. The score is also an inconsistency
+to note: -38.10 dB below bicubic implies an absolute fsr2 score near zero if bicubic is in the usual 35-40 dB range,
+which is more broken than ghosting alone usually reads (about 15-25 dB). The run-20 absolute scores are not in this
+repo, so a second fault (frame pairing, range) is not excluded; the per-frame score below settles it.
+
+**Row 7 does not show the still case is right.** It compares consecutive output frames of a looped still
+(`tblend=difference`, `scripts/bench-intel.sh` `cmd_still`), so it passes for any output that is stable, correct or not.
+
+**Recording the probe.** `scripts/bench-intel.sh` row 8 now keeps xpsnr's per-frame luma stats for each candidate
+(`$BENCH_OUT/.../xpsnr-pan-fsr2.mkv.txt`) and a failing row 8 prints `frame1=X dB frames2+=Y dB`. Frame 1 has no history,
+so a good `frame1` with a collapsed `frames2+` confirms the cause is temporal (zero vectors, history); a bad `frame1` too
+means the fault is in the per-frame path (packing, colour range, pairing). `scripts/test_bench_intel.py` covers the
+format. Not yet run on the Arc.
+
+**Recommendation: ship the image without fsr2-nocuda** (the row's own threshold text says a miss means exactly this).
+No fix is shipped here, because the one candidate is not small and cannot be shown to help:
+a uniform motion field built from the phase-correlation shift (already measured, `gu_inputs.h:245`) would fix pans but
+not local motion, and even exact vectors cannot reach the pass line: with a near-null jitter sequence FSR2 is a temporal
+denoise plus a fixed Lanczos upsample (`vf_fsr2.c:40-46`), which is not expected to beat bicubic by itself. If someone
+wants the experiment: in the `GU_NO_NVOF` branch write `(jitter_x, jitter_y)` into `g->flow` when `pcpeak` is high and
+force `jitterOffset` to zero, then re-run row 8 and read `frames2+`. The served shim's stock path is untouched.
+
 Bead rev-hxlit, step 4. Research only: no Dockerfile or script changed. It blocks moving-video fsr2,
 because fsr2 exists only in the patched build (`/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg`) and bench row 8
 (`scripts/bench-intel.sh:199`, `chain_fsr2`) ends in a plain `hwupload,libplacebo,hwdownload` tail.
