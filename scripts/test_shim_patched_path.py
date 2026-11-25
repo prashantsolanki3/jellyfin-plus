@@ -84,6 +84,24 @@ try:
     binary, _ = shim.pick_binary(cfg, list(BRIDGE))
     check("with the patched binary the bridge chain routes to it", shim.PATCHED_FFMPEG, binary)
     check("with the patched binary there is no warning", False, any("not executable" in m for m in logged))
+
+    # The patched libplacebo chain is garbage on the Arc (4.7 dB XPSNR against 25.7 dB on stock), so a
+    # plain libplacebo/FSRCNNX session must stay on stock even when the patched binary is available.
+    PLAIN = ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk", "-i", "in.mkv", "-vf",
+             "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:custom_shader_path=FSRCNNX_x2_16-0-4-1.glsl,"
+             "hwdownload,format=nv12", "out.m3u8"]
+    FSR2 = ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk", "-i", "in.mkv", "-vf",
+            "format=yuv420p,hwupload,fsr2=w=1920:h=1080,hwdownload,format=nv12", "out.m3u8"]
+    real_has = shim.patched_has
+    shim.patched_has = lambda names: list(names)
+    try:
+        binary, argv = shim.pick_binary(cfg, list(PLAIN))
+        check("patched binary present: a plain libplacebo/FSRCNNX chain runs on stock", shim.REAL_FFMPEG, binary)
+        check("patched binary present: the plain chain is untouched", PLAIN, argv)
+        binary, _ = shim.pick_binary(cfg, list(FSR2))
+        check("patched binary present: a chain with fsr2 routes to the patched binary", shim.PATCHED_FFMPEG, binary)
+    finally:
+        shim.patched_has = real_has
 finally:
     shim.log, shim.os.access = real_log, real_access
 
