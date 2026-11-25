@@ -1072,11 +1072,12 @@ prints; the rest is read from files and the Deployment.
 Row 5 now ends with the evidence instead of the fps alone, in the result detail and in `$BENCH_OUT/run-<id>/`:
 
 - `ffmpeg_ort_360p=` / `ffmpeg_ort_720p=`: `CPU_FALLBACK[...]` with the filter's own `OpenVINO execution provider unavailable (...), using CPU`
-  (or `OpenVINO session could not be created (...)`) when ORT fell back, `no_ort_line_in_log` when it printed neither, else the
-  matched lines. The full stderr of each chain is `row5-<h>p.ffmpeg.log`. `vf_ort.c` now logs its `device=` line at INFO, so
+  (or `OpenVINO session could not be created (...)`) when ORT fell back or the filter's `device=cpu` line shows it ran on the CPU,
+  `no_ort_line_in_log` when it printed neither, else the matched lines (`using CPU` lines are read first). The full stderr of each chain is `row5-<h>p.ffmpeg.log`. `vf_ort.c` now logs its `device=` line at INFO, so
   an image built from this change shows the device it really ran on without `-v verbose`.
-- `ort_env:` `ep_libs_missing`, `gpu_plugin_unresolved` (`ldd` of `libopenvino_intel_gpu_plugin.so`), `opencl_icd`, `libOpenCL`,
-  `level_zero_loader`, `render_node`/`open` (the process opens the node read-write; `FAIL(Permission denied)` is the group),
+- `ort_env:` `ep_libs_missing`, `gpu_plugin_unresolved` (`ldd` of `libopenvino_intel_gpu_plugin.so`), `opencl_icd`, `libOpenCL`
+  (from that same `ldd`; `UNKNOWN` when the plugin or `ldd` is absent), `level_zero_loader` (`/sbin/ldconfig` or
+  `/usr/sbin/ldconfig`; `UNKNOWN(no ldconfig)` when neither exists), `render_node`/`open` (the process opens the node read-write; `FAIL(Permission denied)` is the group),
   `node_gid` and `process_gids`.
 - when `device` is not `openvino`: `session_neural_requested`, `session_withheld`, `session_routing`, `session_summary`.
 

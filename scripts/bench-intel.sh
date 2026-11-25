@@ -780,15 +780,20 @@ row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1; }
 row_4() { shader_row 4 1080 3840 2160 "$FPS_R4" "$XPSNR_R4" 1; }
 
 # ort_why <ffmpeg stderr log>: the lines that say where the ort filter ran or why it did not (its own `using CPU`
-# warnings, ONNX Runtime's errors, the device line), up to three, joined by `|`. Nothing when the log has none.
+# warnings, ONNX Runtime's errors, the device line), up to three, joined by `|`. Nothing when the log has none. The
+# `using CPU` lines come first so earlier OpenVINO chatter cannot push the reason out of the three.
 ort_why() {
-    tr '\r' '\n' <"$1" 2>/dev/null | grep -E 'OpenVINO|using CPU|onnxruntime|ONNX|[Ee]rror' | head -3 | cut -c1-240 | paste -sd'|' - || true
+    local log
+    log=$(tr '\r' '\n' <"$1" 2>/dev/null) || true
+    { grep 'using CPU' <<<"$log" || true; grep -E 'OpenVINO|onnxruntime|ONNX|[Ee]rror' <<<"$log" || true; } \
+        | awk '!seen[$0]++' | head -3 | cut -c1-240 | paste -sd'|' - || true
 }
-# ort_chain_state <log>: what the direct ort chain's own log says about the provider.
+# ort_chain_state <log>: what the direct ort chain's own log says about the provider. The filter's device line
+# (`device=cpu`) is a fallback even when no `using CPU` warning preceded it.
 ort_chain_state() {
     local t
     t=$(ort_why "$1")
-    if [[ "$t" == *"using CPU"* ]]; then echo "CPU_FALLBACK[$t]"
+    if [[ "$t" == *"using CPU"* || "$t" == *"device=cpu"* ]]; then echo "CPU_FALLBACK[$t]"
     elif [[ -n "$t" ]]; then echo "log[$t]"
     else echo "no_ort_line_in_log"; fi
 }
@@ -796,18 +801,30 @@ ort_chain_state() {
 # beside the core, the plugin's unresolved libraries, an OpenCL ICD and loader (and Level Zero's loader), and whether this
 # process can open the render node. A missing item is the CPU fallback's cause, not a guess at it.
 ort_env_report() {
-    local lib="$PREFIX/ort/lib" f miss="" nf="" icds lc open err gid z=MISSING o=MISSING l=MISSING
+    local lib="$PREFIX/ort/lib" plugin f miss="" nf="" icds lc="" lddout="" ldc open err gid z=MISSING o=MISSING l="UNKNOWN(plugin not linked against it or no ldd)"
+    plugin="$lib/libopenvino_intel_gpu_plugin.so"
     for f in libonnxruntime_providers_openvino.so libopenvino_intel_gpu_plugin.so; do
         [[ -e "$lib/$f" ]] || miss+="$f,"
     done
-    if [[ -e "$lib/libopenvino_intel_gpu_plugin.so" ]] && command -v ldd >/dev/null 2>&1; then
-        nf=$(ldd "$lib/libopenvino_intel_gpu_plugin.so" 2>&1 | awk '/not found/ { printf "%s,", $1 }' || true)
+    if [[ -e "$plugin" ]] && command -v ldd >/dev/null 2>&1; then
+        lddout=$(ldd "$plugin" 2>&1 || true)
+        nf=$(awk '/not found/ { printf "%s,", $1 }' <<<"$lddout")
+        # the loader as the plugin itself resolves it, not a guess from the cache
+        if [[ "$nf" == *libOpenCL* ]]; then l=MISSING
+        elif [[ "$lddout" == *libOpenCL* ]]; then l=present; fi
     fi
     icds=$(compgen -G "/etc/OpenCL/vendors/*.icd" || true)
     [[ -z "$icds" ]] || o=present
-    lc=$(ldconfig -p 2>/dev/null || true)
-    [[ "$lc" != *libOpenCL.so.1* ]] || l=present
-    [[ "$lc" != *libze_loader.so.1* ]] || z=present
+    ldc=""
+    for f in /sbin/ldconfig /usr/sbin/ldconfig; do
+        if [[ -x "$f" ]]; then ldc="$f"; break; fi
+    done
+    if [[ -n "$ldc" ]]; then
+        lc=$("$ldc" -p 2>/dev/null || true)
+        if [[ "$lc" == *libze_loader.so.1* ]]; then z=present; fi
+    else
+        z="UNKNOWN(no ldconfig)"
+    fi
     # `<>` creates a missing file, so only a real device node is opened
     if [[ ! -c "$NODE" ]]; then open="FAIL(not a device node in this pod)"
     elif err=$( { : <>"$NODE"; } 2>&1 ); then open=ok
