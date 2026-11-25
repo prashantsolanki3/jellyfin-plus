@@ -81,17 +81,17 @@ def hw_cmd(clip, chain, tail):
             f"-i {clip} -vf {chain} -an {tail}")
 
 
-def run_cmd(clip, chain, out=None):
+def run_cmd(clip, chain, out=None, ff=FF):
     tail = f"-c:v ffv1 {out}" if out else "-f null -"
-    return f"{FF} -hide_banner -nostdin -y -benchmark -stats {INIT} -i {clip} -vf {chain} -an {tail}"
+    return f"{ff} -hide_banner -nostdin -y -benchmark -stats {INIT} -i {clip} -vf {chain} -an {tail}"
 
 
 # the pairing is by frame index: a pts offset or a dropped frame in a written file cannot shift the comparison
 PAIR = "[0:v]settb=1/1000,setpts=N[c];[1:v]settb=1/1000,setpts=N[m];[c][m]xpsnr=stats_file="
 
 
-def xpsnr_cmd(cand, master, run=RUN):
-    return f"{FF} -hide_banner -nostdin -i {cand} -i {master} -lavfi {PAIR}{run}/xpsnr.txt -f null -"
+def xpsnr_cmd(cand, master, run=RUN, ff=FF):
+    return f"{ff} -hide_banner -nostdin -i {cand} -i {master} -lavfi {PAIR}{run}/xpsnr.txt -f null -"
 
 
 TITLES = {
@@ -142,14 +142,14 @@ THRESHOLD = {
 EXACT = [
     "plan: bench-intel: rows=1 2 3 4 5 6 7 8 9 10 11 12 13 runs=3 mode=dry-run",
     "plan: required filters: oidn ort fsr2",
-    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080)),
-    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), f"{RUN}/r2-shader.mkv"),
-    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080), f"{RUN}/r2-bicubic.mkv"),
-    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-shader.mkv", "/clips/tears_1080p.mkv"),
-    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-bicubic.mkv", "/clips/tears_1080p.mkv"),
-    "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160)),
-    "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160), f"{RUN}/r4-shader.mkv"),
-    "plan: row 4 cmd: " + xpsnr_cmd(f"{RUN}/r4-bicubic.mkv", "/clips/tears_2160p.mkv"),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), f"{RUN}/r2-shader.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080), f"{RUN}/r2-bicubic.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-shader.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-bicubic.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160), ff=STOCK),
+    "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160), f"{RUN}/r4-shader.mkv", ff=STOCK),
+    "plan: row 4 cmd: " + xpsnr_cmd(f"{RUN}/r4-bicubic.mkv", "/clips/tears_2160p.mkv", ff=STOCK),
     "plan: row 7 cmd: " + (f"{FF} -hide_banner -nostdin -y {INIT} -loop 1 -framerate 24 -t 10 -i /clips/still_720p.png "
                            f"-vf {FSR2_CHAIN},tblend=all_mode=difference,signalstats,"
                            f"metadata=print:key=lavfi.signalstats.YAVG:file={RUN}/still-fsr2.txt -an -f null -"),
@@ -824,6 +824,8 @@ def test_mutants(tmp):
         ("commands-log-removed", """printf 'row %s: %s\\n' "${CUR_ROW:-?}" "${CMD[*]}" >>"$RUN_OUT/commands.log\"""", ":", argv_failures),
         ("plan-sizes-nominal", 'read -r ow oh <<<"$(master_dims "$master" "$4" "$5")"', 'ow=$4 oh=$5', argv_failures),
         ("inputs-file-not-written", 'rep="$RUN_OUT/r$1-inputs.txt"', "rep=/dev/null", argv_failures),
+        ("rows-2-4-patched", "        2|3|4) echo \"$STOCK_FFMPEG\" ;;", "        2|3|4) echo \"$PATCHED_FFMPEG\" ;;", binary_failures),
+        ("row-8-stock", "        *)     echo \"$PATCHED_FFMPEG\" ;;", "        *)     echo \"$STOCK_FFMPEG\" ;;", binary_failures),
         ("frame-count-unchecked", ' || ("$mn" != "?" && "$n" != "$mn") ]]', " ]]", inputs_failures),
         ("size-unchecked", '("$mw" != "?" && "$w" != "$mw") || ("$mh" != "?" && "$h" != "$mh") || ', "", inputs_failures),
         ("inf-read-as-zero-y", "print (v ~ /^[+-]?[Ii]nf/ ? 999 : v + 0)", "print v + 0", inputs_failures),
@@ -1581,6 +1583,33 @@ def ffmpeg_log(w):
     return [l for l in open(p).read().splitlines() if "-filters" not in l] if os.path.exists(p) else []
 
 
+def binary_failures(script, tmp, tag):
+    """The shim serves plain libplacebo/FSRCNNX with the stock ffmpeg (the patched binary's libplacebo output is garbage on
+    the Arc), so rows 2, 3 and 4 run the stock one and row 8 (fsr2) the patched one, in the plan and in commands.log."""
+    bad = []
+    w = World(tmp, tag)
+    pan_clips(w)
+    patched = os.path.join(w.root, "patched", "ffmpeg")
+    stock = os.path.join(w.root, "stock", "ffmpeg")
+    for p in (patched, stock):
+        os.makedirs(os.path.dirname(p))
+        os.symlink(os.path.join(w.stubs, "ffprobe"), os.path.join(os.path.dirname(p), "ffprobe"))
+        open(p, "w").write(f'#!/bin/sh\nexec {w.stubs}/ffmpeg "$@"\n')
+        os.chmod(p, 0o755)
+    w.env.update(BENCH_FFMPEG=patched, BENCH_STOCK_FFMPEG=stock)
+    rc, out, err = w.run(["--rows", "2,3,4,8"], script=script, BENCH_RUN_ID="bin")
+    logged = open(os.path.join(w.out, "run-bin", "commands.log")).read().splitlines() if os.path.isfile(os.path.join(w.out, "run-bin", "commands.log")) else []
+    rc, plan, err = run(script, ["--dry-run", "--rows", "2,3,4,8"], dict(w.env, BENCH_RUN_ID="bin-plan"))
+    for row, want in ((2, stock), (3, stock), (4, stock), (8, patched)):
+        ran = [l[len(f"row {row}: "):] for l in logged if l.startswith(f"row {row}: ")]
+        planned = [l[len(f"plan: row {row} cmd: "):] for l in plan.splitlines() if l.startswith(f"plan: row {row} cmd: ") and " -hide_banner " in l]
+        for kind, cmds in (("run", ran), ("plan", planned)):
+            argv0 = {c.split(" ", 1)[0] for c in cmds}
+            if not cmds or argv0 != {want}:
+                bad.append(f"row{row}-{kind}:{sorted(argv0)}")
+    return bad
+
+
 def row9_failures(script, tmp, tag):
     """Row 9 reads an H.264 1080p clip (VA-API cannot decode the FFV1 masters): cut once from the lossless one with
     the stock ffmpeg when missing, measure decode, download, upload, libplacebo to yuv420p; the zero-copy hwmap path
@@ -1603,7 +1632,7 @@ def row9_failures(script, tmp, tag):
         bad.append(f"good:{st}:{detail[:90]}")
     if len(prep) != 1 or "-crf 12 -preset fast -an" not in prep[0] or f"-i {w.clips}/tears_1080p.mkv " not in prep[0]:
         bad.append(f"prep:{prep}")
-    stock_runs = open(os.path.join(w.root, "stock.log")).read().splitlines() if os.path.exists(os.path.join(w.root, "stock.log")) else []
+    stock_runs = [l for l in open(os.path.join(w.root, "stock.log")).read().splitlines() if "-filters" not in l] if os.path.exists(os.path.join(w.root, "stock.log")) else []
     if len(stock_runs) != 1 or "-c:v libx264" not in stock_runs[0]:
         bad.append(f"prep-not-the-stock-binary:{stock_runs}")
     if not os.path.exists(h264) or os.path.exists(os.path.join(w.out, "tears_1080p_h264.part.mkv")):
@@ -1963,6 +1992,8 @@ def test_hermetic_api(tmp):
     check("rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-", not bad, str(bad))
     bad = chroma_failures(BENCH, tmp, "chroma")
     check("rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not", not bad, str(bad))
+    bad = binary_failures(BENCH, tmp, "binary")
+    check("rows 2, 3 and 4 run the stock ffmpeg (as the shim) and row 8 the patched one, in the plan and in commands.log", not bad, str(bad))
     bad = row9_failures(BENCH, tmp, "row9")
     check("row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it", not bad, str(bad))
     bad = stale_output_failures(BENCH, tmp, "stale")

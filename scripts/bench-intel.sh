@@ -21,7 +21,7 @@
 #
 # Inputs (all optional; the defaults are the image's own paths):
 #   BENCH_FFMPEG          patched ffmpeg                 /usr/lib/jellyfin-ffmpeg-oidn/ffmpeg
-#   BENCH_STOCK_FFMPEG    stock jellyfin-ffmpeg          /usr/lib/jellyfin-ffmpeg/ffmpeg
+#   BENCH_STOCK_FFMPEG    stock jellyfin-ffmpeg, rows 2-4 (as the shim) and the row 9 cut   /usr/lib/jellyfin-ffmpeg/ffmpeg
 #   BENCH_CLIPS           the lossless clips             /clips      <title>_<height>p.mkv, see below
 #   BENCH_OUT             results.jsonl and the row 9 H.264 cut; every other output goes in its run-<id> directory   $BENCH_CLIPS/bench-out
 #   BENCH_TRACE=1         echo every measured ffmpeg argv as `trace: row N: ...` on stderr (every run writes $BENCH_OUT/run-<id>/commands.log anyway)
@@ -202,10 +202,21 @@ chain_hwdec() { echo "hwdownload,format=nv12,hwupload,libplacebo=w=$1:h=$2:upsca
 # chain_zerocopy: the VA-API frames mapped straight into Vulkan; fails with VK_ERROR_DEVICE_LOST on this ANV.
 chain_zerocopy() { echo "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }
 
+# row_ffmpeg <row>: the binary a row runs. Rows 2-4 are the plain libplacebo path, which the shim serves with the stock
+# binary (the patched one's libplacebo output is garbage on the Arc); the rest need the patched filters. cmd_run and
+# cmd_xpsnr read FF_BIN, set per row beside CUR_ROW.
+FF_BIN=""
+row_ffmpeg() {
+    case "$1" in
+        2|3|4) echo "$STOCK_FFMPEG" ;;
+        *)     echo "$PATCHED_FFMPEG" ;;
+    esac
+}
+
 # cmd_run <clip> <chain> [output] [frames]: a measured run; output omitted = discard (-f null), else lossless
 # ffv1; frames given = stop after that many frames (-frames:v).
 cmd_run() {
-    CMD=("$PATCHED_FFMPEG" -hide_banner -nostdin -y -benchmark -stats "${INIT[@]}" -i "$1" -vf "$2" -an)
+    CMD=("${FF_BIN:-$PATCHED_FFMPEG}" -hide_banner -nostdin -y -benchmark -stats "${INIT[@]}" -i "$1" -vf "$2" -an)
     if [[ -n "${4:-}" ]]; then CMD+=(-frames:v "$4"); fi
     if [[ -n "${3:-}" ]]; then CMD+=(-c:v ffv1 "$3"); else CMD+=(-f null -); fi
 }
@@ -224,7 +235,7 @@ cmd_h264_cut() {
 # inputs are renumbered to 0, 1, 2... so frame k is scored against frame k whatever offset or jitter either file's
 # timestamps carry (score_inputs has already shown the two have the same number of frames).
 cmd_xpsnr() {
-    CMD=("$PATCHED_FFMPEG" -hide_banner -nostdin -i "$1" -i "$2"
+    CMD=("${FF_BIN:-$PATCHED_FFMPEG}" -hide_banner -nostdin -i "$1" -i "$2"
          -lavfi "[0:v]settb=1/1000,setpts=N[c];[1:v]settb=1/1000,setpts=N[m];[c][m]xpsnr=stats_file=$3" -f null -)
 }
 # cmd_still <png> <chain> <metadata-file>: a looped still, consecutive-frame difference per frame.
@@ -296,6 +307,7 @@ print_plan() {
     echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; run dir: $RUN_OUT (fresh, refused if it exists); render node: $NODE"
     echo "plan: vulkan device: vk:$VK_DEV"
     for r in "${ROWS[@]}"; do
+        FF_BIN="$(row_ffmpeg "$r")"
         printf 'plan: row %s: %s\n' "$r" "$(row_title "$r")"
         printf 'plan: row %s must pass: %s\n' "$r" "$(row_must "$r")"
         case "$r" in
@@ -1052,6 +1064,10 @@ FILTERS=$("$PATCHED_FFMPEG" -hide_banner -filters 2>/dev/null) || die "$PATCHED_
 for filter in $(ffmpeg_required_filters intel) fsr2 libplacebo xpsnr; do
     grep -qE "^ [A-Z.]+ +$filter " <<<"$FILTERS" || die "$PATCHED_FFMPEG lists no $filter filter: this is not the Intel build"
 done
+STOCK_FILTERS=$("$STOCK_FFMPEG" -hide_banner -filters 2>/dev/null) || die "$STOCK_FFMPEG -filters failed"
+for filter in libplacebo xpsnr; do
+    grep -qE "^ [A-Z.]+ +$filter " <<<"$STOCK_FILTERS" || die "$STOCK_FFMPEG lists no $filter filter: rows 2-4 run on it"
+done
 if [[ -r "$SHIM_LOG" ]]; then SHIM_LOG_START=$(wc -c <"$SHIM_LOG" | tr -d ' '); fi
 trap cfg_restore EXIT
 trap 'exit 130' INT TERM
@@ -1060,6 +1076,7 @@ if [[ "${BENCH_TRACE:-}" == 1 ]]; then exec 9>&2; fi
 for r in "${ROWS[@]}"; do
     say "row $r: $(row_title "$r")"
     CUR_ROW="$r"
+    FF_BIN="$(row_ffmpeg "$r")"
     "row_$r"
 done
 
