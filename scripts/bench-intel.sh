@@ -930,19 +930,85 @@ ort_env_report() {
     echo "ort_env: ep_libs_missing=${miss:-none} gpu_plugin_unresolved=${nf:-none} opencl_icd=$o libOpenCL=$l level_zero_loader=$z render_node=$NODE open=$open node_gid=$gid process_gids=$(id -G | tr ' ' ,)"
 }
 
+# neural_measure: the ort chain's fps at 360p and 720p (rows 5 and 6 share it, once per run). Sets NM_F360/NM_F720, the
+# chain states NM_ST360/NM_ST720 and NM_ENV; returns 1 with NM_ERR (row 5's FAIL detail) when the chain did not run.
+# Call it directly, not in $(...): the cache is these globals.
+NM_DONE=""; NM_ERR=""; NM_F360=""; NM_F720=""; NM_ST360=""; NM_ST720=""; NM_ENV=""
+neural_measure() {
+    if [[ -n "$NM_DONE" ]]; then [[ -z "$NM_ERR" ]]; return; fi
+    NM_DONE=1
+    local rc l360="$RUN_OUT/row5-360p.ffmpeg.log" l720="$RUN_OUT/row5-720p.ffmpeg.log"
+    NM_ENV=$(ort_env_report)
+    NM_F360=$(KEEP_LOG="$l360" run_fps "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; NM_ERR="$(why "$rc" "the ort chain failed at 360p (fps_360p=$NM_F360)") ffmpeg_ort_360p=$(ort_chain_state "$l360") $NM_ENV"; return 1; }
+    NM_F720=$(KEEP_LOG="$l720" run_fps "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; NM_ERR="$(why "$rc" "the ort chain failed at 720p (fps_720p=$NM_F720)") ffmpeg_ort_720p=$(ort_chain_state "$l720") $NM_ENV"; return 1; }
+    NM_ST360=$(ort_chain_state "$l360")
+    NM_ST720=$(ort_chain_state "$l720")
+}
+
+# nm_loader: the Level Zero loader state in the environment report: present, MISSING or UNKNOWN.
+nm_loader() {
+    local re='level_zero_loader=([^ ]+)'
+    if [[ "$NM_ENV" =~ $re ]]; then echo "${BASH_REMATCH[1]%%(*}"; else echo UNKNOWN; fi
+}
+
+# plugin_config: the Jellyfin Plus plugin configuration as JSON, empty when it cannot be read (read-only; fails soft).
+plugin_config() {
+    local id
+    id=$(api /Plugins 2>/dev/null | jq -r 'first(.[] | select(.Name == "Jellyfin Plus") | .Id) // empty' 2>/dev/null) || return 0
+    [[ -n "$id" ]] || return 0
+    api "/Plugins/$id/Configuration" 2>/dev/null || true
+}
+
+# neural_withheld_by <session record JSON> <plugin configuration JSON or empty>: returns 0 with NW_BY when neural is withheld
+# on Intel by design: the record says `neural ...` in Record.GpuWithheldUnmeasured, or the configuration has
+# IntelNeuralAllowed false. A missing key (a plugin without the setting) or an unreadable configuration is not withheld.
+NW_BY=""
+neural_withheld_by() {
+    local w allowed
+    NW_BY=""
+    w=$(jq -r '.Record.GpuWithheldUnmeasured // empty' <<<"$1" 2>/dev/null || true)
+    if [[ "${w,,}" == *neural* ]]; then NW_BY="session_withheld=$w"; return 0; fi
+    if [[ -n "$2" ]]; then
+        allowed=$(jq -r '.IntelNeuralAllowed != false' <<<"$2" 2>/dev/null || true)
+        if [[ "$allowed" == false ]]; then NW_BY="IntelNeuralAllowed=false"; return 0; fi
+    fi
+    return 1
+}
+
+# neural_class: for withheld neural, sets NC_STATUS and NC_REASON from the shared measurement. Real time is the source
+# frame rate at each resolution. A measurement that is missing, or was not on the GPU, is a FAIL: only a measured rate is SKIP.
+NC_STATUS=""; NC_REASON=""; NC_SRC=""
+nc_fail() { NC_STATUS=FAIL; NC_REASON="neural fps not measured: $1"; }
+neural_class() {
+    local s360 s720 z
+    z=$(nm_loader)
+    s360=$(src_fps "$(clip 360)" 2>/dev/null || true)
+    s720=$(src_fps "$(clip 720)" 2>/dev/null || true)
+    NC_SRC="${s360:-?}/${s720:-?}"
+    [[ -z "$NM_ERR" ]] || { nc_fail "$NM_ERR"; return; }
+    if ! ge "${NM_F360:-0}" 0.01 || ! ge "${NM_F720:-0}" 0.01; then nc_fail "no fps measured (fps_360p=${NM_F360:-none} fps_720p=${NM_F720:-none})"; return; fi
+    if ! ge "${s360:-0}" 0.01 || ! ge "${s720:-0}" 0.01; then nc_fail "the source frame rate is unreadable (src_fps=$NC_SRC)"; return; fi
+    [[ "$NM_ST360$NM_ST720" != *CPU_FALLBACK* ]] || { nc_fail "the ort chain fell back to CPU ($NM_ST360 $NM_ST720), so its fps says nothing about Level Zero"; return; }
+    if ! ge "$NM_F360" "$s360" || ! ge "$NM_F720" "$s720"; then
+        NC_STATUS=SKIP
+        NC_REASON="withheld on Intel: measured $NM_F360/$NM_F720 fps below real time (level_zero_loader=$z)"
+    else
+        NC_STATUS=MANUAL
+        NC_REASON="neural reaches real time on Intel ($NM_F360/$NM_F720 fps); review IntelNeuralAllowed"
+    fi
+}
+
 row_5() {
     [[ -n "$ORT_MODEL" ]] || { record 5 SKIP "no BENCH_ORT_MODEL"; return; }
-    local f360 f720 rec dev applied status=MANUAL note req withheld routing sumry env_note
-    local rc l360="$RUN_OUT/row5-360p.ffmpeg.log" l720="$RUN_OUT/row5-720p.ffmpeg.log"
-    env_note=$(ort_env_report)
-    f360=$(KEEP_LOG="$l360" run_fps "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 360p (fps_360p=$f360)") ffmpeg_ort_360p=$(ort_chain_state "$l360") $env_note"; return; }
-    f720=$(KEEP_LOG="$l720" run_fps "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 720p (fps_720p=$f720)") ffmpeg_ort_720p=$(ort_chain_state "$l720") $env_note"; return; }
-    note="fps_360p=$f360 fps_720p=$f720 over the first $ORT_FRAMES frames, one run each, model compile included (real time = source fps; choose NeuralMaxSourceHeight from these) requested=device=openvino(device_type=GPU) ffmpeg_ort_360p=$(ort_chain_state "$l360") ffmpeg_ort_720p=$(ort_chain_state "$l720") $env_note"
+    local rec dev applied status=MANUAL note req withheld routing sumry env_note cfg
+    neural_measure || { record 5 FAIL "$NM_ERR"; return; }
+    env_note="$NM_ENV"
+    note="fps_360p=$NM_F360 fps_720p=$NM_F720 over the first $ORT_FRAMES frames, one run each, model compile included (real time = source fps; choose NeuralMaxSourceHeight from these) requested=device=openvino(device_type=GPU) ffmpeg_ort_360p=$NM_ST360 ffmpeg_ort_720p=$NM_ST720 $env_note"
     if ! have_api; then
         if [[ "$API_WHY" == rejected ]]; then
             record 5 FAIL "$note token rejected (HTTP $API_CODE) by $JF_URL/System/Info"
         else
-            record 5 MANUAL "$note device=SKIP(no API: the session record is what proves openvino)"
+            record 5 MANUAL "$note neural_withheld=unknown(no API) device=SKIP(no API: the session record is what proves openvino)"
         fi
         return
     fi
@@ -966,6 +1032,15 @@ row_5() {
         sumry=$(jq -r '.Record.Summary // empty' <<<"$rec")
         note+=" session_neural_requested=$req session_withheld=${withheld:-none} session_routing=${routing:-none} session_summary=${sumry:0:300}"
     fi
+    # withheld by design (Intel neural is off by default): the fps above is the evidence, not a device verdict
+    cfg=$(plugin_config)
+    if neural_withheld_by "$rec" "$cfg"; then
+        neural_class
+        status="$NC_STATUS"
+        note="$NC_REASON neural_withheld=yes($NW_BY) src_fps=$NC_SRC level_zero_loader=$(nm_loader) $note"
+    else
+        note+=" neural_withheld=no"
+    fi
     record 5 "$status" "$note"
 }
 
@@ -983,7 +1058,9 @@ cfg_restore() {
 
 row_6() {
     have_api || { no_api 6 "no Jellyfin API"; return; }
-    local cfg rec routing applied seen new
+    local cfg rec routing applied seen new dev wh fpsnote
+    # the same fps rows 5 prints; a failure only matters when neural is withheld (below), so it is not a FAIL here
+    if [[ -n "$ORT_MODEL" ]]; then neural_measure || true; fi
     CFG_ID=$(api /Plugins | jq -r 'first(.[] | select(.Name == "Jellyfin Plus") | .Id) // empty' || true)
     [[ -n "$CFG_ID" ]] || { record 6 FAIL "the Jellyfin Plus plugin is not listed by GET /Plugins"; return; }
     cfg=$(api "/Plugins/$CFG_ID/Configuration") || { record 6 FAIL "GET the plugin configuration failed"; return; }
@@ -1010,11 +1087,21 @@ row_6() {
     cfg_restore
     routing=$(jq -r '.NeuralRouting // empty' <<<"$rec")
     applied=$(jq -r '.NeuralApplied // false' <<<"$rec")
+    dev=$(jq -r '.NeuralDevice // "none"' <<<"$rec")
+    if neural_withheld_by "$rec" "$cfg"; then wh="yes($NW_BY)"; else wh=no; fi
+    fpsnote="neural_withheld=$wh"
+    [[ -z "$ORT_MODEL" ]] || fpsnote+=" fps_360p=${NM_F360:-none} fps_720p=${NM_F720:-none} level_zero_loader=$(nm_loader)"
+    # withheld by design (Intel neural is off by default): there is no neural routing to judge, the fps is the evidence
+    if [[ -n "$ORT_MODEL" && "$wh" != no ]]; then
+        neural_class
+        record 6 "$NC_STATUS" "$NC_REASON neural_withheld=$wh fps_360p=${NM_F360:-none} fps_720p=${NM_F720:-none} src_fps=$NC_SRC device=$dev level_zero_loader=$(nm_loader) neural_applied=$applied NeuralRouting=${routing:-none}"
+        return
+    fi
     # the record must say the neural level was NOT run and why; a "was chosen" record is the opposite
     if [[ "$routing" == *"NOT run"* && "$applied" != true ]]; then
-        record 6 PASS "NeuralRouting=$routing"
+        record 6 PASS "NeuralRouting=$routing $fpsnote"
     else
-        record 6 FAIL "a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied neural_requested=$(jq -r '.NeuralRequested // "off"' <<<"$rec") session_withheld=$(jq -r '.Record.GpuWithheldUnmeasured // "none"' <<<"$rec")"
+        record 6 FAIL "a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied neural_requested=$(jq -r '.NeuralRequested // "off"' <<<"$rec") session_withheld=$(jq -r '.Record.GpuWithheldUnmeasured // "none"' <<<"$rec") $fpsnote"
     fi
 }
 

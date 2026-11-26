@@ -483,7 +483,10 @@ case "$*" in
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4
     # FAKE_ORT_WARN: what the ort filter says on stderr when the OpenVINO provider is not there (vf_ort.c append_openvino)
     # FAKE_ORT_NOISE: three OpenVINO lines before the warning; FAKE_ORT_DEVICE: the device line vf_ort config_input prints
+    # FAKE_RTIME_360 / FAKE_RTIME_720: the wall seconds an ort run over that clip reports (240 frames: fps = 240 / seconds)
+    rt=2.0
     case "$*" in *ort=*)
+        case "$*" in *tears_360p*) rt=${FAKE_RTIME_360:-2.0};; *tears_720p*) rt=${FAKE_RTIME_720:-2.0};; esac
         [ -z "${FAKE_ORT_NOISE:-}" ] || for n in 1 2 3; do echo "[Parsed_ort_3 @ 0x1] OpenVINO runtime note $n" >&2; done
         [ -z "${FAKE_ORT_WARN:-}" ] || echo "[Parsed_ort_3 @ 0x1] $FAKE_ORT_WARN" >&2
         [ -z "${FAKE_ORT_DEVICE:-}" ] || echo "[Parsed_ort_3 @ 0x1] onnxruntime 1.20.1: /m/model.onnx, 640x360 -> 1280x720 (x2), device=$FAKE_ORT_DEVICE" >&2;; esac
@@ -536,7 +539,7 @@ case "$*" in
     case "$*" in *"-c:v ffv1"*) ut=$(awk -v a="$ut" -v b="${FAKE_FFV1_CPU:-1.0}" 'BEGIN { printf "%.2f", a + b }');; esac
     # FAKE_NO_BENCH: an ffmpeg that prints no bench: lines at all
     [ -z "${FAKE_NO_BENCH:-}" ] || exit 0
-    printf 'frame=  240 fps=120\rbench: utime=%ss stime=%ss rtime=2.0s\nbench: maxrss=26176KiB\n' "$ut" "$stt" >&2;;
+    printf 'frame=  240 fps=120\rbench: utime=%ss stime=%ss rtime=%ss\nbench: maxrss=26176KiB\n' "$ut" "$stt" "$rt" >&2;;
 *-loop*)
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4;;
 esac
@@ -902,6 +905,11 @@ def test_mutants(tmp):
         ("dims-nominal", "NF >= 2 && $1 > 0 && $2 > 0", "0", size_failures),
         ("no-timeout", 'timeout --kill-after=10 "$RUN_TIMEOUT" "${CMD[@]}"', '"${CMD[@]}"', timeout_failures),
         ("row5-full-length", "ORT_FRAMES=48", "ORT_FRAMES=", row5_budget_failures),
+        ("neural-skip-on-error", "nc_fail() { NC_STATUS=FAIL;", "nc_fail() { NC_STATUS=SKIP;", neural_class_failures),
+        ("neural-skip-when-fast", "NC_STATUS=MANUAL", "NC_STATUS=SKIP", neural_class_failures),
+        ("neural-fps-missing-from-reason", "measured $NM_F360/$NM_F720 fps below", "measured fps below", neural_class_failures),
+        ("neural-only-360p-judged", ' || ! ge "$NM_F720" "$s720"', "", neural_class_failures),
+        ("neural-cpu-fallback-skipped", '[[ "$NM_ST360$NM_ST720" != *CPU_FALLBACK* ]] ||', ": ||", neural_class_failures),
         ("chroma-unchecked", 'ge "$cu" "$CHROMA_XPSNR_MIN" || status=FAIL', ':', chroma_failures),
         ("signed-dropped", 'printf "%+.2f\\n", c - b', 'printf "%.2f\\n", c - b', signed_failures),
         ("signed-plus-prefix", 'printf "%+.2f\\n", c - b', 'printf "+%.2f\\n", c - b', signed_failures),
@@ -2633,6 +2641,126 @@ def test_row_5(tmp):
     check("row 5 FAILs with the environment report when the ort chain dies", st == "FAIL" and "ort_env:" in detail, f"{st} {detail}")
 
 
+# What Intel neural withheld looks like to the bench: a record with `neural <level>` in Record.GpuWithheldUnmeasured, no device, no routing.
+WITHHELD = {"withheld": "neural realesr-anime-x2", "device": None, "applied": False, "routing": None}
+CONFIG_WITHHELD = {"config": {"NeuralAllowed": True, "NeuralMaxSourceHeight": 0, "Keep": "me", "IntelNeuralAllowed": False}}
+# the stub clips are 24 fps and 240 frames: 20 s is 12 fps, 40 s is 6 fps, the default 2 s is 120 fps
+SLOW = {"FAKE_RTIME_360": "20", "FAKE_RTIME_720": "40"}
+SLOW_REASON = re.compile(r"^withheld on Intel: measured 12\.00/6\.00 fps below real time \(level_zero_loader=(present|MISSING|UNKNOWN)\)")
+CPU_WARN = "OpenVINO execution provider unavailable (Device GPU is not available), using CPU"
+
+
+def neural_world(script, tmp, tag, row, scenario=None, **env):
+    """One bench run of row 5 or 6 with the ort model set; env goes to the run."""
+    w = World(tmp, tag, scenario, extra={"BENCH_ORT_MODEL": "/m/model.onnx"})
+    rc, out, err = w.run(["--rows", str(row)], script=script, **env)
+    return w, results(out).get(row, ("", ""))
+
+
+def neural_class_failures(script, tmp, tag):
+    """Rows 5 and 6 with neural withheld: slow is SKIP with both fps, fast is MANUAL, an error is FAIL (never SKIP)."""
+    bad = []
+    for row in (5, 6):
+        for label, scn, env, want in [
+            ("slow", WITHHELD, SLOW, "SKIP"),
+            ("slow720", WITHHELD, {"FAKE_RTIME_720": "40"}, "SKIP"),
+            ("fast", WITHHELD, {}, "MANUAL"),
+            ("config-slow", CONFIG_WITHHELD, SLOW, "SKIP"),
+            ("nobench", WITHHELD, {"FAKE_NO_BENCH": "1"}, "FAIL"),
+            ("cpu", WITHHELD, {"FAKE_ORT_WARN": CPU_WARN}, "FAIL"),
+            ("ffmpeg-fail", WITHHELD, {"FAKE_FFMPEG_FAIL": "1"}, "FAIL"),
+        ]:
+            w, (st, detail) = neural_world(script, tmp, f"{tag}-{row}-{label}", row, scn, **env)
+            if st != want:
+                bad.append(f"row{row}-{label}:{st}")
+            elif label == "slow" and not SLOW_REASON.match(detail):
+                bad.append(f"row{row}-reason:{detail[:90]}")
+            elif label == "slow720" and "measured 120.00/6.00 fps below real time" not in detail:
+                bad.append(f"row{row}-reason720:{detail[:90]}")
+            elif label == "fast" and not detail.startswith("neural reaches real time on Intel (120.00/120.00 fps); review IntelNeuralAllowed"):
+                bad.append(f"row{row}-fast-reason:{detail[:90]}")
+    return bad
+
+
+def test_row_5_withheld(tmp):
+    for label, scn, env, want, frag in [
+        ("slow", WITHHELD, SLOW, "SKIP", "measured 12.00/6.00 fps below real time"),
+        ("fast-360-slow-720", WITHHELD, {"FAKE_RTIME_720": "40"}, "SKIP", "measured 120.00/6.00 fps below real time"),
+        ("slow-360-fast-720", WITHHELD, {"FAKE_RTIME_360": "20"}, "SKIP", "measured 12.00/120.00 fps below real time"),
+        ("fast", WITHHELD, {}, "MANUAL", "neural reaches real time on Intel (120.00/120.00 fps); review IntelNeuralAllowed"),
+        ("config-slow", CONFIG_WITHHELD, SLOW, "SKIP", "measured 12.00/6.00 fps below real time"),
+        ("config-fast", CONFIG_WITHHELD, {}, "MANUAL", "review IntelNeuralAllowed"),
+    ]:
+        w, (st, detail) = neural_world(BENCH, tmp, "r5w-" + label, 5, scn, **env)
+        check(f"row 5 withheld ({label}) is {want}", st == want and frag in detail, f"{st} {detail}")
+        check(f"row 5 withheld ({label}) still prints fps, source fps, device, loader and the withheld state",
+              all(k in detail for k in ("fps_360p=", "fps_720p=", "src_fps=24.000/24.000", "device=", "level_zero_loader=", "neural_withheld=yes")),
+              detail)
+    w, (st, detail) = neural_world(BENCH, tmp, "r5w-slow-reason", 5, WITHHELD, **SLOW)
+    check("row 5 withheld+slow carries the exact SKIP reason", bool(SLOW_REASON.match(detail)), detail)
+
+    # not withheld: today's results, whatever the fps
+    w, (st, detail) = neural_world(BENCH, tmp, "r5w-open-slow", 5, None, **SLOW)
+    check("row 5 not withheld and slow is still MANUAL on openvino", st == "MANUAL" and "neural_withheld=no" in detail
+          and "fps_360p=12.00 fps_720p=6.00" in detail, f"{st} {detail}")
+    w, (st, detail) = neural_world(BENCH, tmp, "r5w-open-cpu", 5, {"device": "cpu"}, **SLOW)
+    check("row 5 not withheld on a cpu device is still FAIL", st == "FAIL" and "device=cpu" in detail, f"{st} {detail}")
+    w, (st, detail) = neural_world(BENCH, tmp, "r5w-open-allowed", 5, {"config": {"IntelNeuralAllowed": True}, "device": "cpu"}, **SLOW)
+    check("row 5 with IntelNeuralAllowed=true is not withheld", st == "FAIL" and "neural_withheld=no" in detail, f"{st} {detail}")
+    w, (st, detail) = neural_world(BENCH, tmp, "r5w-open-nocfg", 5, {"device": "cpu"})
+    check("row 5 never reads the configuration as withheld when the key is absent", st == "FAIL" and "neural_withheld=no" in detail, f"{st} {detail}")
+
+    # a measurement error is FAIL with its reason, never SKIP
+    for label, env, frag in [("ffmpeg-fail", {"FAKE_FFMPEG_FAIL": "1"}, "the ort chain failed at 360p"),
+                             ("no-fps", {"FAKE_NO_BENCH": "1"}, "no fps measured"),
+                             ("cpu-fallback", {"FAKE_ORT_WARN": CPU_WARN}, "fell back to CPU")]:
+        w, (st, detail) = neural_world(BENCH, tmp, "r5w-err-" + label, 5, WITHHELD, **env)
+        check(f"row 5 withheld with a measurement error ({label}) is FAIL with its reason", st == "FAIL" and frag in detail, f"{st} {detail}")
+
+
+def test_row_6_withheld(tmp):
+    for label, scn, env, want, frag in [
+        ("slow", WITHHELD, SLOW, "SKIP", "measured 12.00/6.00 fps below real time"),
+        ("fast-360-slow-720", WITHHELD, {"FAKE_RTIME_720": "40"}, "SKIP", "measured 120.00/6.00 fps below real time"),
+        ("fast", WITHHELD, {}, "MANUAL", "neural reaches real time on Intel (120.00/120.00 fps); review IntelNeuralAllowed"),
+        ("config-slow", CONFIG_WITHHELD, SLOW, "SKIP", "measured 12.00/6.00 fps below real time"),
+        ("config-fast", CONFIG_WITHHELD, {}, "MANUAL", "review IntelNeuralAllowed"),
+    ]:
+        w, (st, detail) = neural_world(BENCH, tmp, "r6w-" + label, 6, scn, **env)
+        check(f"row 6 withheld ({label}) is {want}", st == want and frag in detail, f"{st} {detail}")
+        check(f"row 6 withheld ({label}) prints fps, device, loader and the withheld state",
+              all(k in detail for k in ("fps_360p=", "fps_720p=", "device=", "level_zero_loader=", "neural_withheld=yes")), detail)
+        posts = w.posts()
+        check(f"row 6 withheld ({label}) puts the plugin configuration back", posts[-1] == w.config0 if posts else True, str(posts))
+    w, (st, detail) = neural_world(BENCH, tmp, "r6w-slow-reason", 6, WITHHELD, **SLOW)
+    check("row 6 withheld+slow carries the exact SKIP reason", bool(SLOW_REASON.match(detail)), detail)
+
+    # not withheld: today's PASS/FAIL, now with the fps printed
+    w, (st, detail) = neural_world(BENCH, tmp, "r6w-open-pass", 6, None, **SLOW)
+    check("row 6 not withheld still PASSes on the NOT-run routing, and prints the fps",
+          st == "PASS" and "fps_360p=12.00 fps_720p=6.00" in detail and "neural_withheld=no" in detail, f"{st} {detail}")
+    w, (st, detail) = neural_world(BENCH, tmp, "r6w-open-fail", 6, {"routing": None}, **SLOW)
+    check("row 6 not withheld with no routing is still FAIL", st == "FAIL" and "neural_withheld=no" in detail, f"{st} {detail}")
+    w = World(tmp, "r6w-nomodel", WITHHELD)
+    st, detail = results(w.run(["--rows", "6"])[1]).get(6, ("", ""))
+    check("row 6 without BENCH_ORT_MODEL keeps today's logic", st == "FAIL" and "fps_360p" not in detail, f"{st} {detail}")
+
+    for label, env, frag in [("ffmpeg-fail", {"FAKE_FFMPEG_FAIL": "1"}, "the ort chain failed at 360p"),
+                             ("no-fps", {"FAKE_NO_BENCH": "1"}, "no fps measured"),
+                             ("cpu-fallback", {"FAKE_ORT_WARN": CPU_WARN}, "fell back to CPU")]:
+        w, (st, detail) = neural_world(BENCH, tmp, "r6w-err-" + label, 6, WITHHELD, **env)
+        check(f"row 6 withheld with a measurement error ({label}) is FAIL with its reason", st == "FAIL" and frag in detail, f"{st} {detail}")
+        check(f"row 6 withheld ({label}) puts the plugin configuration back", w.posts()[-1] == w.config0, str(w.posts()))
+
+    # rows 5 and 6 in one run measure once
+    w = World(tmp, "r56-once", WITHHELD, extra={"BENCH_ORT_MODEL": "/m/model.onnx"})
+    rc, out, err = w.run(["--rows", "5,6"], **SLOW)
+    res = results(out)
+    check("rows 5 and 6 in one run both SKIP withheld", res.get(5, ("",))[0] == "SKIP" and res.get(6, ("",))[0] == "SKIP", str(res))
+    check("rows 5 and 6 in one run measure the ort chain once per clip", len([l for l in ffmpeg_runs(w) if "ort=" in l]) == 2,
+          str([l[-50:] for l in ffmpeg_runs(w) if "ort=" in l]))
+
+
 def stage_meta_check(tmp, label, guid, abi, strip_source):
     """Run the real stage-plugin.sh against a stub dotnet and read the meta.json it writes."""
     root = tempfile.mkdtemp(dir=tmp)
@@ -2709,7 +2837,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         parts = (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
                  test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_no_fsr2,
-                 test_render_node_pick, test_row_6, test_row_5, test_shared_files, test_scored_inputs)
+                 test_render_node_pick, test_row_6, test_row_5, test_row_5_withheld, test_row_6_withheld,
+                 test_shared_files, test_scored_inputs)
 
         def go(part):
             sub = os.path.join(tmp, part.__name__)
