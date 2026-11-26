@@ -516,11 +516,13 @@ and status are unchanged, and the dashboard's GPU line prints each as `Axis leve
 
 The ONNX neural levels (`realesr-anime-x2`, `realesr-anime-x4`, `realesr-general-x4`) are withheld on
 Intel as well, but with a different reason, "not measured on Intel" (`GpuWithheldUnmeasured`): they do not
-need CUDA, and PR 5 gives them an OpenVINO device, but nobody has measured that path on a real Arc. The
-maintainer's condition is that they stay withheld until it is in place **and measured**, so PR 5's path is
-present and unreachable on Intel until `UpscaleEngine.IntelOnnxMeasured` is set (a measured bench result
-lifts it; the tests set it to exercise the path). The Intel `Neural` list is `off`, and the session
-summary names the reason per group.
+need CUDA, and PR 5 gives them an OpenVINO device, but on an A380 bench run22 measured about 1.4 fps at 360p
+and 0.5 fps at 720p, so playback stutters. They stay withheld until the admin sets `IntelNeuralAllowed`
+(dashboard checkbox, default off, gated by the neural master switch; it replaces the hardcoded
+`UpscaleEngine.IntelOnnxMeasured`). Off, nothing changes: the same reason, `GpuWithheldUnmeasured` and
+`Withheld` list. On, PR 5's path is offered once the OpenVINO provider, the weights and the ffmpeg's
+openvino device are present. The Intel `Neural` list is `off` while it is off, and the session summary
+names the reason per group.
 
 **Recommended in documentation only: `MaxConcurrent` 1 for 4K output on a small Intel GPU.** The one
 measurement there is (section 6) is a single session, 1080p to 2160p at 38 to 40 fps on an A380.
@@ -1072,6 +1074,27 @@ then add an Intel-only source-height guard beside the `SrMinScaleFactor` bypass.
 |---|---|---|---|---|---|
 | run20 | -0.69 dB | not measured | not measured | not measured | not measured |
 
+**The low-res route (settings, Intel only).** The `lowtarget` path is now an engine route, set on the
+dashboard (Intel settings beside "Super-resolution minimum ratio"):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `IntelLowResMaxSourceHeight` | 480 | a source shorter than this takes the route; 0 turns it off |
+| `IntelLowResIntermediateScale` | 1.5 | the multiple of the source the network runs to; 1.0 to 2.0 on the page, clamped to that range when read |
+
+The route is set only when the GPU is a detected Intel one, the source is shorter than the max, the target
+upscale applies, the resolved SR level is `fsrcnnx`, `fsrcnnx-heavy` or `fsrcnnx-max` (after the
+`SrMinScaleFactor` bypass), no neural or game pass ran, and `round_even(source * scale)` is below the
+target height. Then libplacebo is built with `w=`/`h=` at `round_even(source * scale)` and the Intel tail
+adds `,scale=<W>:<H>:flags=bicubic,format=<yuv420p or the decode surface format>` after the download, the
+shape of `chain_shader_bicubic` in `scripts/bench-intel.sh`. The session record carries `LowResRoute`
+("low-res route: fsrcnnx to 1.5x then bicubic"), the summary repeats it and the flat session JSON gains the
+key; none of the three appears for a session that did not take the route, on any GPU. NVIDIA and no-GPU
+chains are byte-identical to before. Bench run22, per the owner's brief and not a record in this
+repo, scored this path at +1.08 dB over plain scaling at 360p; the `alt_lowtarget` figure above is still the
+measurement to record from an Arc run, and the live 1.5x behaviour of FSRCNNX's own 1.3x guard on a real
+Arc is not verified here.
+
 **Inputs the owner supplies.** The lossless clips (`<title>_{360,720,1080,2160}p.mkv`, `still_720p.png`,
 `pan_720p.mkv`, `pan_1080p.mkv`), an admin API token for the test Jellyfin, and an ONNX model for
 row 5. No library content is committed (AGENTS.md invariant 18).
@@ -1101,7 +1124,7 @@ prints; the rest is read from files and the Deployment.
 |---|---|---|---|
 | 1 | Is the OpenVINO EP in the ORT build? | Yes, by construction: the pinned `onnxruntime_openvino` 1.24.1 wheel carries it and the build stages and checks it. Not executed in the image. | `scripts/build-ffmpeg.sh:271-277` (wheel pin), `:679-680` (stages `libonnxruntime_providers_openvino.so`, `libopenvino_intel_gpu_plugin.so`), `:1056-1064` (build dies without `device=openvino` or the provider); `ffmpeg/vf_ort.c:244` calls `SessionOptionsAppendExecutionProvider_OpenVINO_V2` |
 | 2 | Are the GPU plugin and the OpenCL / Level Zero runtime in the image? | The GPU plugin yes. **No OpenCL ICD loader or compute runtime, no Level Zero loader**: nothing installs `ocl-icd-libopencl1`, `intel-opencl-icd` or `libze*` (`grep -ri 'intel-opencl-icd\|ocl-icd\|libOpenCL' docker/` finds nothing), and the ldd-derived list cannot see them because it skips the ORT libraries under the ffmpeg prefix and the plugin loads `libOpenCL.so.1` itself. Whether the Jellyfin base carries them is unchecked. | `docker/intel/Dockerfile:85-91` (the `continue` for `$P/*`), `:133-135` and `:140-145` (the only installs), `scripts/build-ffmpeg.sh:63-64` and `:1065` (say the OpenCL stack is the host's job); this file at the OpenCL bullet near line 669 and `docs/filters/NEURAL.md:272` (the plugin needs it) |
-| 3 | Which device does the session ask for? | `device=openvino` on the node, which the provider gets as `device_type=GPU` (`GPU.n` only when `device_id>0`, and the chain passes none). **But a stream never reaches that: on Intel the ONNX levels are withheld while `IntelOnnxMeasured` is false**, the level becomes `off`, `NeuralApplied` is false and `NeuralDevice` stays null, which row 5 printed as `device=none`. `none` is a session that never ran ORT, not an ORT fallback (that reads `cpu`). | `src/patcher/Transcoding/UpscaleEngine.cs:3136` (`IntelOnnxMeasured = false`), `:3149` (withheld), `:1553` (`Withhold` sets the level `off`), `:1640-1644` (`NeuralDevice` only when applied), `:693`; `ffmpeg/vf_ort.c:240-244`; `scripts/bench-intel.sh` `chain_ort` |
+| 3 | Which device does the session ask for? | `device=openvino` on the node, which the provider gets as `device_type=GPU` (`GPU.n` only when `device_id>0`, and the chain passes none). **But a stream never reaches that: on Intel the ONNX levels are withheld while the `IntelNeuralAllowed` setting is false (its default)**, the level becomes `off`, `NeuralApplied` is false and `NeuralDevice` stays null, which row 5 printed as `device=none`. `none` is a session that never ran ORT, not an ORT fallback (that reads `cpu`). | `src/patcher/Transcoding/UpscaleEngine.cs` `IntelWithholdReason` (withheld unless `Settings.IntelNeuralAllowed`), `:1553` (`Withhold` sets the level `off`), `:1640-1644` (`NeuralDevice` only when applied), `:693`; `ffmpeg/vf_ort.c:240-244`; `scripts/bench-intel.sh` `chain_ort` |
 | 4 | Can the process open `/dev/dri/renderD129`? | Unknown here. The pod runs as 1000:1000 with `supplementalGroups: [993]` and one `gpu.intel.com/i915`; the host has `renderD128` and `renderD129`. Whether 993 is the group that owns the node the plugin handed out is not checked. | Deployment `media/jellyfin-plus-test` (`kubectl get deployment`), ops `host_probe aihub gpu` (`by-path card0 card1 card2 renderD128 renderD129`) |
 
 Row 5 now ends with the evidence instead of the fps alone, in the result detail and in `$BENCH_OUT/run-<id>/`:

@@ -76,6 +76,53 @@ cluster is not involved: this plugin runs on the Jellyfin box over SSH, not in K
     "python3 scripts/sync_mcp_filesystem_docs.py --check",
     "scripts/test-gpu-vendor.sh <jfbin>  (C# harness; needs dotnet and the server's DLLs, not runnable in this sandbox)"
   ],
+  "ui_candidates": [
+    {
+      "name": "Jellyfin dashboard controls already on the page (emby-checkbox, emby-input, the page's own markup)",
+      "licence": "GPL-2.0 (ships with Jellyfin)",
+      "maintenance": "maintained with Jellyfin 10.x/12.x, no separate upgrade",
+      "dark_mode": "follows the Jellyfin dashboard theme natively",
+      "coverage": "checkbox, number input with min/max/step, required, help text: all three new fields",
+      "size": "zero added bytes",
+      "verdict": "use"
+    },
+    {
+      "name": "Plain HTML inputs",
+      "licence": "none (browser built-in)",
+      "maintenance": "browser-maintained",
+      "dark_mode": "unstyled, would not match the dashboard theme",
+      "coverage": "covers the fields but looks different from every neighbour",
+      "size": "zero",
+      "verdict": "reject: inconsistent with the page"
+    },
+    {
+      "name": "Shoelace web components",
+      "licence": "MIT",
+      "maintenance": "active upstream",
+      "dark_mode": "own theme, would need wiring to the Jellyfin theme",
+      "coverage": "more than three fields need",
+      "size": "hundreds of KB loaded into an embedded config page",
+      "verdict": "reject: oversized, a second look on one page"
+    },
+    {
+      "name": "Alpine.js",
+      "licence": "MIT",
+      "maintenance": "active upstream",
+      "dark_mode": "none, markup still has to be styled",
+      "coverage": "reactivity the page does not use (load/save is data-config driven)",
+      "size": "about 15 KB plus a CDN or bundled copy",
+      "verdict": "reject: nothing to add for three static fields"
+    },
+    {
+      "name": "Preact",
+      "licence": "MIT",
+      "maintenance": "active upstream",
+      "dark_mode": "none, markup still has to be styled",
+      "coverage": "would mean rewriting the page's render path",
+      "size": "about 4 KB plus a build step the embedded page does not have",
+      "verdict": "reject: a rewrite for three fields"
+    }
+  ],
   "tdd": "required",
   "fast_path": false,
   "acceptance": [

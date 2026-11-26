@@ -147,6 +147,22 @@ namespace Jellyfin.Plugin.Plus.Configuration
         /// </summary>
         public double SrMinScaleFactor { get; set; } = 1.60;
 
+        /// <summary>
+        /// Intel only: offer the ONNX neural levels (OpenVINO). Off by default because the A380 bench
+        /// measured about 1.4 fps at 360p and 0.5 fps at 720p, so it will stutter. See
+        /// UpscaleSettings.IntelNeuralAllowed.
+        /// </summary>
+        public bool IntelNeuralAllowed { get; set; }
+
+        /// <summary>
+        /// Intel only: sources shorter than this run FSRCNNX to a small intermediate size and finish
+        /// with a bicubic scale. 0 turns the route off. See UpscaleSettings.IntelLowResMaxSourceHeight.
+        /// </summary>
+        public int IntelLowResMaxSourceHeight { get; set; } = 480;
+
+        /// <summary>Intel only: the FSRCNNX intermediate scale of the low-res route, 1.0 to 2.0.</summary>
+        public double IntelLowResIntermediateScale { get; set; } = 1.5;
+
         /// <summary>Never upscale sources taller than this.</summary>
         public int MaxSourceHeight { get; set; } = 1440;
 

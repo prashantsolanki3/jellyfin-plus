@@ -226,8 +226,10 @@ keeps the code path that existed before the setting did:
   NVIDIA`), **only on a detected Intel server**, so the NVIDIA probe and status have exactly the keys
   they had, and the dashboard's GPU line prints each as `Axis level (reason)`. The ONNX neural levels (`ort`) are withheld too, with their own reason, "not measured on Intel"
   (`SessionRecord.GpuWithheldUnmeasured`): PR 5 gives them a device (next bullet), but that path has not been
-  measured on a real Arc, and they stay withheld until it is (`UpscaleEngine.IntelOnnxMeasured`; a measured bench
-  result will lift it).
+  measured on a real Arc (about 1.4 fps at 360p on an A380), and they stay withheld until the admin sets
+  `IntelNeuralAllowed` (default off). Intel also gets a low-res route, `IntelLowResMaxSourceHeight` (480, 0 = off)
+  and `IntelLowResIntermediateScale` (1.5): FSRCNNX to `round_even(source * scale)`, then a bicubic scale, reported
+  as `SessionRecord.LowResRoute` and present only when it ran (GPU_VENDORS.md).
 - **The ONNX neural level's device.** The `ort` filter (`ffmpeg/vf_ort.c`) gained `device=openvino`
   beside `cuda` (the default) and `cpu`: ONNX Runtime's OpenVINO provider on an Intel GPU
   (`device_id` is the GPU number, 0 meaning OpenVINO's `GPU`). If the provider will not append, or a
