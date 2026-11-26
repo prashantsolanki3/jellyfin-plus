@@ -1054,7 +1054,34 @@ is unit-tested by `scripts/test_entrypoint.py`; that the base's ENTRYPOINT is `/
 arguments is matched to upstream, not to the pinned digest) and the symlinks; the base image's layout
 (`/jellyfin`, `/jellyfin/jellyfin-web`); the derived runtime package names. The OpenCL compute runtime that
 OpenVINO's GPU device needs is not installed by the image and whether the base carries it is unchecked:
-row 5's `device=` figure is what shows a CPU fallback.
+row 5's detail carries the fallback reason (below).
+
+### 5.9 Why row 5 reads `device=none` (diagnosis only, no fix)
+
+Checked in this order against the repository and the live test pod (`media/jellyfin-plus-test`, image
+`jellyfin-plus-intel:9e306b8`). No shell in the pod was available, so the in-pod answers are the ones row 5 now
+prints; the rest is read from files and the Deployment.
+
+| # | Question | Answer | Evidence |
+|---|---|---|---|
+| 1 | Is the OpenVINO EP in the ORT build? | Yes, by construction: the pinned `onnxruntime_openvino` 1.24.1 wheel carries it and the build stages and checks it. Not executed in the image. | `scripts/build-ffmpeg.sh:271-277` (wheel pin), `:679-680` (stages `libonnxruntime_providers_openvino.so`, `libopenvino_intel_gpu_plugin.so`), `:1056-1064` (build dies without `device=openvino` or the provider); `ffmpeg/vf_ort.c:244` calls `SessionOptionsAppendExecutionProvider_OpenVINO_V2` |
+| 2 | Are the GPU plugin and the OpenCL / Level Zero runtime in the image? | The GPU plugin yes. **No OpenCL ICD loader or compute runtime, no Level Zero loader**: nothing installs `ocl-icd-libopencl1`, `intel-opencl-icd` or `libze*` (`grep -ri 'intel-opencl-icd\|ocl-icd\|libOpenCL' docker/` finds nothing), and the ldd-derived list cannot see them because it skips the ORT libraries under the ffmpeg prefix and the plugin loads `libOpenCL.so.1` itself. Whether the Jellyfin base carries them is unchecked. | `docker/intel/Dockerfile:85-91` (the `continue` for `$P/*`), `:133-135` and `:140-145` (the only installs), `scripts/build-ffmpeg.sh:63-64` and `:1065` (say the OpenCL stack is the host's job); this file at the OpenCL bullet near line 669 and `docs/filters/NEURAL.md:272` (the plugin needs it) |
+| 3 | Which device does the session ask for? | `device=openvino` on the node, which the provider gets as `device_type=GPU` (`GPU.n` only when `device_id>0`, and the chain passes none). **But a stream never reaches that: on Intel the ONNX levels are withheld while `IntelOnnxMeasured` is false**, the level becomes `off`, `NeuralApplied` is false and `NeuralDevice` stays null, which row 5 printed as `device=none`. `none` is a session that never ran ORT, not an ORT fallback (that reads `cpu`). | `src/patcher/Transcoding/UpscaleEngine.cs:3136` (`IntelOnnxMeasured = false`), `:3149` (withheld), `:1553` (`Withhold` sets the level `off`), `:1640-1644` (`NeuralDevice` only when applied), `:693`; `ffmpeg/vf_ort.c:240-244`; `scripts/bench-intel.sh` `chain_ort` |
+| 4 | Can the process open `/dev/dri/renderD129`? | Unknown here. The pod runs as 1000:1000 with `supplementalGroups: [993]` and one `gpu.intel.com/i915`; the host has `renderD128` and `renderD129`. Whether 993 is the group that owns the node the plugin handed out is not checked. | Deployment `media/jellyfin-plus-test` (`kubectl get deployment`), ops `host_probe aihub gpu` (`by-path card0 card1 card2 renderD128 renderD129`) |
+
+Row 5 now ends with the evidence instead of the fps alone, in the result detail and in `$BENCH_OUT/run-<id>/`:
+
+- `ffmpeg_ort_360p=` / `ffmpeg_ort_720p=`: `CPU_FALLBACK[...]` with the filter's own `OpenVINO execution provider unavailable (...), using CPU`
+  (or `OpenVINO session could not be created (...)`) when ORT fell back or the filter's `device=cpu` line shows it ran on the CPU,
+  `no_ort_line_in_log` when it printed neither, else the matched lines (`using CPU` lines are read first). The full stderr of each chain is `row5-<h>p.ffmpeg.log`. `vf_ort.c` now logs its `device=` line at INFO, so
+  an image built from this change shows the device it really ran on without `-v verbose`.
+- `ort_env:` `ep_libs_missing`, `gpu_plugin_unresolved` (`ldd` of `libopenvino_intel_gpu_plugin.so`), `opencl_icd`, `libOpenCL`
+  (from that same `ldd`; `UNKNOWN` when the plugin or `ldd` is absent), `level_zero_loader` (`/sbin/ldconfig` or
+  `/usr/sbin/ldconfig`; `UNKNOWN(no ldconfig)` when neither exists), `render_node`/`open` (the process opens the node read-write; `FAIL(Permission denied)` is the group),
+  `node_gid` and `process_gids`.
+- when `device` is not `openvino`: `session_neural_requested`, `session_withheld`, `session_routing`, `session_summary`.
+
+Row 6 prints `neural_requested` and `session_withheld` when it fails. The fix is a separate task.
 
 ## 6. A380 measurements
 

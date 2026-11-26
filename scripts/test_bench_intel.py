@@ -443,6 +443,12 @@ case "$*" in
 *-benchmark*)
     [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4
+    # FAKE_ORT_WARN: what the ort filter says on stderr when the OpenVINO provider is not there (vf_ort.c append_openvino)
+    # FAKE_ORT_NOISE: three OpenVINO lines before the warning; FAKE_ORT_DEVICE: the device line vf_ort config_input prints
+    case "$*" in *ort=*)
+        [ -z "${FAKE_ORT_NOISE:-}" ] || for n in 1 2 3; do echo "[Parsed_ort_3 @ 0x1] OpenVINO runtime note $n" >&2; done
+        [ -z "${FAKE_ORT_WARN:-}" ] || echo "[Parsed_ort_3 @ 0x1] $FAKE_ORT_WARN" >&2
+        [ -z "${FAKE_ORT_DEVICE:-}" ] || echo "[Parsed_ort_3 @ 0x1] onnxruntime 1.20.1: /m/model.onnx, 640x360 -> 1280x720 (x2), device=$FAKE_ORT_DEVICE" >&2;; esac
     # an ffv1 write leaves its output (the last argument) as ffmpeg does. FAKE_FFV1_FAIL / _SKIP / _STALE hold a substring
     # of the output path they apply to: _FAIL exits 1 (a full disk), _SKIP exits 0 and writes nothing, _STALE writes it
     # with a year-2000 mtime, as a leftover of an earlier run would be.
@@ -640,8 +646,13 @@ if path.startswith("/JellyfinPlus/Session/"):
     if cfg_max > 0 and s["neural"] and s["src_height"] > cfg_max:
         routing = "neural %s NOT run: the source is %dp, taller than NeuralMaxSourceHeight %d, so the shader path ran" % (
             s["neural"], s["src_height"], cfg_max)
-    out({"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False),
-         "NeuralDevice": sc.get("device", "openvino"), "NeuralRouting": sc["routing"] if "routing" in sc else routing})
+    rec = {"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False),
+           "NeuralDevice": sc.get("device", "openvino"), "NeuralRouting": sc["routing"] if "routing" in sc else routing}
+    if "requested" in sc:
+        rec["NeuralRequested"] = sc["requested"]
+    if "withheld" in sc:
+        rec["Record"] = {"GpuWithheldUnmeasured": sc["withheld"]}
+    out(rec)
 if path.endswith("/master.m3u8"):
     if sc.get("fail_master"):
         fail()
@@ -806,7 +817,7 @@ def test_mutants(tmp):
         ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
         ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
-        ("run-fps-lost-failure", '|| { rc=$?; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
+        ("run-fps-lost-failure", '|| { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
         ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"',
          'curl -fsS -H "Authorization: MediaBrowser Token=\\"$JF_TOKEN\\"" "$@" "$JF_URL$p"', token_failures),
         ("legacy-header", 'Authorization: MediaBrowser Token=\\\\"%s\\\\"', "X-Emby-Token: %s", token_failures),
@@ -2202,6 +2213,16 @@ def test_row_6(tmp):
         w, rc, out, err, (st, detail) = row6_case(tmp, "r6-" + tag, scn)
         check(f"row 6 FAILs on a record that is not the NOT-run wording ({tag})", st == "FAIL", f"{st} {detail}")
 
+    # a FAIL names what the session asked for and what withheld it, with the values the record held
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-why", {"applied": True, "requested": "realesr-anime-x2",
+                                                              "withheld": "not measured on Intel"})
+    check("row 6 FAIL prints neural_requested= and session_withheld= with the record's values",
+          st == "FAIL" and "neural_requested=realesr-anime-x2" in detail and "session_withheld=not measured on Intel" in detail,
+          f"{st} {detail}")
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-why-empty", {"applied": True})
+    check("row 6 FAIL prints neural_requested=off and session_withheld=none when the record has neither",
+          st == "FAIL" and "neural_requested=off" in detail and "session_withheld=none" in detail, f"{st} {detail}")
+
     rc, out, err = World(tmp, "r6-fast").run(["--rows", "6"], BENCH_NEURAL_LEVEL="fast")
     check("BENCH_NEURAL_LEVEL=fast is refused (it is not a level)", rc == 2 and "BENCH_NEURAL_LEVEL" in err, f"rc={rc} {err}")
 
@@ -2239,6 +2260,72 @@ def test_row_5(tmp):
     w = World(tmp, "r5-nostream", {"fail_master": True}, extra)
     st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
     check("row 5 FAILs when its stream cannot start", st == "FAIL", f"{st} {detail}")
+
+    # the exact fallback reason: the ort filter's own warning, the environment's answers, and what the session record says
+    warn = "OpenVINO execution provider unavailable (Device GPU is not available), using CPU"
+    w = World(tmp, "r5-reason", {"device": None, "applied": False,
+                                 "routing": "neural realesr-anime-x2 NOT run: not measured on Intel"},
+              dict(extra, FAKE_ORT_WARN=warn))
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 prints the ort filter's fallback reason for both clips",
+          detail.count("CPU_FALLBACK[") == 2 and "Device GPU is not available" in detail, detail)
+    both = "libonnxruntime_providers_openvino.so,libopenvino_intel_gpu_plugin.so,"
+    check("row 5 names both ORT libraries as missing when $PREFIX/ort/lib has neither",
+          f"ep_libs_missing={both} " in detail and "gpu_plugin_unresolved=none " in detail
+          and "libOpenCL=UNKNOWN(" in detail and "open=FAIL(" in detail and "process_gids=" in detail, detail)
+    ldconfig = any(os.path.exists(p) for p in ("/sbin/ldconfig", "/usr/sbin/ldconfig"))
+    z = re.search(r"level_zero_loader=(\S+)", detail)
+    check("row 5 reports the Level Zero loader as UNKNOWN(no ldconfig) only when the host has no ldconfig",
+          bool(z) and (z.group(1) in ("present", "MISSING") if ldconfig else z.group(1) == "UNKNOWN(no"), detail)
+
+    # seed the ort lib directory the report reads, and a fake ldd for the GPU plugin
+    lib = os.path.join(w.stubs, "ort", "lib")
+    os.makedirs(lib)
+    open(os.path.join(lib, "libonnxruntime_providers_openvino.so"), "w").close()
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 names only the GPU plugin as missing when the provider is there",
+          "ep_libs_missing=libopenvino_intel_gpu_plugin.so, " in detail, detail)
+    open(os.path.join(lib, "libopenvino_intel_gpu_plugin.so"), "w").close()
+    ldd = os.path.join(w.stubs, "ldd")
+    open(ldd, "w").write('#!/bin/sh\ncat "$FAKE_LDD_OUT"\n')
+    os.chmod(ldd, 0o755)
+    ldd_out = os.path.join(w.root, "ldd.txt")
+    open(ldd_out, "w").write("\tlibOpenCL.so.1 => not found\n\tlibc.so.6 => /lib/libc.so.6 (0x1)\n")
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out)[1]).get(5, ("", ""))[1]
+    check("row 5 reports no missing ORT library, the unresolved plugin library, and libOpenCL missing from that ldd",
+          "ep_libs_missing=none " in detail and "gpu_plugin_unresolved=libOpenCL.so.1, " in detail
+          and "libOpenCL=MISSING " in detail, detail)
+    open(ldd_out, "w").write("\tlibOpenCL.so.1 => /usr/lib/libOpenCL.so.1 (0x1)\n")
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out)[1]).get(5, ("", ""))[1]
+    check("row 5 reports libOpenCL present when the plugin's ldd resolves it",
+          "gpu_plugin_unresolved=none " in detail and "libOpenCL=present " in detail, detail)
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out, BENCH_RENDER_NODE="/dev/null")[1]).get(5, ("", ""))[1]
+    check("row 5 reports open=ok for a render node this process can open (a character device)",
+          "render_node=/dev/null open=ok " in detail, detail)
+    check("row 5 says a null device is a session that never ran ORT, with the routing it recorded",
+          st == "FAIL" and "device=none" in detail and "session_neural_requested=" in detail and "NOT run: not measured on Intel" in detail, f"{st} {detail}")
+    check("row 5 keeps each chain's ffmpeg log in the run directory",
+          all(os.path.isfile(os.path.join(w.out, "run-w1", f"row5-{h}p.ffmpeg.log")) for h in (360, 720)), os.listdir(w.out))
+    w = World(tmp, "r5-quiet", extra=extra)
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 without a fallback line says so instead of claiming openvino", "ffmpeg_ort_360p=no_ort_line_in_log" in detail, detail)
+    # ort_why: `using CPU` is read first, and the device line alone is enough to call a CPU run a fallback
+    w = World(tmp, "r5-noise", extra=dict(extra, FAKE_ORT_NOISE="1", FAKE_ORT_WARN=warn))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 keeps the `using CPU` reason when three earlier OpenVINO lines precede it",
+          detail.count("CPU_FALLBACK[") == 2 and "using CPU" in detail and "OpenVINO runtime note 2" in detail
+          and "OpenVINO runtime note 3" not in detail, detail)
+    w = World(tmp, "r5-devcpu", extra=dict(extra, FAKE_ORT_DEVICE="cpu"))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 flags CPU_FALLBACK from a device=cpu line with no `using CPU` warning",
+          detail.count("CPU_FALLBACK[") == 2 and "device=cpu" in detail and "using CPU" not in detail, detail)
+    w = World(tmp, "r5-devgpu", extra=dict(extra, FAKE_ORT_DEVICE="openvino"))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 does not flag a device=openvino line as a fallback",
+          "CPU_FALLBACK" not in detail and "ffmpeg_ort_360p=log[" in detail and "device=openvino" in detail, detail)
+    w = World(tmp, "r5-chainfail", extra=dict(extra, FAKE_FFMPEG_FAIL="1"))
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 FAILs with the environment report when the ort chain dies", st == "FAIL" and "ort_env:" in detail, f"{st} {detail}")
 
 
 def stage_meta_check(tmp, label, guid, abi, strip_source):
