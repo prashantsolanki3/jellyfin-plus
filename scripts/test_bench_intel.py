@@ -476,7 +476,7 @@ case "$*" in
     1) echo "[Parsed_libplacebo_2 @ 0x1] vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)" >&2; echo "Conversion failed!" >&2; exit 1;;
     plain) echo "Error initializing filter 'libplacebo' with args 'w=1920'" >&2; echo "Conversion failed!" >&2; exit 1;;
     esac
-    printf 'frame=  240 fps=120\rbench: utime=0.5s stime=0.1s rtime=2.0s\n' >&2
+    printf 'frame=  240 fps=120\rbench: utime=0.5s stime=0.1s rtime=2.0s\nbench: maxrss=26176KiB\n' >&2
     exit 0;;
 *-benchmark*)
     [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
@@ -534,7 +534,9 @@ case "$*" in
     *) ut=1.0; stt=0.1;;
     esac
     case "$*" in *"-c:v ffv1"*) ut=$(awk -v a="$ut" -v b="${FAKE_FFV1_CPU:-1.0}" 'BEGIN { printf "%.2f", a + b }');; esac
-    printf 'frame=  240 fps=120\rbench: utime=%ss stime=%ss rtime=2.0s\n' "$ut" "$stt" >&2;;
+    # FAKE_NO_BENCH: an ffmpeg that prints no bench: lines at all
+    [ -z "${FAKE_NO_BENCH:-}" ] || exit 0
+    printf 'frame=  240 fps=120\rbench: utime=%ss stime=%ss rtime=2.0s\nbench: maxrss=26176KiB\n' "$ut" "$stt" >&2;;
 *-loop*)
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4;;
 esac
@@ -909,6 +911,7 @@ def test_mutants(tmp):
         ("row9-no-zerocopy", 'zc=$(zerocopy_note)', 'zc=""', row9_failures),
         ("row9-zerocopy-fatal", 'zc=$(zerocopy_note)', 'zc=$(zerocopy_note); [[ "$zc" != zerocopy=FAIL* ]] || status=FAIL', row9_failures),
         ("row9-cpu-user-only", "t = u + s", "t = u", row9_failures),
+        ("row9-cpu-last-bench-line", "/^bench: utime=/ {", "/^bench:/ {", row9_failures),
         ("row9-cpu-ffv1-sink", 'hw) cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" ;;',
          'hw) cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" "$RUN_OUT/cpu-hw.mkv" ;;', row9_failures),
         ("row9-cpu-not-median", """printf '%s\\n' "${cpu[@]}" | median""", """printf '%s\\n' "${cpu[@]}" | sort -n | tail -1""", row9_failures),
@@ -1821,6 +1824,13 @@ def row9_failures(script, tmp, tag):
     runs3 = [l for l in ffmpeg_log(w) if " -vf " in l and l.endswith(" -f null -") and "hwmap=" not in l]
     if st != "PASS" or "cpu_gain=45.5%" not in detail or len(runs3) != 6:
         bad.append(f"median:{st}:{len(runs3)}:{detail[:120]}")
+
+    # an ffmpeg that prints no bench: line is a FAIL that says so, never a 0.00s reading
+    w = World(tmp, tag + "-nobench")
+    rc, out, err = w.run(["--rows", "9"], script=script, FAKE_NO_BENCH="1")
+    st, detail = results(out).get(9, ("", ""))
+    if st != "FAIL" or "printed no bench: line" not in detail or "0.00s" in detail:
+        bad.append(f"nobench:{st}:{detail[:120]}")
 
     # a gain under the threshold stays a FAIL and prints its real figure (nothing is relaxed)
     w = World(tmp, tag + "-lowgain")
