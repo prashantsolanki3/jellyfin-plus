@@ -437,6 +437,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 session["HardwareDecodeReason"] = record.HardwareDecodeReason;
             }
 
+            // Present only when the Intel low-res route built the chain.
+            if (record.LowResRoute != null)
+            {
+                session["LowResRoute"] = record.LowResRoute;
+            }
+
             return WithoutRenderNodes(JsonSerializer.Serialize(session));
         }
     }
