@@ -32,6 +32,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+WORKERS = 8
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -60,6 +64,21 @@ def bicubic(w, h):
 
 
 YUV_END = "format=yuv420p,hwdownload,format=yuv420p"
+
+
+def ewa(w, h):
+    """Row 2's `ewa` alternative: libplacebo's ewa_lanczos, no shader."""
+    return f"format=yuv420p,hwupload,libplacebo=w={w}:h={h}:upscaler=ewa_lanczos:{YUV_END}"
+
+
+def shader_bicubic(mw, mh, w, h):
+    """Row 2's `x2-bicubic` / `lowtarget` alternatives: FSRCNNX to mw x mh, then bicubic to the master's size w x h."""
+    return (f"format=yuv420p,hwupload,libplacebo=w={mw}:h={mh}:upscaler=ewa_lanczos:custom_shader_path={SHADER}:"
+            f"{YUV_END},scale={w}:{h}:flags=bicubic,format=yuv420p")
+
+
+# the 360p fixture is not on disk in a dry run, so the plan takes the nominal 640x360: 2x is 1280x720, 1.5x is 960x540
+ALTS = ("ewa", "x2-bicubic", "lowtarget")
 # the tail the bench and production used until rev-8j46u: every chain that carries it is a regression
 RGBA_TAIL = "format=rgba,hwdownload,format=rgba"
 FSR2_CHAIN = ("format=yuv420p,format=gbrpf32le,fsr2=w=1920:h=1080,format=yuv420p,hwupload,"
@@ -147,6 +166,12 @@ EXACT = [
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080), f"{RUN}/r2-bicubic.mkv", ff=STOCK),
     "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-shader.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
     "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-bicubic.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", ewa(1920, 1080), f"{RUN}/r2-alt-ewa.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-alt-ewa.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader_bicubic(1280, 720, 1920, 1080), f"{RUN}/r2-alt-x2-bicubic.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-alt-x2-bicubic.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader_bicubic(960, 540, 1920, 1080), f"{RUN}/r2-alt-lowtarget.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-alt-lowtarget.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
     "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160), ff=STOCK),
     "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160), f"{RUN}/r4-shader.mkv", ff=STOCK),
     "plan: row 4 cmd: " + xpsnr_cmd(f"{RUN}/r4-bicubic.mkv", "/clips/tears_2160p.mkv", ff=STOCK),
@@ -169,13 +194,17 @@ FAILS = []
 PASSES = 0
 
 
+LOCK = threading.Lock()
+
+
 def check(name, ok, detail=""):
     global PASSES
-    if ok:
-        PASSES += 1
-    else:
-        FAILS.append(name)
-        print(f"FAIL {name} {detail}".rstrip())
+    with LOCK:
+        if ok:
+            PASSES += 1
+        else:
+            FAILS.append(name)
+            print(f"FAIL {name} {detail}".rstrip())
 
 
 def clean_env(extra=None, path=None):
@@ -398,6 +427,8 @@ case "$*" in
     exit 0;;
 *xpsnr=*)
     [ "${FAKE_XPSNR_FAIL:-}" = 1 ] && exit 1
+    # FAKE_XPSNR_FAIL_ON: a substring of a scored file's path whose score fails (one row 2 alternative missing its score)
+    if [ -n "${FAKE_XPSNR_FAIL_ON:-}" ]; then case "$*" in *"$FAKE_XPSNR_FAIL_ON"*) exit 1;; esac; fi
     [ "${FAKE_XPSNR_HANG:-}" = 1 ] && exec sleep 4
     # real ffmpeg 9 prints two spaces after XPSNR and between the planes: `XPSNR  y: 14.4167  u: 30.1  v: 30.2`
     # FAKE_XPSNR_SWAP=1: the candidates (shader, fsr2) score below their bicubic control, a negative delta
@@ -407,6 +438,10 @@ case "$*" in
     *shader.mkv* | *pan-fsr2.mkv*) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=30 || y=40;;
     *) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=40 || y=30;;
     esac
+    # FAKE_XPSNR_ALT="ewa=34 lowtarget=36": the luma score of a row 2 alternative (r2-alt-<name>.mkv), whole dB
+    for kv in ${FAKE_XPSNR_ALT:-}; do
+        case "$*" in *"r2-alt-${kv%%=*}.mkv"*) y=${kv#*=};; esac
+    done
     # FAKE_XPSNR_GREEN=1: the shader outputs keep their luma score but have lost their chroma, as ANV's green frames did
     c=$y
     case "$*" in *shader.mkv*) [ "${FAKE_XPSNR_GREEN:-}" = 1 ] && c=3;; esac
@@ -465,7 +500,8 @@ case "$*" in
         if [ -z "$skip" ]; then
             # the file says what was asked of it (size from the chain, 480 frames like the masters), so ffprobe can report it.
             # FAKE_FFV1_SHORT / _BADSIZE hold a substring of the output path: one frame short, or a 1280x572 picture.
-            dims=$(echo "$*" | sed -n 's/.*libplacebo=w=\([0-9]*\):h=\([0-9]*\).*/\1 \2/p;s/.*scale=\([0-9]*\):\([0-9]*\):.*/\1 \2/p')
+            # a trailing scale (the shader-then-bicubic alternatives) is the final size; else the libplacebo one
+            dims=$(echo "$*" | sed -n -e 's/.*scale=\([0-9]*\):\([0-9]*\):.*/\1 \2/p' -e t -e 's/.*libplacebo=w=\([0-9]*\):h=\([0-9]*\).*/\1 \2/p')
             n=480
             if [ -n "${FAKE_FFV1_SHORT:-}" ]; then
                 case "$last" in *"$FAKE_FFV1_SHORT"*) n=479;; esac
@@ -804,11 +840,19 @@ def test_mutants(tmp):
         ("chroma-floor-zero", "CHROMA_XPSNR_MIN=25", "CHROMA_XPSNR_MIN=0"),
         ("hwdec-no-download", 'echo "hwdownload,format=nv12,hwupload,libplacebo', 'echo "hwupload,libplacebo'),
         ("hwdec-ffv1-plan", 'cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)"', 'cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)"'),
+        ("alt-no-final-resize", '$YUV_END,scale=$1:$2:flags=bicubic,format=yuv420p"; }', '$YUV_END"; }'),
+        ("alt-shader-at-target", "libplacebo=w=$ALT_MID_W:h=$ALT_MID_H:", "libplacebo=w=$1:h=$2:"),
+        ("alt-low-is-x2", "ALT_LOW=1.5", "ALT_LOW=2"),
+        ("alt-ewa-with-shader", 'chain_ewa() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:$YUV_END"; }',
+         'chain_ewa() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }'),
+        ("alts-not-planned", "                plan_alts 2 360 1080 1920 1080\n", ""),
+        ("alts-dropped-from-plan", 'ROW2_ALTS="ewa x2-bicubic lowtarget"', 'ROW2_ALTS="ewa x2-bicubic"'),
     ]:
         path = mutant_dir(tmp, name, old, new)
         rc, out, _ = run(path, ["--dry-run"])
         check(f"mutant {name} is caught", rc != 0 or bool(plan_failures(out)))
 
+    behaviour = []
     for name, old, new, fn in [
         ("octal-hhmm", 'hm=$((10#$(TZ="$BLOCK_TZ" date +%H%M)))', 'hm=$(TZ="$BLOCK_TZ" date +%H%M)', gate_failures),
         ("octal-window-start", "lo=$((10#${item%-*}))", "lo=$((${item%-*}))", gate_failures),
@@ -854,7 +898,13 @@ def test_mutants(tmp):
         ("size-unchecked", '("$mw" != "?" && "$w" != "$mw") || ("$mh" != "?" && "$h" != "$mh") || ', "", inputs_failures),
         ("inf-read-as-zero-y", "print (v ~ /^[+-]?[Ii]nf/ ? 999 : v + 0)", "print v + 0", inputs_failures),
         ("inf-read-as-zero-chroma", "return x ~ /^[+-]?[Ii]nf/ ? 999 : x + 0", "return x + 0", inputs_failures),
-        ("trace-silent", """printf 'trace: row %s: %s\\n' "${CUR_ROW:-?}" "${CMD[*]}" >&9;""", ":;", trace_failures),
+        ("alts-dropped", 'ROW2_ALTS="ewa x2-bicubic lowtarget"', 'ROW2_ALTS=""', alt_failures),
+        ("alt-fails-the-row", 'detail+="$ALT_DETAIL"', 'detail+="$ALT_DETAIL"; [[ "$ALT_DETAIL" != *FAIL* ]] || status=FAIL', alt_failures),
+        ("alt-tie-goes-late", 'if gt "$d" "$best_d"; then best="$name"', 'if ge "$d" "$best_d"; then best="$name"', alt_failures),
+        ("alt-not-lined-up", 'if ! why_not=$(lines_up "$out" "$master"); then', 'if ! why_not=$(:); then', alt_failures),
+        ("alts-after-failed-score", 'if [[ "$alts" == 1 && "$xrc" == 0 ]]; then', 'if [[ "$alts" == 1 ]]; then', alt_failures),
+        ("alts-on-row-3", 'row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1; }', 'row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1 1; }', alt_failures),
+        ("trace-silent","""printf 'trace: row %s: %s\\n' "${CUR_ROW:-?}" "${CMD[*]}" >&9;""", ":;", trace_failures),
         ("row10-no-prime",'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
         ("row10-short-wait", "LOAD_WAIT=5", "LOAD_WAIT=1", row10_prime_failures),
         ("row10-fdinfo-none", 'fdnote="fdinfo=not visible from the bench pod"', 'fdnote="fdinfo_busy=none"', row10_prime_failures),
@@ -864,7 +914,18 @@ def test_mutants(tmp):
          lambda sc, t, g: row10_fdinfo_failures(sc, t, g, ("oidn",))),
     ]:
         path = mutant_dir(tmp, name, old, new)
-        check(f"mutant {name} is caught by its behaviour check", bool(fn(path, tmp, "mut-" + name)))
+        behaviour.append((name, path, fn))
+
+    # each behaviour check runs the script for seconds (some wait out a stub hang): in parallel, each in its own directory
+    def caught(item):
+        name, path, fn = item
+        sub = os.path.join(tmp, "b-" + name)
+        os.makedirs(sub)
+        return name, bool(fn(path, sub, "mut-" + name))
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for name, ok in pool.map(caught, behaviour):
+            check(f"mutant {name} is caught by its behaviour check", ok)
 
 
 def build_apt_checks(df):
@@ -1440,7 +1501,11 @@ def size_failures(script, tmp, tag):
             bad.append(f"row{row}-{title}:no ffmpeg run")
         for l in lines:
             sizes = re.findall(r"(?:w=(\d+):h=(\d+)|scale=(\d+):(\d+):)", l)
-            if not want.search(l) or any((a or c, b or d) != (str(ow), str(oh)) for a, b, c, d in sizes):
+            if "r2-alt-" in l:
+                # a shader-then-bicubic alternative runs its shader at an intermediate size; the file it writes is the master's
+                if not sizes or (sizes[-1][0] or sizes[-1][2], sizes[-1][1] or sizes[-1][3]) != (str(ow), str(oh)):
+                    bad.append(f"row{row}-{title}-alt:{l[-90:]}")
+            elif not want.search(l) or any((a or c, b or d) != (str(ow), str(oh)) for a, b, c, d in sizes):
                 bad.append(f"row{row}-{title}:{l[-90:]}")
     return bad
 
@@ -1712,7 +1777,7 @@ def row9_failures(script, tmp, tag):
     return bad
 
 
-RUN_FILES = ["r2-shader.mkv", "r2-bicubic.mkv", "r3-shader.mkv", "r3-bicubic.mkv", "r4-shader.mkv", "r4-bicubic.mkv",
+RUN_FILES = ["r2-shader.mkv", "r2-bicubic.mkv", "r2-alt-ewa.mkv", "r2-alt-x2-bicubic.mkv", "r2-alt-lowtarget.mkv", "r3-shader.mkv", "r3-bicubic.mkv", "r4-shader.mkv", "r4-bicubic.mkv",
              "pan-fsr2.mkv", "pan-bicubic.mkv", "hwdec-on.mkv", "hwdec-off.mkv"]
 SHARED = ("results.jsonl", "tears_1080p_h264.mkv")
 
@@ -1830,12 +1895,20 @@ def argv_failures(script, tmp, tag):
     sh, bi = f"{run_dir}/r2-shader.mkv", f"{run_dir}/r2-bicubic.mkv"
     xp = [l for l in r2 if "xpsnr=" in l]
     pairs = [re.search(r" -i (\S+) -i (\S+) -lavfi ", l).groups() for l in xp]
-    if pairs != [(sh, master), (bi, master), (sh, master)]:
+    alt = {n: f"{run_dir}/r2-alt-{n}.mkv" for n in ALTS}
+    want_pairs = [(sh, master), (bi, master), (sh, master)]
+    for n in ALTS:  # each alternative is scored against the master, then the same bicubic control again
+        want_pairs += [(alt[n], master), (bi, master)]
+    if pairs != want_pairs:
         bad.append(f"row2-xpsnr-inputs:{pairs}")
     if any(PAIR not in l for l in xp):
         bad.append("row2-xpsnr-pairing-not-by-index")
     writes = [l for l in r2 if "-c:v ffv1" in l]
-    want_writes = [run_cmd(src, shader(1920, 858), sh), run_cmd(src, bicubic(1920, 858), bi)]
+    # the source is 640x286, so 2x is 1280x572 and 1.5x is 960x430 (even); every alternative ends at the master's 1920x858
+    want_writes = [run_cmd(src, shader(1920, 858), sh), run_cmd(src, bicubic(1920, 858), bi),
+                   run_cmd(src, ewa(1920, 858), alt["ewa"]),
+                   run_cmd(src, shader_bicubic(1280, 572, 1920, 858), alt["x2-bicubic"]),
+                   run_cmd(src, shader_bicubic(960, 430, 1920, 858), alt["lowtarget"])]
     if writes != [l.replace(FF, ff, 1) for l in want_writes]:
         bad.append(f"row2-writes:{writes}")
     fps = [l for l in r2 if "-f null -" in l and "xpsnr=" not in l]
@@ -1901,7 +1974,8 @@ def trace_failures(script, tmp, tag):
     bad = []
     w = World(tmp, tag)
     rc, out, err = w.run(["--rows", "2"], script=script, BENCH_TRACE="1")
-    if len([l for l in err.splitlines() if l.startswith("trace: row 2: ")]) != 6:
+    # fps, 2 writes, 3 scores and a chroma score, then 3 alternatives of a write and 2 scores each
+    if len([l for l in err.splitlines() if l.startswith("trace: row 2: ")]) != 15:
         bad.append(f"trace:{err[:120]}")
     rc, out, err = w.run(["--rows", "2"], script=script)
     if "trace:" in err or "trace:" in out:
@@ -1909,8 +1983,81 @@ def trace_failures(script, tmp, tag):
     return bad
 
 
+def alt_failures(script, tmp, tag):
+    """rev-zlqhh: FSRCNNX 360p to 1080p lost 0.69 dB to bicubic (run20). Row 2 also scores ewa, FSRCNNX at 2x then bicubic and
+    FSRCNNX at 1.5x then bicubic on the same fixture, against the same bicubic control, and prints each delta and the best of
+    all the paths. The alternatives are evidence: they never change the row's status (the +0.5 dB threshold on FSRCNNX does),
+    one that cannot be scored says so and the others still run, and rows 3 and 4 have none."""
+    bad = []
+
+    def row2(label, **env):
+        w = World(tmp, f"{tag}-{label}")
+        rc, out, err = w.run(["--rows", "2"], script=script, **env)
+        st, detail = results(out).get(2, ("", ""))
+        return w, st, detail
+
+    # FSRCNNX +10 dB over bicubic, every alternative below it: FSRCNNX is the best path
+    w, st, detail = row2("good", FAKE_XPSNR_ALT="ewa=34 x2-bicubic=31 lowtarget=36")
+    for want in ("xpsnr_delta=+10.00dB", "alt_ewa=+4.00dB", "alt_x2-bicubic=+1.00dB", "alt_lowtarget=+6.00dB", "best=fsrcnnx"):
+        if want not in detail:
+            bad.append(f"good:missing {want}:{detail[:200]}")
+    if st != "PASS":
+        bad.append(f"good:{st}")
+
+    # an alternative that beats FSRCNNX is named best, and the row still FAILs on FSRCNNX against its own threshold
+    w, st, detail = row2("swap", FAKE_XPSNR_SWAP="1", FAKE_XPSNR_ALT="ewa=41 x2-bicubic=39 lowtarget=43")
+    for want in ("xpsnr_delta=-10.00dB", "alt_ewa=+1.00dB", "alt_x2-bicubic=-1.00dB", "alt_lowtarget=+3.00dB", "best=lowtarget"):
+        if want not in detail:
+            bad.append(f"swap:missing {want}:{detail[:200]}")
+    if st != "FAIL":
+        bad.append(f"swap:{st}")
+
+    # nothing beats bicubic: it is the best path (a delta of 0 is its own score)
+    w, st, detail = row2("none", FAKE_XPSNR_SWAP="1", FAKE_XPSNR_ALT="ewa=39 x2-bicubic=38 lowtarget=37")
+    if "best=bicubic" not in detail or st != "FAIL":
+        bad.append(f"none:{st}:{detail[:200]}")
+
+    # a tie keeps the earlier path
+    w, st, detail = row2("tie", FAKE_XPSNR_ALT="ewa=40")
+    if "alt_ewa=+10.00dB" not in detail or "best=fsrcnnx" not in detail:
+        bad.append(f"tie:{detail[:200]}")
+
+    # a bad alternative never fails a passing row
+    w, st, detail = row2("worse", FAKE_XPSNR_ALT="ewa=20 x2-bicubic=20 lowtarget=20")
+    if st != "PASS" or "alt_ewa=-10.00dB" not in detail:
+        bad.append(f"worse:{st}:{detail[:200]}")
+
+    # one alternative without a score: named, never +0.00, never the best; the others are still scored
+    w, st, detail = row2("noscore", FAKE_XPSNR_FAIL_ON="r2-alt-x2-bicubic.mkv", FAKE_XPSNR_ALT="ewa=34 lowtarget=36")
+    if "alt_x2-bicubic=FAIL(" not in detail or "alt_x2-bicubic=+" in detail or "alt_ewa=+4.00dB" not in detail \
+            or "alt_lowtarget=+6.00dB" not in detail or st != "PASS":
+        bad.append(f"noscore:{st}:{detail[:200]}")
+
+    # an alternative whose write fails, or whose file does not line up with the master, is named and not scored
+    for label, env, alt, note in (("write", {"FAKE_FFV1_FAIL": "r2-alt-ewa"}, "ewa", "No space left"),
+                                  ("short", {"FAKE_FFV1_SHORT": "r2-alt-lowtarget"}, "lowtarget", "479 frames"),
+                                  ("size", {"FAKE_FFV1_BADSIZE": "r2-alt-x2-bicubic"}, "x2-bicubic", "1280x572")):
+        w, st, detail = row2(label, **env)
+        if f"alt_{alt}=FAIL(" not in detail or note not in detail or st != "PASS" or "xpsnr_delta=+10.00dB" not in detail:
+            bad.append(f"{label}:{st}:{detail[:240]}")
+        if any(f"r2-alt-{alt}.mkv" in l and "xpsnr=" in l for l in ffmpeg_log(w)):
+            bad.append(f"{label}:scored a file that does not line up")
+
+    # no FSRCNNX score, no alternatives: the row FAILs as before and runs nothing more
+    w, st, detail = row2("noxpsnr", FAKE_XPSNR_FAIL="1")
+    if st != "FAIL" or "alt_" in detail or any("r2-alt-" in l for l in ffmpeg_log(w)):
+        bad.append(f"noxpsnr:{st}:{detail[:120]}")
+
+    # rows 3 and 4 have none
+    w = World(tmp, tag + "-rows34")
+    rc, out, err = w.run(["--rows", "3,4"], script=script, BENCH_RUN_ID="r34")
+    if "alt_" in out or any("-alt-" in l for l in ffmpeg_log(w)):
+        bad.append("rows 3 and 4 ran an alternative")
+    return bad
+
+
 def test_scored_inputs(tmp):
-    for name, fn in (("argv", argv_failures), ("inputs", inputs_failures), ("trace", trace_failures)):
+    for name, fn in (("argv", argv_failures), ("inputs", inputs_failures), ("trace", trace_failures), ("alts", alt_failures)):
         got = fn(BENCH, tmp, name)
         check(f"scored inputs: {name}", not got, str(got))
 
@@ -2003,34 +2150,33 @@ def test_hermetic_api(tmp):
     res = results(out)
     check("a stream with no segment is a FAIL, not a 0x PASS", res.get(3, ("",))[0] == "FAIL" and res.get(12, ("",))[0] == "FAIL", str(res))
 
-    bad = token_failures(BENCH, tmp, "token")
-    check("the token is on curl's stdin, not its command line", not bad, str(bad))
-    bad = runfps_failures(BENCH, tmp, "runfps")
-    check("a failed ffmpeg run reaches the FAIL branch of rows 2 and 11", not bad, str(bad))
-    bad = size_failures(BENCH, tmp, "sizes")
-    check("rows 2, 3, 4, 8 and 11 scale to the master's letterboxed size, a 16:9 clip keeps 16:9", not bad, str(bad))
-    bad = xpsnr_failures(BENCH, tmp, "xpsnr")
-    check("a failed xpsnr is FAIL 'xpsnr failed' on rows 2, 3, 4, 8 and 9, never +0.00 dB", not bad, str(bad))
-    bad = timeout_failures(BENCH, tmp, "timeouts")
-    check("every measured ffmpeg runs under timeout --kill-after=10 (BENCH_RUN_TIMEOUT, default 240) and a timeout is FAIL 'timeout after Ns'", not bad, str(bad))
-    bad = row5_budget_failures(BENCH, tmp, "row5-budget")
-    check("row 5 runs once per clip and stops after 48 frames; other rows are not cut", not bad, str(bad))
-    bad = item_failures(BENCH, tmp, "items")
-    check("an item lookup HTTP error is its own FAIL, distinct from 'not in the library'", not bad, str(bad))
-    bad = signed_failures(BENCH, tmp, "signed")
-    check("rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-", not bad, str(bad))
-    bad = chroma_failures(BENCH, tmp, "chroma")
-    check("rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not", not bad, str(bad))
-    bad = binary_failures(BENCH, tmp, "binary")
-    check("rows 2, 3 and 4 run the stock ffmpeg (as the shim) and row 8 the patched one, in the plan and in commands.log", not bad, str(bad))
-    bad = row9_failures(BENCH, tmp, "row9")
-    check("row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it", not bad, str(bad))
-    bad = stale_output_failures(BENCH, tmp, "stale")
-    check("a row scores only files this run wrote: a fresh run-<id> directory (a used id is refused), any failed write is FAIL, a missing or old file is FAIL 'not written by this run'", not bad, str(bad))
-    bad = row10_prime_failures(BENCH, tmp, "row10-prime")
-    check("row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod", not bad, str(bad))
-    bad = row10_fdinfo_failures(BENCH, tmp, "row10-fd")
-    check("row 10 finds the transcode of the stock and of the oidn ffmpeg", not bad, str(bad))
+    # each of these runs the script for seconds, some waiting out a stub hang: in parallel, each in its own directory
+    table = [
+        (token_failures, "token", "the token is on curl's stdin, not its command line"),
+        (runfps_failures, "runfps", "a failed ffmpeg run reaches the FAIL branch of rows 2 and 11"),
+        (size_failures, "sizes", "rows 2, 3, 4, 8 and 11 scale to the master's letterboxed size, a 16:9 clip keeps 16:9"),
+        (xpsnr_failures, "xpsnr", "a failed xpsnr is FAIL 'xpsnr failed' on rows 2, 3, 4, 8 and 9, never +0.00 dB"),
+        (timeout_failures, "timeouts", "every measured ffmpeg runs under timeout --kill-after=10 (BENCH_RUN_TIMEOUT, default 240) and a timeout is FAIL 'timeout after Ns'"),
+        (row5_budget_failures, "row5-budget", "row 5 runs once per clip and stops after 48 frames; other rows are not cut"),
+        (item_failures, "items", "an item lookup HTTP error is its own FAIL, distinct from 'not in the library'"),
+        (signed_failures, "signed", "rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-"),
+        (chroma_failures, "chroma", "rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not"),
+        (binary_failures, "binary", "rows 2, 3 and 4 run the stock ffmpeg (as the shim) and row 8 the patched one, in the plan and in commands.log"),
+        (row9_failures, "row9", "row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it"),
+        (stale_output_failures, "stale", "a row scores only files this run wrote: a fresh run-<id> directory (a used id is refused), any failed write is FAIL, a missing or old file is FAIL 'not written by this run'"),
+        (row10_prime_failures, "row10-prime", "row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod"),
+        (row10_fdinfo_failures, "row10-fd", "row 10 finds the transcode of the stock and of the oidn ffmpeg"),
+    ]
+
+    def judged(item):
+        fn, tag, _ = item
+        sub = os.path.join(tmp, "c-" + tag)
+        os.makedirs(sub)
+        return fn(BENCH, sub, tag)
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for (_, _, msg), bad in zip(table, pool.map(judged, table)):
+            check(msg, not bad, str(bad))
 
 
 def test_token_rejected(tmp):
@@ -2402,12 +2548,19 @@ def main():
         print("no bash")
         return 1
     with tempfile.TemporaryDirectory() as tmp:
-        for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
-                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_no_fsr2, test_render_node_pick, test_row_6, test_row_5,
-                     test_shared_files, test_scored_inputs):
+        parts = (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
+                 test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_no_fsr2,
+                 test_render_node_pick, test_row_6, test_row_5, test_shared_files, test_scored_inputs)
+
+        def go(part):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
             part(sub)
+
+        # the parts share nothing but the check() counters: the two long ones (mutants, hermetic API) overlap the rest
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for f in [pool.submit(go, p) for p in parts]:
+                f.result()
         dockerfile_checks(tmp)
     print(f"{PASSES} checks passed, {len(FAILS)} failed")
     return 1 if FAILS else 0

@@ -1004,7 +1004,7 @@ never `PASS`.
 | Row | What | Must pass |
 |---|---|---|
 | 1 | Vendor record | vendor=intel; render node (picked at run time: vendor 0x8086 in `/dev/dri`, else the only node); Vulkan `vk:0` (index; name match `vk:Intel` when several GPU nodes are visible); no NVIDIA-only level; fsr2 offered; no nvenc/cuda in any command |
-| 2 | FSRCNNX 360p to 1080p, software decode | fps >= 100; xpsnr >= bicubic + 0.5 dB |
+| 2 | FSRCNNX 360p to 1080p, software decode | fps >= 100; xpsnr >= bicubic + 0.5 dB (the detail also lists `alt_<path>` deltas and `best=`, see "Row 2, sources under 480p"; they never change the status) |
 | 3 | FSRCNNX 720p to 1080p | end-to-end fps >= 1.2x source; xpsnr >= bicubic + 0.3 dB |
 | 4 | FSRCNNX 1080p to 2160p | scaler-only fps >= 34; end-to-end with QSV >= 1.2x; xpsnr >= bicubic + 0.3 dB |
 | 5 | Neural (ORT on OpenVINO) | a 360p neural stream's session record says `openvino`, not CPU (`FAIL` otherwise); fps measured at 360p and 720p; slower than real time is a valid result (`MANUAL`) |
@@ -1036,6 +1036,41 @@ numbers, when a scored file's size or frame count differs from the master's. xps
 frame k (both inputs renumbered with `setpts=N`), not by pts, and an infinite score (an identical pair) is
 999 dB, not 0. Scores from before this change paired by pts and are not comparable (run16 scored -27 dB
 where a hand run of the same chains scored -0.47 dB).
+
+**Row 2, sources under 480p (rev-zlqhh).** run20 scored FSRCNNX 360p to 1080p at -0.69 dB against
+bicubic (3.0x), while 720p to 1080p (1.5x) scored +0.80 dB and 1080p to 2160p (2x) +0.73 dB. Figures
+from the bead, not from a record in the repo. The 2x network meets a 3x target by scaling its output
+up again, and the engine has no guard for that high ratio: the `SrMinScaleFactor` bypass in
+`UpscaleEngine.cs` only covers the low end. Row 2 therefore scores, on the same 360p fixture, against
+the same bicubic control and master and by frame index (frame k against frame k), after the FSRCNNX
+verdict, whose `+0.5 dB` threshold is unchanged:
+
+| Path | Chain |
+|---|---|
+| `fsrcnnx` | the row's candidate: FSRCNNX straight to 1080p |
+| `bicubic` | the control itself, 0 dB by definition |
+| `ewa` | libplacebo `ewa_lanczos`, no shader |
+| `x2-bicubic` | FSRCNNX to 2x the source (720p), then `scale=...:flags=bicubic` to the master's size |
+| `lowtarget` | FSRCNNX to 1.5x the source (540p), then `scale=...:flags=bicubic` to the master's size |
+
+The detail reads `alt_ewa=<d>dB alt_x2-bicubic=<d>dB alt_lowtarget=<d>dB best=<path>`. `best` is the
+highest delta of all five, the simpler path on a tie. It ranks quality only, not fps: the detail
+prints `best=<path> (quality only, not fps)`, and the fps floor is judged on FSRCNNX alone. An alternative that fails to write, does not
+line up with the master (size or frame count) or has no score reads `alt_<path>=FAIL(<why>)` and is
+never the best. The alternatives never change the row's status and do not run when the FSRCNNX
+score itself failed. `--dry-run` lists their commands.
+
+Status: row 2 still FAILs on FSRCNNX until routing exists. The break-even source height is not
+measured: the fixtures are 360, 720, 1080 and 2160p, so two ratios (3.0x and 1.5x) bracket it, and
+`lowtarget` at 1.5x shows only whether a 2x network shrunk back down holds at this source. Routing
+sources under the break-even to the best path in the Intel upscaler selection, and a threshold set
+from the evidence, wait for an Arc run of row 2 (`jellyfin-plus-bench`, suspended): record the
+`alt_` figures below from `results.jsonl`, add a 480p or 540p fixture if `best` is not clear-cut,
+then add an Intel-only source-height guard beside the `SrMinScaleFactor` bypass.
+
+| Run | `fsrcnnx` | `ewa` | `x2-bicubic` | `lowtarget` | `best` |
+|---|---|---|---|---|---|
+| run20 | -0.69 dB | not measured | not measured | not measured | not measured |
 
 **Inputs the owner supplies.** The lossless clips (`<title>_{360,720,1080,2160}p.mkv`, `still_720p.png`,
 `pan_720p.mkv`, `pan_1080p.mkv`), an admin API token for the test Jellyfin, and an ONNX model for
