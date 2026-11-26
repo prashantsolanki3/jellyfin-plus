@@ -86,6 +86,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             NeuralDevice();
             NeuralRouting();
             AutoNeuralCache();
+            LowResRoute();
             IntelHardwareDecode();
             AccessHardwareDecode();
             Fdinfo();
@@ -1246,18 +1247,23 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("Intel, only an ONNX level asked for: not enhanced", !plan.Act && plan.Status == "not-requested", plan.Status);
             Check("Intel, only an ONNX level asked for: the reason says why", plan.Reason.Contains("neural realesr-anime-x2 not run: not measured on Intel"), plan.Reason);
 
-            // The withhold is the maintainer's condition: it stays until the OpenVINO path is MEASURED on an Arc, even though
-            // PR 5's path is present (provider file there, ffmpeg lists the device). Lifting it (a bench result) is one flag.
+            // The withhold stays until the admin sets IntelNeuralAllowed (default off), even though PR 5's path is present
+            // (provider file there, ffmpeg lists the device): bench run22 measured about 1.4 fps at 360p on an A380.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.Settings = rig;
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
-            Check("Intel, not measured: the flag is off by default and the ONNX level is withheld", !UpscaleEngine.IntelOnnxMeasured && plan.GpuWithheldUnmeasured == "neural realesr-anime-x2" && !plan.NeuralApplied);
-            UpscaleEngine.IntelOnnxMeasured = true;
+            Check("Intel, IntelNeuralAllowed is off by default in both settings classes", !new UpscaleSettings().IntelNeuralAllowed && !new Jellyfin.Plugin.Plus.Configuration.PluginConfiguration().IntelNeuralAllowed);
+            Check("Intel, IntelNeuralAllowed off: the ONNX level is withheld", plan.GpuWithheldUnmeasured == "neural realesr-anime-x2" && !plan.NeuralApplied);
+            Equal("Intel, IntelNeuralAllowed off: the withhold reason is unchanged", "not measured on Intel", UpscaleEngine.IntelWithholdReason("Neural", "realesr-anime-x2"));
+            UpscaleSettings allowed = RigSettings("auto");
+            allowed.IntelNeuralAllowed = true;
+            UpscaleEngine.Settings = allowed;
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
             record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
-            Check("Intel, measured (flag on): an ONNX neural level is not withheld", plan.GpuWithheld == null && plan.GpuWithheldUnmeasured == null && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
-            Check("Intel, measured (flag on): and its description does not claim CUDA", record.Summary.Contains("this server's GPU is Intel, so no CUDA and the CPU provider") && !record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
-            UpscaleEngine.IntelOnnxMeasured = false;
+            Check("Intel, IntelNeuralAllowed on: an ONNX neural level is not withheld", plan.GpuWithheld == null && plan.GpuWithheldUnmeasured == null && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
+            Check("Intel, IntelNeuralAllowed on: and its description does not claim CUDA", record.Summary.Contains("this server's GPU is Intel, so no CUDA and the CPU provider") && !record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            Check("Intel, IntelNeuralAllowed on: the NVIDIA-only levels stay withheld", UpscaleEngine.IntelWithholdReason("Neural", "dlpp-2") == "needs NVIDIA");
+            UpscaleEngine.Settings = rig;
 
             GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
             UpscaleEngine.Settings = rig;
@@ -1701,7 +1707,10 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                     UpscaleEngine.StartFsr2Probe();
                 }
 
-                UpscaleEngine.Plan cpu = HwDecide(marked, HwSettings(true), PlainHwJob(pair.Value));
+                // The neural plan has to reach Decide's hardware-decode step, so the ONNX level must not be withheld on Intel.
+                UpscaleSettings blockedCfg = HwSettings(true);
+                blockedCfg.IntelNeuralAllowed = true;
+                UpscaleEngine.Plan cpu = HwDecide(marked, blockedCfg, PlainHwJob(pair.Value));
                 string tag = " [" + pair.Key + "]";
                 Check("a CPU-side step keeps software decode" + tag, cpu.Act && !cpu.HardwareDecode, cpu.Status + ": " + cpu.Reason + " / " + cpu.HardwareDecodeReason);
                 Check("the reason names the step" + tag, cpu.HardwareDecodeReason.StartsWith("software decode: the plan has a step that cannot follow VA-API decode (") && cpu.HardwareDecodeReason.Contains(pair.Key == "atadenoise" ? "denoise" : pair.Key), cpu.HardwareDecodeReason);
@@ -2046,6 +2055,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             Encoder = "auto",
             GpuVendor = vendor,
+            IntelNeuralAllowed = true, // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
             NeuralMaxSourceHeight = maxHeight,
             NeuralModelDirectory = Path.Combine(NeuralRig(), weights ? "models" : "empty"),
         };
@@ -2073,7 +2083,6 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         // Which ort device the node asks for. Intel only changes anything; every other server's node is the one it always was.
         private static void NeuralDevice()
         {
-            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Av1QsvProbeSource = _ => true;
@@ -2248,7 +2257,6 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;
-            UpscaleEngine.IntelOnnxMeasured = false;
             UpscaleEngine.OrtOpenVinoProbeSource = null;
             UpscaleEngine.ResetOrtProbe();
             File.Delete(Path.Combine(NeuralRig(), "ffmpeg"));
@@ -2258,7 +2266,6 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         // The auto-picked level is looked up once per directory per TTL, not stat'ed on every plan.
         private static void AutoNeuralCache()
         {
-            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
             int stats = 0;
             var present = new HashSet<string>(StringComparer.Ordinal);
             long now = 1000;
@@ -2299,7 +2306,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 UpscaleEngine.Av1QsvProbeSource = _ => true;
                 UpscaleEngine.OrtOpenVinoProbeSource = () => true;
                 SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
-                var routed = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto", NeuralMaxSourceHeight = 480, NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                var routed = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto", IntelNeuralAllowed = true, NeuralMaxSourceHeight = 480, NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
                 // A session that names the level never goes through the auto pick, so its stat count is
                 // the cost of planning alone; an auto-picked session must cost exactly the same.
                 DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080", "neural", "realesr-anime-x2");
@@ -2331,7 +2338,6 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         // NeuralMaxSourceHeight: what it does for each source height, and that 0 does nothing.
         private static void NeuralRouting()
         {
-            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Av1QsvProbeSource = _ => true;
@@ -2461,6 +2467,177 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("Intel, 480, 360p: the chain runs the network on OpenVINO before the upload", chain.Contains("format=gbrpf32le,ort=model=" + X2() + ":device=openvino,format=yuv420p") && chain.IndexOf("ort=", StringComparison.Ordinal) < chain.IndexOf("hwupload", StringComparison.Ordinal), chain);
             Check("Intel, 480, 360p: and never CUDA, nvenc or vaapi", !chain.Contains("cuda") && !chain.Contains("nvenc") && !chain.Contains("vaapi"), chain);
 
+            ResetNeuralHarness();
+        }
+
+        // A shader directory with just the files the SR levels resolve to, so Decide can name a level without the real shaders.
+        private static string ShaderRig()
+        {
+            string dir = Path.Combine(Rig(), "shaders");
+            Directory.CreateDirectory(dir);
+            foreach (string file in new[] { "FSRCNNX_x2_8-0-4-1.glsl", "FSRCNNX_x2_16-0-4-1.glsl", "FSRCNN_x2_r1_32-0-2.glsl", "ravu-zoom-r3.glsl", "Anime4K_Upscale_CNN_x2_M.glsl" })
+            {
+                File.WriteAllText(Path.Combine(dir, file), "x");
+            }
+
+            return dir;
+        }
+
+        private static UpscaleSettings LowResSettings(string vendor = "auto")
+        {
+            UpscaleSettings cfg = RigSettings(vendor);
+            cfg.ShaderDirectory = ShaderRig();
+            cfg.ShaderCacheDirectory = string.Empty;
+            cfg.Deband = false;
+            return cfg;
+        }
+
+        private static UpscaleEngine.Plan LowResDecide(FakeGpuEnvironment env, UpscaleSettings cfg, int height, params string[] options)
+        {
+            return DecideOn(env, cfg, height * 16 / 9, height, options);
+        }
+
+        // The Intel low-res route: FSRCNNX to round_even(source * scale), then a bicubic scale to the target.
+        private static void LowResRoute()
+        {
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.DrmVulkanProbeSource = n => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
+            SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
+            string[] fsr = { "upscale", "1080", "sr", "fsrcnnx" };
+            const string Text = "low-res route: fsrcnnx to 1.5x then bicubic";
+            FakeGpuEnvironment intel() => Machine("renderD128", "0x8086");
+            FakeGpuEnvironment nvidia() => Machine("renderD128", "0x10de");
+
+            // The settings: defaults in both copies, and across the settings JSON boundary.
+            var configuration = new Jellyfin.Plugin.Plus.Configuration.PluginConfiguration();
+            var mirror = new UpscaleSettings();
+            Check("low-res route: the default max height is 480 in both copies", configuration.IntelLowResMaxSourceHeight == 480 && mirror.IntelLowResMaxSourceHeight == 480);
+            Check("low-res route: the default scale is 1.5 in both copies", configuration.IntelLowResIntermediateScale == 1.5 && mirror.IntelLowResIntermediateScale == 1.5);
+            var json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            UpscaleSettings parsed = JsonSerializer.Deserialize<UpscaleSettings>("{\"IntelLowResMaxSourceHeight\":360,\"IntelLowResIntermediateScale\":1.25,\"IntelNeuralAllowed\":true}", json);
+            Check("low-res route: the settings JSON carries all three across the boundary", parsed.IntelLowResMaxSourceHeight == 360 && parsed.IntelLowResIntermediateScale == 1.25 && parsed.IntelNeuralAllowed);
+            Check("low-res route: settings JSON without them keeps the defaults", JsonSerializer.Deserialize<UpscaleSettings>("{\"Enabled\":true}", json).IntelLowResMaxSourceHeight == 480);
+
+            // On by default, on an Intel GPU, for a 360p source asking for 1080p.
+            UpscaleEngine.Plan plan = LowResDecide(intel(), LowResSettings(), 360, fsr);
+            Check("Intel 360p: the plan acts and upscales to 1920x1080", plan.Act && plan.UpscaleApplied && plan.Width == 1920 && plan.Height == 1080, plan.Status + ": " + plan.Reason);
+            Check("Intel 360p: the intermediate size is 960x540", plan.LowResMidWidth == 960 && plan.LowResMidHeight == 540, plan.LowResMidWidth + "x" + plan.LowResMidHeight);
+            Equal("Intel 360p: the route text", Text, plan.LowResRoute);
+            string chain = UpscaleEngine.BuildChain(plan);
+            Check("Intel 360p: libplacebo runs to the intermediate size", chain.Contains(",libplacebo=w=960:h=540:upscaler="), chain);
+            Check("Intel 360p: the chain keeps the shader and ends in the bicubic scale to the target",
+                chain.Contains("custom_shader_path=") && chain.EndsWith(":format=yuv420p,hwdownload,format=yuv420p,scale=1920:1080:flags=bicubic,format=yuv420p"), chain);
+            Check("Intel 360p: libplacebo never names the target size", !chain.Contains("libplacebo=w=1920"), chain);
+            SessionRecord record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
+            Equal("Intel 360p: the record carries the route", Text, record.LowResRoute);
+            Check("Intel 360p: the summary says so", record.Summary.Contains(Text), record.Summary);
+            record.PlaySessionId = "harness-lowres-" + Guid.NewGuid().ToString("N");
+            UpscaleEngine.Record(record);
+            Check("Intel 360p: the session JSON carries LowResRoute", PatcherHost.SessionJson(record.PlaySessionId).Contains("\"LowResRoute\":\"" + Text + "\""));
+
+            // Hardware decode: the same node after the download, in the surface format.
+            Equal("Intel hardware decode, literal plan: the chain",
+                "hwmap=derive_device=vulkan,libplacebo=w=960:h=540:upscaler=ewa_lanczos,hwdownload,format=nv12,scale=1920:1080:flags=bicubic,format=nv12",
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, HardwareDecode = true, HardwareDecodeFormat = "nv12", LowResMidWidth = 960, LowResMidHeight = 540 }));
+
+            // The boundary: below the max it runs, at the max it does not, and 0 turns it off.
+            plan = LowResDecide(intel(), LowResSettings(), 479, fsr);
+            Check("Intel 479p: the route runs at round_even(479 * 1.5) = 718", plan.LowResRoute == Text && plan.LowResMidHeight == 718 && plan.LowResMidWidth == 1276, plan.LowResMidWidth + "x" + plan.LowResMidHeight);
+            plan = LowResDecide(intel(), LowResSettings(), 480, fsr);
+            Check("Intel 480p: the route does not run, the chain is the old one", plan.LowResRoute == null && plan.LowResMidHeight == 0 && !UpscaleEngine.BuildChain(plan).Contains("bicubic") && UpscaleEngine.BuildChain(plan).Contains("libplacebo=w=1920:h=1080:upscaler="), plan.Status + ": " + plan.Reason);
+            UpscaleSettings off = LowResSettings();
+            off.IntelLowResMaxSourceHeight = 0;
+            plan = LowResDecide(intel(), off, 360, fsr);
+            Check("Intel 360p, max height 0: off", plan.LowResRoute == null && !UpscaleEngine.BuildChain(plan).Contains("bicubic"));
+            UpscaleSettings raised = LowResSettings();
+            raised.IntelLowResMaxSourceHeight = 720;
+            plan = LowResDecide(intel(), raised, 540, fsr);
+            Check("Intel 540p, max height raised to 720: runs", plan.LowResRoute == Text && plan.LowResMidHeight == 810, plan.LowResMidHeight.ToString());
+            Check("Intel 540p: still below the 1080p target, so the route holds", plan.LowResMidHeight < plan.Height);
+            raised.SrMinScaleFactor = 0; // so the ratio bypass does not decide this one
+            plan = LowResDecide(intel(), raised, 540, "upscale", "720", "sr", "fsrcnnx");
+            Check("Intel 540p to 720p: an intermediate size of 810 is not below the target, so no route", plan.Height == 720 && plan.SrLevel == "fsrcnnx" && plan.LowResRoute == null, plan.Height + " " + plan.SrLevel + " " + plan.LowResRoute);
+
+            // Levels: all three FSRCNNX ones, nothing else.
+            foreach (string level in new[] { "fsrcnnx", "fsrcnnx-heavy", "fsrcnnx-max" })
+            {
+                plan = LowResDecide(intel(), LowResSettings(), 360, "upscale", "1080", "sr", level);
+                Check("Intel 360p, sr " + level + ": the route runs", plan.LowResRoute == Text && plan.SrLevel == level, plan.SrLevel + " / " + plan.LowResRoute);
+            }
+
+            foreach (string level in new[] { "off", "ravu-zoom", "anime4k-m" })
+            {
+                plan = LowResDecide(intel(), LowResSettings(), 360, "upscale", "1080", "sr", level);
+                Check("Intel 360p, sr " + level + ": no route and no bicubic node", plan.LowResRoute == null && !UpscaleEngine.BuildChain(plan).Contains("bicubic"), plan.SrLevel + " / " + plan.LowResRoute);
+            }
+
+            plan = LowResDecide(intel(), LowResSettings(), 360, "upscale", "360", "sr", "fsrcnnx");
+            Check("Intel 360p, target the same as the source: no upscale and no route", !plan.UpscaleApplied && plan.LowResRoute == null && plan.LowResMidHeight == 0);
+
+            // The scale is clamped to 1.0 to 2.0 when read, because the settings API accepts anything.
+            foreach (var pair in new[] { (0.5, 360), (1.0, 360), (2.0, 720), (3.0, 720), (double.NaN, 540), (-1.0, 360) })
+            {
+                UpscaleSettings scaled = LowResSettings();
+                scaled.IntelLowResIntermediateScale = pair.Item1;
+                plan = LowResDecide(intel(), scaled, 360, fsr);
+                Check("Intel 360p, scale " + pair.Item1.ToString(System.Globalization.CultureInfo.InvariantCulture) + " is read as " + UpscaleEngine.LowResScale(scaled).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    plan.LowResMidHeight == pair.Item2 && plan.LowResRoute != null, plan.LowResMidHeight + " " + plan.LowResRoute);
+            }
+
+            UpscaleSettings fine = LowResSettings();
+            fine.IntelLowResIntermediateScale = 1.25;
+            plan = LowResDecide(intel(), fine, 360, fsr);
+            Check("Intel 360p, scale 1.25: the text names it", plan.LowResRoute == "low-res route: fsrcnnx to 1.25x then bicubic" && plan.LowResMidHeight == 450, plan.LowResRoute + " " + plan.LowResMidHeight);
+
+            // A neural or game pass: the route stays out of the way.
+            UpscaleSettings neural = NeuralSettings("auto", 0);
+            neural.ShaderDirectory = ShaderRig();
+            neural.ShaderCacheDirectory = string.Empty;
+            neural.Deband = false;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
+            plan = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), neural, 640, 360, "upscale", "1080", "sr", "fsrcnnx", "neural", "realesr-anime-x2");
+            Check("Intel 360p with a neural pass: it ran, and there is no route", plan.NeuralApplied && plan.LowResRoute == null && !UpscaleEngine.BuildChain(plan).Contains("bicubic"), plan.Status + ": " + plan.Reason);
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            string marker = Path.Combine(Rig(), "fsr2-nocuda");
+            UseFsr2Probe(Fsr2Passed);
+            GpuDetector.UseEnvironment(WithFile(intel(), marker));
+            UpscaleEngine.Settings = LowResSettings();
+            UpscaleEngine.StartFsr2Probe();
+            plan = DecideOn(WithFile(intel(), marker), LowResSettings(), 640, 360, "upscale", "1080", "sr", "fsrcnnx", "game", "fsr2");
+            Check("Intel 360p with fsr2: it ran, and there is no route", plan.GameApplied && plan.LowResRoute == null && !UpscaleEngine.BuildChain(plan).Contains("bicubic"), plan.Status + ": " + plan.Reason);
+
+            // Intel only: NVIDIA, no GPU and a vendor chosen that is not there build exactly what they built with the route off.
+            foreach (string vendor in new[] { "auto", "nvidia", "none" })
+            {
+                foreach (FakeGpuEnvironment env in new[] { nvidia(), Machine() })
+                {
+                    UpscaleSettings routeOn = LowResSettings(vendor);
+                    UpscaleSettings routeOff = LowResSettings(vendor);
+                    routeOff.IntelLowResMaxSourceHeight = 0;
+                    UpscaleEngine.Plan routed = LowResDecide(env, routeOn, 360, fsr);
+                    string routedChain = UpscaleEngine.BuildChain(routed);
+                    UpscaleEngine.Plan unrouted = LowResDecide(env, routeOff, 360, fsr);
+                    string tag = " [GpuVendor=" + vendor + ", " + (env.Nodes.Count == 0 ? "no GPU" : "NVIDIA node") + "]";
+                    Equal("non-Intel 360p: the chain is byte-identical with the route off" + tag, UpscaleEngine.BuildChain(unrouted), routedChain);
+                    Check("non-Intel 360p: no route, no bicubic node, no record key" + tag,
+                        routed.LowResRoute == null && routed.LowResMidHeight == 0 && !routedChain.Contains("bicubic") && UpscaleEngine.Describe(null, routed, routed.Status, routed.Reason).LowResRoute == null);
+                }
+            }
+
+            UpscaleEngine.Plan nv = LowResDecide(nvidia(), LowResSettings(), 360, fsr);
+            SessionRecord nvRecord = UpscaleEngine.Describe(null, nv, nv.Status, nv.Reason);
+            nvRecord.PlaySessionId = "harness-lowres-nv-" + Guid.NewGuid().ToString("N");
+            UpscaleEngine.Record(nvRecord);
+            Check("NVIDIA 360p: the session JSON gains no LowResRoute key", !PatcherHost.SessionJson(nvRecord.PlaySessionId).Contains("LowResRoute"));
+            Check("NVIDIA 360p: the summary says nothing of it", !nvRecord.Summary.Contains("low-res route"), nvRecord.Summary);
+            Check("NVIDIA 360p: libplacebo is still given the target size", UpscaleEngine.BuildChain(nv).Contains("libplacebo=w=1920:h=1080:upscaler="));
+
+            // An Intel server whose GPU vendor is set to something else is not an Intel path either.
+            plan = LowResDecide(intel(), LowResSettings("nvidia"), 360, fsr);
+            Check("Intel node, GpuVendor=nvidia: no route", plan.LowResRoute == null && !UpscaleEngine.BuildChain(plan).Contains("bicubic"), plan.LowResRoute);
+
+            UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe();
             ResetNeuralHarness();
         }
 
