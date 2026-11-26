@@ -550,7 +550,7 @@ exit 0
 # 1080p shape doubled, which is 3840x1716), wide_ is a 16:9 title, any other clip is unreadable.
 FFPROBE_STUB = r'''#!/bin/sh
 case "$*" in
-*r_frame_rate*) echo 24/1;;
+*r_frame_rate*) echo "${FAKE_SRC_FPS:-24/1}";;
 *packet=pts_time*) echo 0.000000; echo 0.041667; echo 0.083333;;
 *nb_read_packets*)
     # a file the ffmpeg stub wrote says its own size and frame count; a master is 480 frames of its clip's size
@@ -908,7 +908,15 @@ def test_mutants(tmp):
         ("neural-skip-on-error", "nc_fail() { NC_STATUS=FAIL;", "nc_fail() { NC_STATUS=SKIP;", neural_class_failures),
         ("neural-skip-when-fast", "NC_STATUS=MANUAL", "NC_STATUS=SKIP", neural_class_failures),
         ("neural-fps-missing-from-reason", "measured $NM_F360/$NM_F720 fps below", "measured fps below", neural_class_failures),
-        ("neural-only-360p-judged", ' || ! ge "$NM_F720" "$s720"', "", neural_class_failures),
+        ("neural-only-360p-judged", '! ge "$NM_F720" "$s720" || r720=1', 'r720=$r360', neural_class_failures),
+        ("neural-only-720p-judged", '! ge "$NM_F360" "$s360" || r360=1', 'r360=$r720', neural_class_failures),
+        ("neural-mixed-is-skip", 'elif [[ "$r360$r720" == 10 ]]; then', 'elif false; then', neural_class_failures),
+        ("neural-mixed720-is-skip", 'elif [[ "$r360$r720" == 01 ]]; then', 'elif false; then', neural_class_failures),
+        ("neural-src-fps-unchecked", 'if ! ge "${s360:-0}" 0.01 || ! ge "${s720:-0}" 0.01; then', 'if false; then', neural_class_failures),
+        ("row5-cpu-overwritten", 'if [[ "$dev" == cpu ]]; then\n            # the session itself', 'if false; then\n            # the session itself', row5_cpu_failures),
+        ("row6-shader-check-after-withheld", 'if [[ "$applied" == true || ( -n "$routing" && "$routing" != *"NOT run"* ) ]]; then record 6 FAIL "$failnote"; return; fi', ':', row6_shader_failures),
+        ("row6-chosen-not-checked", '( -n "$routing" && "$routing" != *"NOT run"* ) ]]; then record 6 FAIL', '( -n "" ) ]]; then record 6 FAIL', row6_shader_failures),
+        ("row6-applied-not-checked", 'if [[ "$applied" == true || ( -n', 'if [[ "$applied" == never || ( -n', row6_shader_failures),
         ("neural-cpu-fallback-skipped", '[[ "$NM_ST360$NM_ST720" != *CPU_FALLBACK* ]] ||', ": ||", neural_class_failures),
         ("chroma-unchecked", 'ge "$cu" "$CHROMA_XPSNR_MIN" || status=FAIL', ':', chroma_failures),
         ("signed-dropped", 'printf "%+.2f\\n", c - b', 'printf "%.2f\\n", c - b', signed_failures),
@@ -2647,6 +2655,8 @@ CONFIG_WITHHELD = {"config": {"NeuralAllowed": True, "NeuralMaxSourceHeight": 0,
 # the stub clips are 24 fps and 240 frames: 20 s is 12 fps, 40 s is 6 fps, the default 2 s is 120 fps
 SLOW = {"FAKE_RTIME_360": "20", "FAKE_RTIME_720": "40"}
 SLOW_REASON = re.compile(r"^withheld on Intel: measured 12\.00/6\.00 fps below real time \(level_zero_loader=(present|MISSING|UNKNOWN)\)")
+MIXED_360_REASON = "neural reaches real time on Intel at 360p (120.00 fps; 720p 6.00 fps below); review IntelNeuralAllowed"
+MIXED_720_REASON = "neural reaches real time on Intel at 720p (120.00 fps; 360p 12.00 fps below); review IntelNeuralAllowed"
 CPU_WARN = "OpenVINO execution provider unavailable (Device GPU is not available), using CPU"
 
 
@@ -2658,35 +2668,66 @@ def neural_world(script, tmp, tag, row, scenario=None, **env):
 
 
 def neural_class_failures(script, tmp, tag):
-    """Rows 5 and 6 with neural withheld: slow is SKIP with both fps, fast is MANUAL, an error is FAIL (never SKIP)."""
+    """Rows 5 and 6 with neural withheld: all below real time is SKIP with both fps, any at real time is MANUAL, an error is FAIL (never SKIP)."""
     bad = []
     for row in (5, 6):
         for label, scn, env, want in [
             ("slow", WITHHELD, SLOW, "SKIP"),
-            ("slow720", WITHHELD, {"FAKE_RTIME_720": "40"}, "SKIP"),
+            ("mixed720-slow", WITHHELD, {"FAKE_RTIME_720": "40"}, "MANUAL"),
+            ("mixed360-slow", WITHHELD, {"FAKE_RTIME_360": "20"}, "MANUAL"),
             ("fast", WITHHELD, {}, "MANUAL"),
             ("config-slow", CONFIG_WITHHELD, SLOW, "SKIP"),
             ("nobench", WITHHELD, {"FAKE_NO_BENCH": "1"}, "FAIL"),
             ("cpu", WITHHELD, {"FAKE_ORT_WARN": CPU_WARN}, "FAIL"),
             ("ffmpeg-fail", WITHHELD, {"FAKE_FFMPEG_FAIL": "1"}, "FAIL"),
+            ("nosrc-fps", WITHHELD, {"FAKE_SRC_FPS": "0/0"}, "FAIL"),
         ]:
             w, (st, detail) = neural_world(script, tmp, f"{tag}-{row}-{label}", row, scn, **env)
             if st != want:
                 bad.append(f"row{row}-{label}:{st}")
             elif label == "slow" and not SLOW_REASON.match(detail):
                 bad.append(f"row{row}-reason:{detail[:90]}")
-            elif label == "slow720" and "measured 120.00/6.00 fps below real time" not in detail:
-                bad.append(f"row{row}-reason720:{detail[:90]}")
+            elif label == "mixed720-slow" and not detail.startswith(MIXED_360_REASON):
+                bad.append(f"row{row}-mixed720-reason:{detail[:90]}")
+            elif label == "mixed360-slow" and not detail.startswith(MIXED_720_REASON):
+                bad.append(f"row{row}-mixed360-reason:{detail[:90]}")
             elif label == "fast" and not detail.startswith("neural reaches real time on Intel (120.00/120.00 fps); review IntelNeuralAllowed"):
                 bad.append(f"row{row}-fast-reason:{detail[:90]}")
+            elif label == "nosrc-fps" and "source frame rate is unreadable" not in detail:
+                bad.append(f"row{row}-nosrc-reason:{detail[:90]}")
+    return bad
+
+
+def row5_cpu_failures(script, tmp, tag):
+    """Row 5, neural withheld, but the session's own device is cpu: FAIL with that reason at any fps, never SKIP or MANUAL."""
+    bad = []
+    for label, env in [("slow", SLOW), ("fast", {})]:
+        w, (st, detail) = neural_world(script, tmp, f"{tag}-5-cpu-{label}", 5, dict(WITHHELD, device="cpu"), **env)
+        if st != "FAIL" or "device=cpu" not in detail or "CPU fallback" not in detail:
+            bad.append(f"row5-cpu-{label}:{st}:{detail[:90]}")
+    return bad
+
+
+def row6_shader_failures(script, tmp, tag):
+    """Row 6, neural withheld, but the record says neural ran or was chosen: FAIL with today's reason, not SKIP or MANUAL."""
+    bad = []
+    for label, scn, env in [
+        ("applied-slow", dict(WITHHELD, applied=True), SLOW),
+        ("applied-fast", dict(WITHHELD, applied=True), {}),
+        ("chosen-slow", dict(WITHHELD, routing="neural realesr-anime-x2 was chosen"), SLOW),
+        ("chosen-fast", dict(WITHHELD, routing="neural realesr-anime-x2 was chosen"), {}),
+    ]:
+        w, (st, detail) = neural_world(script, tmp, f"{tag}-6-{label}", 6, scn, **env)
+        if st != "FAIL" or "must go to the shader path with a record saying so" not in detail or "neural_withheld=yes" not in detail:
+            bad.append(f"row6-{label}:{st}:{detail[:90]}")
     return bad
 
 
 def test_row_5_withheld(tmp):
     for label, scn, env, want, frag in [
         ("slow", WITHHELD, SLOW, "SKIP", "measured 12.00/6.00 fps below real time"),
-        ("fast-360-slow-720", WITHHELD, {"FAKE_RTIME_720": "40"}, "SKIP", "measured 120.00/6.00 fps below real time"),
-        ("slow-360-fast-720", WITHHELD, {"FAKE_RTIME_360": "20"}, "SKIP", "measured 12.00/120.00 fps below real time"),
+        ("fast-360-slow-720", WITHHELD, {"FAKE_RTIME_720": "40"}, "MANUAL", MIXED_360_REASON),
+        ("slow-360-fast-720", WITHHELD, {"FAKE_RTIME_360": "20"}, "MANUAL", MIXED_720_REASON),
         ("fast", WITHHELD, {}, "MANUAL", "neural reaches real time on Intel (120.00/120.00 fps); review IntelNeuralAllowed"),
         ("config-slow", CONFIG_WITHHELD, SLOW, "SKIP", "measured 12.00/6.00 fps below real time"),
         ("config-fast", CONFIG_WITHHELD, {}, "MANUAL", "review IntelNeuralAllowed"),
@@ -2698,6 +2739,14 @@ def test_row_5_withheld(tmp):
               detail)
     w, (st, detail) = neural_world(BENCH, tmp, "r5w-slow-reason", 5, WITHHELD, **SLOW)
     check("row 5 withheld+slow carries the exact SKIP reason", bool(SLOW_REASON.match(detail)), detail)
+
+    # a session-level cpu verdict stays FAIL with its reason even when neural is withheld
+    for label, env in [("slow", SLOW), ("fast", {})]:
+        w, (st, detail) = neural_world(BENCH, tmp, "r5w-cpu-" + label, 5, dict(WITHHELD, device="cpu"), **env)
+        check(f"row 5 withheld with a cpu session ({label}) stays FAIL with its reason",
+              st == "FAIL" and "CPU fallback" in detail and "device=cpu" in detail and "neural_withheld=yes" in detail, f"{st} {detail}")
+    w, (st, detail) = neural_world(BENCH, tmp, "r5w-nosrc", 5, WITHHELD, FAKE_SRC_FPS="0/0")
+    check("row 5 withheld with an unreadable source fps is FAIL", st == "FAIL" and "source frame rate is unreadable" in detail, f"{st} {detail}")
 
     # not withheld: today's results, whatever the fps
     w, (st, detail) = neural_world(BENCH, tmp, "r5w-open-slow", 5, None, **SLOW)
@@ -2721,7 +2770,8 @@ def test_row_5_withheld(tmp):
 def test_row_6_withheld(tmp):
     for label, scn, env, want, frag in [
         ("slow", WITHHELD, SLOW, "SKIP", "measured 12.00/6.00 fps below real time"),
-        ("fast-360-slow-720", WITHHELD, {"FAKE_RTIME_720": "40"}, "SKIP", "measured 120.00/6.00 fps below real time"),
+        ("fast-360-slow-720", WITHHELD, {"FAKE_RTIME_720": "40"}, "MANUAL", MIXED_360_REASON),
+        ("slow-360-fast-720", WITHHELD, {"FAKE_RTIME_360": "20"}, "MANUAL", MIXED_720_REASON),
         ("fast", WITHHELD, {}, "MANUAL", "neural reaches real time on Intel (120.00/120.00 fps); review IntelNeuralAllowed"),
         ("config-slow", CONFIG_WITHHELD, SLOW, "SKIP", "measured 12.00/6.00 fps below real time"),
         ("config-fast", CONFIG_WITHHELD, {}, "MANUAL", "review IntelNeuralAllowed"),
@@ -2734,6 +2784,17 @@ def test_row_6_withheld(tmp):
         check(f"row 6 withheld ({label}) puts the plugin configuration back", posts[-1] == w.config0 if posts else True, str(posts))
     w, (st, detail) = neural_world(BENCH, tmp, "r6w-slow-reason", 6, WITHHELD, **SLOW)
     check("row 6 withheld+slow carries the exact SKIP reason", bool(SLOW_REASON.match(detail)), detail)
+
+    # the shader-path check comes first: a withheld record that still says neural ran or was chosen is FAIL with today's reason
+    for label, scn, env in [("applied", dict(WITHHELD, applied=True), SLOW), ("applied-fast", dict(WITHHELD, applied=True), {}),
+                            ("chosen", dict(WITHHELD, routing="neural realesr-anime-x2 was chosen"), SLOW),
+                            ("chosen-fast", dict(WITHHELD, routing="neural realesr-anime-x2 was chosen"), {})]:
+        w, (st, detail) = neural_world(BENCH, tmp, "r6w-shader-" + label, 6, scn, **env)
+        check(f"row 6 withheld but neural {label} is FAIL with the shader-path reason",
+              st == "FAIL" and "must go to the shader path with a record saying so" in detail and "neural_withheld=yes" in detail, f"{st} {detail}")
+        check(f"row 6 withheld but neural {label} puts the plugin configuration back", w.posts()[-1] == w.config0, str(w.posts()))
+    w, (st, detail) = neural_world(BENCH, tmp, "r6w-nosrc", 6, WITHHELD, FAKE_SRC_FPS="0/0")
+    check("row 6 withheld with an unreadable source fps is FAIL", st == "FAIL" and "source frame rate is unreadable" in detail, f"{st} {detail}")
 
     # not withheld: today's PASS/FAIL, now with the fps printed
     w, (st, detail) = neural_world(BENCH, tmp, "r6w-open-pass", 6, None, **SLOW)

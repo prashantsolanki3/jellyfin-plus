@@ -989,12 +989,22 @@ neural_class() {
     if ! ge "${NM_F360:-0}" 0.01 || ! ge "${NM_F720:-0}" 0.01; then nc_fail "no fps measured (fps_360p=${NM_F360:-none} fps_720p=${NM_F720:-none})"; return; fi
     if ! ge "${s360:-0}" 0.01 || ! ge "${s720:-0}" 0.01; then nc_fail "the source frame rate is unreadable (src_fps=$NC_SRC)"; return; fi
     [[ "$NM_ST360$NM_ST720" != *CPU_FALLBACK* ]] || { nc_fail "the ort chain fell back to CPU ($NM_ST360 $NM_ST720), so its fps says nothing about Level Zero"; return; }
-    if ! ge "$NM_F360" "$s360" || ! ge "$NM_F720" "$s720"; then
-        NC_STATUS=SKIP
-        NC_REASON="withheld on Intel: measured $NM_F360/$NM_F720 fps below real time (level_zero_loader=$z)"
-    else
+    # real time at any resolution is a decision for the owner (MANUAL); SKIP only when every resolution is below it
+    local r360=0 r720=0
+    ! ge "$NM_F360" "$s360" || r360=1
+    ! ge "$NM_F720" "$s720" || r720=1
+    if [[ "$r360$r720" == 11 ]]; then
         NC_STATUS=MANUAL
         NC_REASON="neural reaches real time on Intel ($NM_F360/$NM_F720 fps); review IntelNeuralAllowed"
+    elif [[ "$r360$r720" == 10 ]]; then
+        NC_STATUS=MANUAL
+        NC_REASON="neural reaches real time on Intel at 360p ($NM_F360 fps; 720p $NM_F720 fps below); review IntelNeuralAllowed"
+    elif [[ "$r360$r720" == 01 ]]; then
+        NC_STATUS=MANUAL
+        NC_REASON="neural reaches real time on Intel at 720p ($NM_F720 fps; 360p $NM_F360 fps below); review IntelNeuralAllowed"
+    else
+        NC_STATUS=SKIP
+        NC_REASON="withheld on Intel: measured $NM_F360/$NM_F720 fps below real time (level_zero_loader=$z)"
     fi
 }
 
@@ -1035,9 +1045,14 @@ row_5() {
     # withheld by design (Intel neural is off by default): the fps above is the evidence, not a device verdict
     cfg=$(plugin_config)
     if neural_withheld_by "$rec" "$cfg"; then
-        neural_class
-        status="$NC_STATUS"
-        note="$NC_REASON neural_withheld=yes($NW_BY) src_fps=$NC_SRC level_zero_loader=$(nm_loader) $note"
+        if [[ "$dev" == cpu ]]; then
+            # the session itself ran neural on the CPU: a fallback is a FAIL whatever the fps say
+            note="session ran neural on device=cpu (CPU fallback) neural_withheld=yes($NW_BY) $note"
+        else
+            neural_class
+            status="$NC_STATUS"
+            note="$NC_REASON neural_withheld=yes($NW_BY) src_fps=$NC_SRC level_zero_loader=$(nm_loader) $note"
+        fi
     else
         note+=" neural_withheld=no"
     fi
@@ -1058,7 +1073,7 @@ cfg_restore() {
 
 row_6() {
     have_api || { no_api 6 "no Jellyfin API"; return; }
-    local cfg rec routing applied seen new dev wh fpsnote
+    local cfg rec routing applied seen new dev wh fpsnote failnote
     # the same fps rows 5 prints; a failure only matters when neural is withheld (below), so it is not a FAIL here
     if [[ -n "$ORT_MODEL" ]]; then neural_measure || true; fi
     CFG_ID=$(api /Plugins | jq -r 'first(.[] | select(.Name == "Jellyfin Plus") | .Id) // empty' || true)
@@ -1091,8 +1106,11 @@ row_6() {
     if neural_withheld_by "$rec" "$cfg"; then wh="yes($NW_BY)"; else wh=no; fi
     fpsnote="neural_withheld=$wh"
     [[ -z "$ORT_MODEL" ]] || fpsnote+=" fps_360p=${NM_F360:-none} fps_720p=${NM_F720:-none} level_zero_loader=$(nm_loader)"
-    # withheld by design (Intel neural is off by default): there is no neural routing to judge, the fps is the evidence
+    failnote="a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied neural_requested=$(jq -r '.NeuralRequested // "off"' <<<"$rec") session_withheld=$(jq -r '.Record.GpuWithheldUnmeasured // "none"' <<<"$rec") $fpsnote"
+    # withheld by design (Intel neural is off by default): there is no neural routing to judge, the fps is the evidence,
+    # unless the record says neural ran or was chosen anyway
     if [[ -n "$ORT_MODEL" && "$wh" != no ]]; then
+        if [[ "$applied" == true || ( -n "$routing" && "$routing" != *"NOT run"* ) ]]; then record 6 FAIL "$failnote"; return; fi
         neural_class
         record 6 "$NC_STATUS" "$NC_REASON neural_withheld=$wh fps_360p=${NM_F360:-none} fps_720p=${NM_F720:-none} src_fps=$NC_SRC device=$dev level_zero_loader=$(nm_loader) neural_applied=$applied NeuralRouting=${routing:-none}"
         return
@@ -1101,7 +1119,7 @@ row_6() {
     if [[ "$routing" == *"NOT run"* && "$applied" != true ]]; then
         record 6 PASS "NeuralRouting=$routing $fpsnote"
     else
-        record 6 FAIL "a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied neural_requested=$(jq -r '.NeuralRequested // "off"' <<<"$rec") session_withheld=$(jq -r '.Record.GpuWithheldUnmeasured // "none"' <<<"$rec") $fpsnote"
+        record 6 FAIL "$failnote"
     fi
 }
 
