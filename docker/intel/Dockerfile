@@ -19,11 +19,9 @@ ARG JELLYFIN_IMAGE=docker.io/jellyfin/jellyfin:12.4.20261026-211555@sha256:fea86
 FROM ${JELLYFIN_IMAGE} AS base-pkgs
 RUN dpkg-query -W -f='${Package}\n' | sort -u > /base-pkgs.txt
 
-# ---- build: ffmpeg, FSR2, the plugin and patcher, the shaders, the web client -----------------------
+# ---- build: ffmpeg, the plugin and patcher, the shaders, the web client -----------------------------
 FROM ${JELLYFIN_IMAGE} AS build
 
-# FidelityFX-FSR2 at the commit docs/filters/FSR2.md was verified against. A git commit id is a content hash.
-ARG FSR2_COMMIT=1680d1edd5c034f88ebbbb793d8b88f8842cf804
 # The .NET 10 SDK, from Microsoft's release metadata, checked against its published sha512.
 ARG DOTNET_SDK_URL=https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.404/dotnet-sdk-10.0.404-linux-x64.tar.gz
 ARG DOTNET_SDK_SHA512=577d0eb17fec33d029104c5c63a1ab0accc3e28776274abef2218dbac5af18d2109b5406d26b31d76f5c245215e3ba0926a94c20246c672c41847c9e1eb1dc50
@@ -36,9 +34,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DOTNET_NOLOGO=1 \
     PATH=/opt/dotnet:$PATH
 
-# What must exist before build-ffmpeg.sh's own preflight: the FSR2 library is built out of tree and the
-# script refuses to start without it, and its Vulkan backend needs vulkan/vulkan.h. The rest is the
-# script's own intel apt list (scripts/test_bench_intel.py keeps the two equal), so its apt step is a no-op.
+# The script's own intel apt list (scripts/test_bench_intel.py keeps the two equal), so its apt step is a no-op.
 # Not libshaderc-dev: the script builds shaderc from source, the distro one breaks nlmeans_vulkan.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git python3 build-essential glslang-tools nodejs npm \
@@ -51,29 +47,14 @@ RUN curl -fsSL "$DOTNET_SDK_URL" -o /tmp/dotnet.tar.gz \
  && tar -C /opt/dotnet -xzf /tmp/dotnet.tar.gz \
  && rm /tmp/dotnet.tar.gz
 
-# FSR2's Vulkan backend as a static library, the recipe in docs/filters/FSR2.md (gen_perm.py stands in
-# for upstream's Windows-only shader compiler).
-COPY ffmpeg/gen_perm.py ffmpeg/fsr2compat.h /opt/fsr2-build/
-RUN set -eux; \
-    mkdir /opt/fsr2 && cd /opt/fsr2 && git init -q \
- && git fetch -q --depth 1 https://github.com/GPUOpen-Effects/FidelityFX-FSR2.git "$FSR2_COMMIT" \
- && git checkout -q --detach FETCH_HEAD \
- && test "$(git rev-parse HEAD)" = "$FSR2_COMMIT"; \
-    API=/opt/fsr2/src/ffx-fsr2-api; \
-    GLSLANG=glslangValidator python3 /opt/fsr2-build/gen_perm.py "$API/shaders" /opt/fsr2-perm; \
-    mkdir -p /opt/fsr2-obj /opt/fsr2-lib && cd /opt/fsr2-obj; \
-    for f in "$API"/*.cpp "$API"/vk/*.cpp "$API"/vk/shaders/*.cpp; do \
-        g++ -O2 -fPIC -std=c++17 -DFFX_GCC -include /opt/fsr2-build/fsr2compat.h -I/opt/fsr2-perm -c "$f" -o "$(basename "$f" .cpp).o"; \
-    done; \
-    ar rcs /opt/fsr2-lib/libffx_fsr2_vk.a ./*.o
-
 COPY . /src
 WORKDIR /src
 
-# The Intel build: oidn and ort (OpenVINO), plus fsr2 without CUDA (patch 0016, the fsr2-nocuda marker).
-# Slow (shaderc, libplacebo and ffmpeg compile here) and needs about 12 GB of free disk.
-RUN GPU_VENDOR=intel WITH_ORT=1 ORT_EP=openvino WITH_FSR2=1 \
-    FSR2_SDK=/opt/fsr2/src/ffx-fsr2-api FSR2_LIB=/opt/fsr2-lib \
+# The Intel build: oidn and ort (OpenVINO). No fsr2: without CUDA its motion vectors are zero and moving
+# content scores below bicubic (docs/intel-patched-ffmpeg-libplacebo.md), so no fsr2-nocuda marker is left
+# and the plugin withholds the level. Slow (shaderc, libplacebo and ffmpeg compile here) and needs about
+# 12 GB of free disk.
+RUN GPU_VENDOR=intel WITH_ORT=1 ORT_EP=openvino \
     PREFIX=/usr/lib/jellyfin-ffmpeg-oidn \
     bash scripts/build-ffmpeg.sh
 
@@ -202,10 +183,11 @@ RUN --mount=type=bind,from=base-pkgs,source=/usr/lib/jellyfin-ffmpeg/ffmpeg,targ
         [ "$(dirname "$got")" = "$S" ] || { echo "$F loads $so from $got, not $S (rev-hxlit)" >&2; exit 1; }; \
     done; \
     filters=$("$F" -hide_banner -filters); \
-    for f in $(ffmpeg_required_filters intel) fsr2 libplacebo xpsnr; do \
+    for f in $(ffmpeg_required_filters intel) libplacebo xpsnr; do \
         echo "$filters" | grep -qE "^ [A-Z.]+ +$f " || { echo "no $f filter in $F" >&2; exit 1; }; \
     done; \
-    test -f /usr/lib/jellyfin-ffmpeg-oidn/fsr2-nocuda; \
+    if echo "$filters" | grep -qE '^ [A-Z.]+ +fsr2 '; then echo "$F carries fsr2: not shipped on Intel" >&2; exit 1; fi; \
+    test ! -e /usr/lib/jellyfin-ffmpeg-oidn/fsr2-nocuda; \
     "$F" -hide_banner -hwaccels | grep -qx vaapi; \
     "$F" -hide_banner -encoders | grep -q h264_qsv; \
     "$F" -hide_banner -encoders | grep -qE '^ V.{5} png '; \

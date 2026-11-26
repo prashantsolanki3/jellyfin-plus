@@ -18,8 +18,8 @@ Needs no GPU, ffmpeg, docker, network or Jellyfin. It runs the real scripts/benc
   - a row scores only files its own run wrote (rev-hxlit): a fresh run-<id> directory per run, a used id
     refused, any failed write a FAIL, a missing or old scored file a FAIL;
   - scripts/plugin-meta.sh holds the plugin GUID and target ABI once (Plugin.cs and manifest.json agree);
-  - docker/intel/Dockerfile keeps its pins (base digest, FSR2 commit, SDK sha512), builds the Intel
-    variant, carries the acceptance checks, and its digest matches the spec page;
+  - docker/intel/Dockerfile keeps its pins (base digest, SDK sha512), builds the Intel
+    variant without fsr2, carries the acceptance checks, and its digest matches the spec page;
   - mutation: each deliberate breakage of bench-intel.sh is caught by the plan checks.
 
 It does not build the image and does not run a row against a GPU. Exit status: 0 every check passed,
@@ -160,7 +160,7 @@ THRESHOLD = {
 
 EXACT = [
     "plan: bench-intel: rows=1 2 3 4 5 6 7 8 9 10 11 12 13 runs=3 mode=dry-run",
-    "plan: required filters: oidn ort fsr2",
+    "plan: required filters: oidn ort",
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), ff=STOCK),
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), f"{RUN}/r2-shader.mkv", ff=STOCK),
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080), f"{RUN}/r2-bicubic.mkv", ff=STOCK),
@@ -418,7 +418,11 @@ FFMPEG_STUB = r'''#!/bin/sh
 [ -z "${FAKE_FFMPEG_LOG:-}" ] || echo "$*" >> "$FAKE_FFMPEG_LOG"
 case "$*" in
 *-filters*)
-    for f in oidn ort fsr2 libplacebo xpsnr; do echo " T.. $f  V->V stub"; done
+    for f in oidn ort fsr2 libplacebo xpsnr; do
+        # FAKE_NO_FSR2=1: the Intel image's binary, which carries no fsr2 filter
+        [ "$f" = fsr2 ] && [ "${FAKE_NO_FSR2:-}" = 1 ] && continue
+        echo " T.. $f  V->V stub"
+    done
     i=0; while [ $i -lt 4000 ]; do echo " T.. pad$i  V->V padding so the pipe fills"; i=$((i + 1)); done
     exit 0;;
 *xpsnr=*)
@@ -474,6 +478,12 @@ case "$*" in
 *-benchmark*)
     [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4
+    # FAKE_ORT_WARN: what the ort filter says on stderr when the OpenVINO provider is not there (vf_ort.c append_openvino)
+    # FAKE_ORT_NOISE: three OpenVINO lines before the warning; FAKE_ORT_DEVICE: the device line vf_ort config_input prints
+    case "$*" in *ort=*)
+        [ -z "${FAKE_ORT_NOISE:-}" ] || for n in 1 2 3; do echo "[Parsed_ort_3 @ 0x1] OpenVINO runtime note $n" >&2; done
+        [ -z "${FAKE_ORT_WARN:-}" ] || echo "[Parsed_ort_3 @ 0x1] $FAKE_ORT_WARN" >&2
+        [ -z "${FAKE_ORT_DEVICE:-}" ] || echo "[Parsed_ort_3 @ 0x1] onnxruntime 1.20.1: /m/model.onnx, 640x360 -> 1280x720 (x2), device=$FAKE_ORT_DEVICE" >&2;; esac
     # an ffv1 write leaves its output (the last argument) as ffmpeg does. FAKE_FFV1_FAIL / _SKIP / _STALE hold a substring
     # of the output path they apply to: _FAIL exits 1 (a full disk), _SKIP exits 0 and writes nothing, _STALE writes it
     # with a year-2000 mtime, as a leftover of an earlier run would be.
@@ -664,7 +674,7 @@ if path.startswith("/JellyfinPlus/Session/"):
         shimlog(sc.get("probe_logs"))
     s = st["sessions"].get(sid)
     if s is None:
-        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": ["off", "fsr2"]}
+        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": sc.get("game_levels", ["off", "fsr2"])}
         if cfg_max > 0 and sc.get("config_applies", True):
             levels["NeuralMaxSourceHeight"] = cfg_max
         out({"Known": False, "Levels": levels})
@@ -672,8 +682,13 @@ if path.startswith("/JellyfinPlus/Session/"):
     if cfg_max > 0 and s["neural"] and s["src_height"] > cfg_max:
         routing = "neural %s NOT run: the source is %dp, taller than NeuralMaxSourceHeight %d, so the shader path ran" % (
             s["neural"], s["src_height"], cfg_max)
-    out({"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False),
-         "NeuralDevice": sc.get("device", "openvino"), "NeuralRouting": sc["routing"] if "routing" in sc else routing})
+    rec = {"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False),
+           "NeuralDevice": sc.get("device", "openvino"), "NeuralRouting": sc["routing"] if "routing" in sc else routing}
+    if "requested" in sc:
+        rec["NeuralRequested"] = sc["requested"]
+    if "withheld" in sc:
+        rec["Record"] = {"GpuWithheldUnmeasured": sc["withheld"]}
+    out(rec)
 if path.endswith("/master.m3u8"):
     if sc.get("fail_master"):
         fail()
@@ -828,7 +843,8 @@ def test_mutants(tmp):
         ("alt-no-final-resize", '$YUV_END,scale=$1:$2:flags=bicubic,format=yuv420p"; }', '$YUV_END"; }'),
         ("alt-shader-at-target", "libplacebo=w=$ALT_MID_W:h=$ALT_MID_H:", "libplacebo=w=$1:h=$2:"),
         ("alt-low-is-x2", "ALT_LOW=1.5", "ALT_LOW=2"),
-        ("alt-ewa-with-shader", 'upscaler=ewa_lanczos:$YUV_END"; }\nchain_shader_bicubic', 'upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }\nchain_shader_bicubic'),
+        ("alt-ewa-with-shader", 'chain_ewa() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:$YUV_END"; }',
+         'chain_ewa() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }'),
         ("alts-not-planned", "                plan_alts 2 360 1080 1920 1080\n", ""),
         ("alts-dropped-from-plan", 'ROW2_ALTS="ewa x2-bicubic lowtarget"', 'ROW2_ALTS="ewa x2-bicubic"'),
     ]:
@@ -845,7 +861,7 @@ def test_mutants(tmp):
         ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
         ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
-        ("run-fps-lost-failure", '|| { rc=$?; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
+        ("run-fps-lost-failure", '|| { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
         ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"',
          'curl -fsS -H "Authorization: MediaBrowser Token=\\"$JF_TOKEN\\"" "$@" "$JF_URL$p"', token_failures),
         ("legacy-header", 'Authorization: MediaBrowser Token=\\\\"%s\\\\"', "X-Emby-Token: %s", token_failures),
@@ -915,8 +931,7 @@ def test_mutants(tmp):
 def build_apt_checks(df):
     """The build stage's apt line carries every dev package build-ffmpeg.sh installs for the Intel build.
 
-    The FSR2 compile runs before the script's own apt step, and a header missing there (vulkan/vulkan.h)
-    failed the first CI build.
+    A header missing there (vulkan/vulkan.h) failed the first CI build.
     """
     stage = re.search(r"^FROM \S+ AS build\n(.*?)(?=^FROM )", df, re.M | re.S)
     check("the Dockerfile has a build stage", bool(stage))
@@ -936,9 +951,7 @@ def build_apt_checks(df):
     missing = [p for p in wanted if p not in pkgs]
     check("the build stage installs everything build-ffmpeg.sh apt-installs for intel", not missing, str(missing))
 
-    fetch = body.find("git fetch")
-    at = apt.start() if apt else -1
-    check("the apt install comes before the FSR2 fetch and compile", 0 <= at < fetch, f"{at} {fetch}")
+    check("the build stage fetches no FSR2 source", "git fetch" not in body and "FidelityFX" not in body)
     check("the distro shaderc is not installed (it broke nlmeans_vulkan)", "libshaderc" not in " ".join(pkgs))
     check("build-ffmpeg.sh apt-installs zlib1g-dev for intel (png needs zlib)", "zlib1g-dev" in (intel.group(1).split() if intel else []))
     check("build-ffmpeg.sh passes --enable-zlib for intel", bool(re.search(r"HWACCEL_FLAGS=\([^)]*--enable-zlib", script.split("else\n    VENDOR_PATCHES=(")[0])))
@@ -1135,20 +1148,21 @@ def dockerfile_checks(tmp):
     digest = re.search(r"^ARG JELLYFIN_IMAGE=(\S+@sha256:[0-9a-f]{64})$", df, re.M)
     check("base image is pinned by digest", bool(digest))
     check("the spec page names the same base image", bool(digest) and digest.group(1).split("docker.io/")[1] in spec)
-    commit = re.search(r"^ARG FSR2_COMMIT=([0-9a-f]{40})$", df, re.M)
-    check("FSR2 is pinned to a full commit", bool(commit))
-    check("the spec page names the FSR2 commit", bool(commit) and commit.group(1) in spec)
+    check("the image builds no fsr2 (zero motion vectors without CUDA): no SDK, no WITH_FSR2",
+          not re.search(r"WITH_FSR2|FSR2_|gen_perm|fsr2compat|FidelityFX", df))
+    check("the build acceptance requires the fsr2 marker absent and the filter absent",
+          "test ! -e /usr/lib/jellyfin-ffmpeg-oidn/fsr2-nocuda" in df and "carries fsr2: not shipped on Intel" in df)
     check("the .NET SDK sha512 is pinned and checked",
           bool(re.search(r"^ARG DOTNET_SDK_SHA512=[0-9a-f]{128}$", df, re.M)) and "sha512sum -c" in df)
     check("no :latest", ":latest" not in df)
     froms = re.findall(r"^FROM (\S+)", df, re.M)
     check("every stage starts from the pinned base", froms and all(f == "${JELLYFIN_IMAGE}" for f in froms), str(froms))
-    for needle in ["GPU_VENDOR=intel", "WITH_ORT=1", "ORT_EP=openvino", "WITH_FSR2=1", "FSR2_SDK=", "FSR2_LIB=",
-                   "PREFIX=/usr/lib/jellyfin-ffmpeg-oidn", "scripts/build-ffmpeg.sh", "fsr2-nocuda",
+    for needle in ["GPU_VENDOR=intel", "WITH_ORT=1", "ORT_EP=openvino",
+                   "PREFIX=/usr/lib/jellyfin-ffmpeg-oidn", "scripts/build-ffmpeg.sh",
                    "ffmpeg_required_filters intel", "-hwaccels", "h264_qsv", "-encoders | grep -qE '^ V.{5} png '",
                    "-decoders | grep -qE '^ V.{5} png '", "cmp /tmp/base-ffmpeg",
                    "not found", "S=/usr/lib/jellyfin-ffmpeg/lib", "libvulkan.so.1 libshaderc_shared.so.1",
-                   'loads $so from $got, not $S', "git rev-parse HEAD", "FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
+                   'loads $so from $got, not $S',"FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
                    "/var/cache/jellyfin/jellyfin-upscale.json", "jellyfin-ffmpeg-upscale"]:
         check(f"Dockerfile carries {needle}", needle in df)
     check("Dockerfile publishes nothing and sets no USER", not re.search(r"docker push|^USER ", df, re.M))
@@ -1167,7 +1181,7 @@ def dockerfile_checks(tmp):
     check("dockerignore keeps what the build needs", not [n for n in need if n in ignore], str(ignore))
     for rel in ["shim/jellyfin-ffmpeg-upscale", "scripts/bench-intel.sh", "scripts/ffmpeg-vendor.sh", "scripts/build-ffmpeg.sh",
                 "scripts/install-shaders.sh", "scripts/jellyfin-plus-webinject", "scripts/build-web-panel.sh",
-                "ffmpeg/gen_perm.py", "ffmpeg/fsr2compat.h", "web/theme/jellyfinplus.css", "web/package-lock.json",
+                "web/theme/jellyfinplus.css", "web/package-lock.json",
                 "assets/jellyfinplus.png", "assets/plugin-meta.json", "docker/intel/stage-plugin.sh",
                 "docker/intel/entrypoint.py", "docker/intel/accept-plugin.sh", "scripts/test_entrypoint.py"]:
         check(f"{rel} exists", os.path.isfile(os.path.join(REPO, rel)))
@@ -2207,6 +2221,32 @@ def test_row_1_scope(tmp):
     check("row 12 passes on a libplacebo line written during the run", results(out).get(12, ("",))[0] == "PASS", str(results(out)))
 
 
+def test_no_fsr2(tmp):
+    """The Intel image ships no fsr2 filter: rows 7 and 8 are SKIP with the reason, row 1 wants it withheld."""
+    w = World(tmp, "nofsr2", {"game_levels": ["off"]}, extra={"FAKE_NO_FSR2": "1"})
+    pan_clips(w)
+    os.remove(os.path.join(w.stubs, "fsr2-nocuda"))
+    rc, out, err = w.run(["--rows", "1,7,8"])
+    res = results(out)
+    check("without an fsr2 filter the run is not refused", rc == 0 and "not the Intel build" not in err, f"rc={rc} {err}")
+    for row in (7, 8):
+        st, detail = res.get(row, ("", ""))
+        check(f"row {row} is SKIP, not FAIL, on a binary without fsr2",
+              st == "SKIP" and "no fsr2 filter" in detail and "zero motion vectors without CUDA" in detail, f"{st} {detail}")
+    check("row 8 runs no ffmpeg when it skips", not [l for l in ffmpeg_log(w) if "pan_" in l], str(ffmpeg_log(w)))
+    st, detail = res.get(1, ("", ""))
+    check("row 1 passes with fsr2 withheld and no marker", st == "PASS" and "fsr2 not offered" in detail, f"{st} {detail}")
+
+    w = World(tmp, "nofsr2-offered", {"game_levels": ["off", "fsr2"]}, extra={"FAKE_NO_FSR2": "1"})
+    os.remove(os.path.join(w.stubs, "fsr2-nocuda"))
+    st, detail = results(w.run(["--rows", "1"])[1]).get(1, ("", ""))
+    check("row 1 fails when fsr2 is still offered", st == "FAIL" and "offered:fsr2" in detail, f"{st} {detail}")
+
+    w = World(tmp, "nofsr2-marker", {"game_levels": ["off"]}, extra={"FAKE_NO_FSR2": "1"})
+    st, detail = results(w.run(["--rows", "1"])[1]).get(1, ("", ""))
+    check("row 1 fails when the marker is left in the image", st == "FAIL" and "marker-present" in detail, f"{st} {detail}")
+
+
 def drm_fixture(root, cards, in_dri):
     """A fake /sys/class/drm (renderDnnn/device/vendor for every card) and /dev/dri (a file per name in in_dri)."""
     sysdrm = os.path.join(root, "sys-class-drm")
@@ -2319,6 +2359,16 @@ def test_row_6(tmp):
         w, rc, out, err, (st, detail) = row6_case(tmp, "r6-" + tag, scn)
         check(f"row 6 FAILs on a record that is not the NOT-run wording ({tag})", st == "FAIL", f"{st} {detail}")
 
+    # a FAIL names what the session asked for and what withheld it, with the values the record held
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-why", {"applied": True, "requested": "realesr-anime-x2",
+                                                              "withheld": "not measured on Intel"})
+    check("row 6 FAIL prints neural_requested= and session_withheld= with the record's values",
+          st == "FAIL" and "neural_requested=realesr-anime-x2" in detail and "session_withheld=not measured on Intel" in detail,
+          f"{st} {detail}")
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-why-empty", {"applied": True})
+    check("row 6 FAIL prints neural_requested=off and session_withheld=none when the record has neither",
+          st == "FAIL" and "neural_requested=off" in detail and "session_withheld=none" in detail, f"{st} {detail}")
+
     rc, out, err = World(tmp, "r6-fast").run(["--rows", "6"], BENCH_NEURAL_LEVEL="fast")
     check("BENCH_NEURAL_LEVEL=fast is refused (it is not a level)", rc == 2 and "BENCH_NEURAL_LEVEL" in err, f"rc={rc} {err}")
 
@@ -2356,6 +2406,72 @@ def test_row_5(tmp):
     w = World(tmp, "r5-nostream", {"fail_master": True}, extra)
     st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
     check("row 5 FAILs when its stream cannot start", st == "FAIL", f"{st} {detail}")
+
+    # the exact fallback reason: the ort filter's own warning, the environment's answers, and what the session record says
+    warn = "OpenVINO execution provider unavailable (Device GPU is not available), using CPU"
+    w = World(tmp, "r5-reason", {"device": None, "applied": False,
+                                 "routing": "neural realesr-anime-x2 NOT run: not measured on Intel"},
+              dict(extra, FAKE_ORT_WARN=warn))
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 prints the ort filter's fallback reason for both clips",
+          detail.count("CPU_FALLBACK[") == 2 and "Device GPU is not available" in detail, detail)
+    both = "libonnxruntime_providers_openvino.so,libopenvino_intel_gpu_plugin.so,"
+    check("row 5 names both ORT libraries as missing when $PREFIX/ort/lib has neither",
+          f"ep_libs_missing={both} " in detail and "gpu_plugin_unresolved=none " in detail
+          and "libOpenCL=UNKNOWN(" in detail and "open=FAIL(" in detail and "process_gids=" in detail, detail)
+    ldconfig = any(os.path.exists(p) for p in ("/sbin/ldconfig", "/usr/sbin/ldconfig"))
+    z = re.search(r"level_zero_loader=(\S+)", detail)
+    check("row 5 reports the Level Zero loader as UNKNOWN(no ldconfig) only when the host has no ldconfig",
+          bool(z) and (z.group(1) in ("present", "MISSING") if ldconfig else z.group(1) == "UNKNOWN(no"), detail)
+
+    # seed the ort lib directory the report reads, and a fake ldd for the GPU plugin
+    lib = os.path.join(w.stubs, "ort", "lib")
+    os.makedirs(lib)
+    open(os.path.join(lib, "libonnxruntime_providers_openvino.so"), "w").close()
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 names only the GPU plugin as missing when the provider is there",
+          "ep_libs_missing=libopenvino_intel_gpu_plugin.so, " in detail, detail)
+    open(os.path.join(lib, "libopenvino_intel_gpu_plugin.so"), "w").close()
+    ldd = os.path.join(w.stubs, "ldd")
+    open(ldd, "w").write('#!/bin/sh\ncat "$FAKE_LDD_OUT"\n')
+    os.chmod(ldd, 0o755)
+    ldd_out = os.path.join(w.root, "ldd.txt")
+    open(ldd_out, "w").write("\tlibOpenCL.so.1 => not found\n\tlibc.so.6 => /lib/libc.so.6 (0x1)\n")
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out)[1]).get(5, ("", ""))[1]
+    check("row 5 reports no missing ORT library, the unresolved plugin library, and libOpenCL missing from that ldd",
+          "ep_libs_missing=none " in detail and "gpu_plugin_unresolved=libOpenCL.so.1, " in detail
+          and "libOpenCL=MISSING " in detail, detail)
+    open(ldd_out, "w").write("\tlibOpenCL.so.1 => /usr/lib/libOpenCL.so.1 (0x1)\n")
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out)[1]).get(5, ("", ""))[1]
+    check("row 5 reports libOpenCL present when the plugin's ldd resolves it",
+          "gpu_plugin_unresolved=none " in detail and "libOpenCL=present " in detail, detail)
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out, BENCH_RENDER_NODE="/dev/null")[1]).get(5, ("", ""))[1]
+    check("row 5 reports open=ok for a render node this process can open (a character device)",
+          "render_node=/dev/null open=ok " in detail, detail)
+    check("row 5 says a null device is a session that never ran ORT, with the routing it recorded",
+          st == "FAIL" and "device=none" in detail and "session_neural_requested=" in detail and "NOT run: not measured on Intel" in detail, f"{st} {detail}")
+    check("row 5 keeps each chain's ffmpeg log in the run directory",
+          all(os.path.isfile(os.path.join(w.out, "run-w1", f"row5-{h}p.ffmpeg.log")) for h in (360, 720)), os.listdir(w.out))
+    w = World(tmp, "r5-quiet", extra=extra)
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 without a fallback line says so instead of claiming openvino", "ffmpeg_ort_360p=no_ort_line_in_log" in detail, detail)
+    # ort_why: `using CPU` is read first, and the device line alone is enough to call a CPU run a fallback
+    w = World(tmp, "r5-noise", extra=dict(extra, FAKE_ORT_NOISE="1", FAKE_ORT_WARN=warn))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 keeps the `using CPU` reason when three earlier OpenVINO lines precede it",
+          detail.count("CPU_FALLBACK[") == 2 and "using CPU" in detail and "OpenVINO runtime note 2" in detail
+          and "OpenVINO runtime note 3" not in detail, detail)
+    w = World(tmp, "r5-devcpu", extra=dict(extra, FAKE_ORT_DEVICE="cpu"))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 flags CPU_FALLBACK from a device=cpu line with no `using CPU` warning",
+          detail.count("CPU_FALLBACK[") == 2 and "device=cpu" in detail and "using CPU" not in detail, detail)
+    w = World(tmp, "r5-devgpu", extra=dict(extra, FAKE_ORT_DEVICE="openvino"))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 does not flag a device=openvino line as a fallback",
+          "CPU_FALLBACK" not in detail and "ffmpeg_ort_360p=log[" in detail and "device=openvino" in detail, detail)
+    w = World(tmp, "r5-chainfail", extra=dict(extra, FAKE_FFMPEG_FAIL="1"))
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 FAILs with the environment report when the ort chain dies", st == "FAIL" and "ort_env:" in detail, f"{st} {detail}")
 
 
 def stage_meta_check(tmp, label, guid, abi, strip_source):
@@ -2433,8 +2549,8 @@ def main():
         return 1
     with tempfile.TemporaryDirectory() as tmp:
         parts = (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
-                 test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_render_node_pick,
-                 test_row_6, test_row_5, test_shared_files, test_scored_inputs)
+                 test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_no_fsr2,
+                 test_render_node_pick, test_row_6, test_row_5, test_shared_files, test_scored_inputs)
 
         def go(part):
             sub = os.path.join(tmp, part.__name__)
@@ -2442,7 +2558,7 @@ def main():
             part(sub)
 
         # the parts share nothing but the check() counters: the two long ones (mutants, hermetic API) overlap the rest
-        with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             for f in [pool.submit(go, p) for p in parts]:
                 f.result()
         dockerfile_checks(tmp)

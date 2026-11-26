@@ -5,7 +5,7 @@
 # file into an upstream PR branch; cut upstream branches from upstream/main.
 #
 # What it does: builds docker/intel/Dockerfile (Intel Arc image: patched ffmpeg, plugin,
-# patcher, fsr2-nocuda marker), runs the acceptance checks inside the built image, and only
+# patcher; no fsr2 since PR 48), runs the acceptance checks inside the built image, and only
 # if every check passes pushes it to ghcr.io/prashantsolanki3/jellyfin-plus-intel:<short-sha>
 # and prints the digest in the job summary, so a consumer can pin by digest.
 #
@@ -98,18 +98,20 @@ jobs:
           # whole-word match on its own column, so "ort" does not match "sort" or "report".
           has() { grep -Eq "(^|[[:space:]])$2([[:space:]]|\$)" <<<"$1"; }
 
-          for f in fsr2 ort libplacebo; do
+          for f in ort libplacebo; do
             if has "$filters" "$f"; then echo "ok   filter $f"; else bad "filter '$f' missing from -filters"; fi
           done
+          # fsr2 gets zero motion vectors without CUDA (PR 48), so the Intel image must not ship it.
+          if has "$filters" fsr2; then bad "filter 'fsr2' must be absent from -filters"; else echo "ok   filter fsr2 absent"; fi
           if has "$hwaccels" vaapi; then echo "ok   hwaccel vaapi"; else bad "hwaccel 'vaapi' missing from -hwaccels"; fi
           for e in hevc_qsv h264_qsv; do
             if has "$encoders" "$e"; then echo "ok   encoder $e"; else bad "encoder '$e' missing from -encoders"; fi
           done
 
           if docker run --rm --entrypoint /usr/bin/test "$REF" -f "$FSR2_MARKER"; then
-            echo "ok   marker $FSR2_MARKER"
+            bad "fsr2-nocuda marker must be absent but exists at $FSR2_MARKER"
           else
-            bad "fsr2-nocuda marker missing at $FSR2_MARKER"
+            echo "ok   marker $FSR2_MARKER absent"
           fi
 
           read -ra dirs <<<"$PLUGIN_SEARCH_DIRS"
@@ -162,5 +164,5 @@ jobs:
             echo "${IMAGE}@${DIGEST}"
             echo '```'
             echo
-            echo "Acceptance checks passed before the push: filters fsr2/ort/libplacebo, hwaccel vaapi, encoders hevc_qsv/h264_qsv, fsr2-nocuda marker, plugin DLL."
+            echo "Acceptance checks passed before the push: filters ort/libplacebo present and fsr2 absent, hwaccel vaapi, encoders hevc_qsv/h264_qsv, fsr2-nocuda marker absent, plugin DLL."
           } >> "$GITHUB_STEP_SUMMARY"

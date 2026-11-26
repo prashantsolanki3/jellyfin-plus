@@ -407,7 +407,8 @@ static int config_input(AVFilterLink *inlink)
     if (!s->in_buf)
         return AVERROR(ENOMEM);
 
-    av_log(ctx, AV_LOG_VERBOSE, "onnxruntime %s: %s, %dx%d -> %dx%d (x%d), device=%s\n",
+    /* INFO, not VERBOSE: the device it really ran on is what bench row 5 reads from a default-level log. */
+    av_log(ctx, AV_LOG_INFO, "onnxruntime %s: %s, %dx%d -> %dx%d (x%d), device=%s\n",
            OrtGetApiBase()->GetVersionString(), s->model,
            s->in_w, s->in_h, s->out_w, s->out_h, s->scale,
            device_name(s));

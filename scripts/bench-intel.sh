@@ -150,7 +150,7 @@ row_must() {
         5)  echo "session record device=openvino (not a CPU fallback); fps measured at 360p and 720p; xpsnr>=FSRCNNX where it runs; slower than real time is a valid result" ;;
         6)  echo "NeuralMaxSourceHeight=480: a 720p source goes to the shader path and the record says why" ;;
         7)  echo "after the first ceil(8*scale^2) frames: mean consecutive-frame luma difference<=0.5, per-frame max<=16 in 99% of frames; FSRCNNX control exactly 0" ;;
-        8)  echo "xpsnr on the panning cut >= bicubic (a miss means the image ships without fsr2-nocuda: a result, not a blocker)" ;;
+        8)  echo "xpsnr on the panning cut >= bicubic (SKIP when the patched ffmpeg has no fsr2 filter: the image ships without it, a result, not a blocker)" ;;
         9)  echo "on, an H.264 1080p source: -hwaccel vaapi, download and upload into libplacebo (the zero-copy hwmap=derive_device=vulkan is tried once and its failure recorded, not failed on), no 'Conversion failed!', video engine busy, cpu time per frame >=30% lower, xpsnr(on,off)>=50dB; off: command identical to a build without hardware decode" ;;
         10) echo "h264_qsv/hevc_qsv chosen; the served segment's codec matches; encoderSessions counts the session; /Gpu/Load (primed, read again >=5 s later) within +-10 points of the fdinfo figure when the transcode is visible to the bench pod, else MANUAL with the plugin's figure" ;;
         11) echo "one stream holds fps>=36 while one Plex hardware transcode runs" ;;
@@ -338,7 +338,7 @@ plan_alts() {
 print_plan() {
     local r ow oh
     echo "plan: bench-intel: rows=${ROWS[*]} runs=$RUNS mode=dry-run"
-    echo "plan: required filters: $(ffmpeg_required_filters intel) fsr2"
+    echo "plan: required filters: $(ffmpeg_required_filters intel)"
     echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
     echo "plan: every measured ffmpeg runs under timeout --kill-after=10 ${RUN_TIMEOUT}s (BENCH_RUN_TIMEOUT); row 5 runs ${ORT_RUNS}x per clip, ${ORT_FRAMES} frames"
     echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; run dir: $RUN_OUT (fresh, refused if it exists); render node: $NODE"
@@ -361,7 +361,8 @@ print_plan() {
             5)  cmd_run "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_FRAMES"; plan_cmd 5
                 cmd_run "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_FRAMES"; plan_cmd 5
                 echo "plan: row 5 cmd: a 360p stream with neural=realesr-anime-x2, then NeuralDevice from $JF_URL/JellyfinPlus/Session/<its PlaySessionId>"
-                echo "plan: row 5 threshold: device=openvino; largest NeuralMaxSourceHeight holding >=${E2E_X}x" ;;
+                echo "plan: row 5 threshold: device=openvino; largest NeuralMaxSourceHeight holding >=${E2E_X}x"
+                echo "plan: row 5 diagnosis: the detail carries ffmpeg_ort_<h>p (the ort filter's own fallback line), ort_env (EP libs, OpenCL ICD, render node open) and, when device is not openvino, the session's requested/withheld/routing" ;;
             6)  echo "plan: row 6 cmd: set NeuralMaxSourceHeight=480 (restored after), transcode $(clip 720) with neural=$NEURAL_LEVEL, read Session/<id> NeuralRouting" ;;
             7)  cmd_still "$CLIPS/still_720p.png" "$(chain_fsr2 1920 1080)" "$RUN_OUT/still-fsr2.txt"; plan_cmd 7
                 cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$RUN_OUT/still-control.txt"; plan_cmd 7
@@ -521,6 +522,9 @@ ffmpeg_pid() {
     return 0
 }
 
+# keep_log <file>: copy a run's ffmpeg stderr to $KEEP_LOG when the caller named one (row 5 reads the ort filter's own words from it).
+keep_log() { [[ -z "${KEEP_LOG:-}" ]] || cp -f "$1" "$KEEP_LOG" 2>/dev/null || true; }
+
 # run_fps <clip> <chain> [output] [runs] [frames]: the median fps of <runs> (default RUNS) runs (frames over wall
 # time, from -benchmark). On failure it prints 0 and returns ffmpeg's exit status (124 = timed out, see why); callers
 # run it in $(...), so the status is its return value, not a variable.
@@ -530,7 +534,8 @@ run_fps() {
     for ((i = 0; i < runs; i++)); do
         cmd_run "$1" "$2" "${3:-}" "${5:-}"
         # collected in this shell, not piped into median from the loop: a return inside a pipe is lost
-        ff_exec 2>"$log" >/dev/null || { rc=$?; echo 0; rm -f "$log"; return "$rc"; }
+        ff_exec 2>"$log" >/dev/null || { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }
+        keep_log "$log"
         # -stats separates its updates with \r, so the bench: line can share a line with the last one
         tr '\r' '\n' <"$log" >"$log.n"
         n=$(awk '/^frame=/ { gsub(/frame= */, ""); f = $1 } END { print f + 0 }' "$log.n")
@@ -726,9 +731,14 @@ api_stream() {
 
 # ---- the rows --------------------------------------------------------------------------------------
 
+# The image ships without fsr2 (zero motion vectors without CUDA: docs/intel-patched-ffmpeg-libplacebo.md); rows 7
+# and 8 and the fsr2 half of row 1 run only on a patched binary that still carries the filter.
+FSR2_SKIP_WHY="the patched ffmpeg has no fsr2 filter: the image ships without it, fsr2 gets zero motion vectors without CUDA (docs/intel-patched-ffmpeg-libplacebo.md)"
+has_fsr2() { grep -qE "^ [A-Z.]+ +fsr2 " <<<"$FILTERS"; }
+
 row_1() {
     have_api || { no_api 1 "no Jellyfin API: set BENCH_JELLYFIN_URL and BENCH_JELLYFIN_TOKEN"; return; }
-    local st probe bad="" why="" offered
+    local st probe bad="" why="" offered fsr2_note
     st=$(api /JellyfinPlus/Status) || { record 1 FAIL "GET /JellyfinPlus/Status failed"; return; }
     probe=$(api /JellyfinPlus/Session/bench-probe) || { record 1 FAIL "GET /JellyfinPlus/Session failed"; return; }
     [[ "$(jq -r '.Gpu.Vendor' <<<"$st")" == intel ]] || bad+=" vendor=$(jq -r '.Gpu.Vendor' <<<"$st")"
@@ -738,8 +748,15 @@ row_1() {
     for lvl in optix optix-temporal dlpp-1 dlpp-2 dlpp-3 dlpp-4 vsr-rtcuda dlss dlaa; do
         [[ " $offered " != *" $lvl "* ]] || bad+=" offered:$lvl"
     done
-    [[ " $offered " == *" fsr2 "* ]] || bad+=" fsr2-not-offered"
-    [[ -f "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-missing"
+    if has_fsr2; then
+        [[ " $offered " == *" fsr2 "* ]] || bad+=" fsr2-not-offered"
+        [[ -f "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-missing"
+        fsr2_note="fsr2 offered"
+    else
+        [[ " $offered " != *" fsr2 "* ]] || bad+=" offered:fsr2"
+        [[ ! -e "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-present"
+        fsr2_note="fsr2 not offered"
+    fi
     if [[ -r "$SHIM_LOG" ]]; then
         local hits
         hits=$(shim_log_new | grep -ciE 'nvenc|cuda' || true)
@@ -749,7 +766,7 @@ row_1() {
     fi
     "$PATCHED_FFMPEG" -hide_banner -nostdin -init_hw_device "vulkan=vk:$VK_DEV" \
         -f lavfi -i nullsrc=s=64x64 -frames:v 1 -f null - >/dev/null 2>&1 || bad+=" vulkan-vk:$VK_DEV-failed"
-    if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, fsr2 offered, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
+    if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, $fsr2_note, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
 }
 
 xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB, signed (+1.25, -0.40: callers print it as is); non-zero (xpsnr_y's status) when either score is missing
@@ -793,7 +810,7 @@ row_alts() {
         ALT_DETAIL+=" alt_$name=${d}dB"
         if gt "$d" "$best_d"; then best="$name"; best_d="$d"; fi
     done
-    ALT_DETAIL+=" best=$best"
+    ALT_DETAIL+=" best=$best (quality only, not fps)"
 }
 
 shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e] [alts]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size; alts=1 also scores the ROW2_ALTS paths
@@ -856,13 +873,68 @@ row_2() { shader_row 2 360 1920 1080 "$FPS_R2" "$XPSNR_R2" 0 1; }
 row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1; }
 row_4() { shader_row 4 1080 3840 2160 "$FPS_R4" "$XPSNR_R4" 1; }
 
+# ort_why <ffmpeg stderr log>: the lines that say where the ort filter ran or why it did not (its own `using CPU`
+# warnings, ONNX Runtime's errors, the device line), up to three, joined by `|`. Nothing when the log has none. The
+# `using CPU` lines come first so earlier OpenVINO chatter cannot push the reason out of the three.
+ort_why() {
+    local log
+    log=$(tr '\r' '\n' <"$1" 2>/dev/null) || true
+    { grep 'using CPU' <<<"$log" || true; grep -E 'OpenVINO|onnxruntime|ONNX|[Ee]rror' <<<"$log" || true; } \
+        | awk '!seen[$0]++' | head -3 | cut -c1-240 | paste -sd'|' - || true
+}
+# ort_chain_state <log>: what the direct ort chain's own log says about the provider. The filter's device line
+# (`device=cpu`) is a fallback even when no `using CPU` warning preceded it.
+ort_chain_state() {
+    local t
+    t=$(ort_why "$1")
+    if [[ "$t" == *"using CPU"* || "$t" == *"device=cpu"* ]]; then echo "CPU_FALLBACK[$t]"
+    elif [[ -n "$t" ]]; then echo "log[$t]"
+    else echo "no_ort_line_in_log"; fi
+}
+# ort_env_report: what OpenVINO's GPU device needs from this pod, one `key=value` each: the provider and the GPU plugin
+# beside the core, the plugin's unresolved libraries, an OpenCL ICD and loader (and Level Zero's loader), and whether this
+# process can open the render node. A missing item is the CPU fallback's cause, not a guess at it.
+ort_env_report() {
+    local lib="$PREFIX/ort/lib" plugin f miss="" nf="" icds lc="" lddout="" ldc open err gid z=MISSING o=MISSING l="UNKNOWN(plugin not linked against it or no ldd)"
+    plugin="$lib/libopenvino_intel_gpu_plugin.so"
+    for f in libonnxruntime_providers_openvino.so libopenvino_intel_gpu_plugin.so; do
+        [[ -e "$lib/$f" ]] || miss+="$f,"
+    done
+    if [[ -e "$plugin" ]] && command -v ldd >/dev/null 2>&1; then
+        lddout=$(ldd "$plugin" 2>&1 || true)
+        nf=$(awk '/not found/ { printf "%s,", $1 }' <<<"$lddout")
+        # the loader as the plugin itself resolves it, not a guess from the cache
+        if [[ "$nf" == *libOpenCL* ]]; then l=MISSING
+        elif [[ "$lddout" == *libOpenCL* ]]; then l=present; fi
+    fi
+    icds=$(compgen -G "/etc/OpenCL/vendors/*.icd" || true)
+    [[ -z "$icds" ]] || o=present
+    ldc=""
+    for f in /sbin/ldconfig /usr/sbin/ldconfig; do
+        if [[ -x "$f" ]]; then ldc="$f"; break; fi
+    done
+    if [[ -n "$ldc" ]]; then
+        lc=$("$ldc" -p 2>/dev/null || true)
+        if [[ "$lc" == *libze_loader.so.1* ]]; then z=present; fi
+    else
+        z="UNKNOWN(no ldconfig)"
+    fi
+    # `<>` creates a missing file, so only a real device node is opened
+    if [[ ! -c "$NODE" ]]; then open="FAIL(not a device node in this pod)"
+    elif err=$( { : <>"$NODE"; } 2>&1 ); then open=ok
+    else open="FAIL(${err##*: })"; fi
+    gid=$(stat -c %g "$NODE" 2>/dev/null || echo "?")
+    echo "ort_env: ep_libs_missing=${miss:-none} gpu_plugin_unresolved=${nf:-none} opencl_icd=$o libOpenCL=$l level_zero_loader=$z render_node=$NODE open=$open node_gid=$gid process_gids=$(id -G | tr ' ' ,)"
+}
+
 row_5() {
     [[ -n "$ORT_MODEL" ]] || { record 5 SKIP "no BENCH_ORT_MODEL"; return; }
-    local f360 f720 rec dev applied status=MANUAL note
-    local rc
-    f360=$(run_fps "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 360p (fps_360p=$f360)")"; return; }
-    f720=$(run_fps "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 720p (fps_720p=$f720)")"; return; }
-    note="fps_360p=$f360 fps_720p=$f720 over the first $ORT_FRAMES frames, one run each, model compile included (real time = source fps; choose NeuralMaxSourceHeight from these)"
+    local f360 f720 rec dev applied status=MANUAL note req withheld routing sumry env_note
+    local rc l360="$RUN_OUT/row5-360p.ffmpeg.log" l720="$RUN_OUT/row5-720p.ffmpeg.log"
+    env_note=$(ort_env_report)
+    f360=$(KEEP_LOG="$l360" run_fps "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 360p (fps_360p=$f360)") ffmpeg_ort_360p=$(ort_chain_state "$l360") $env_note"; return; }
+    f720=$(KEEP_LOG="$l720" run_fps "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 720p (fps_720p=$f720)") ffmpeg_ort_720p=$(ort_chain_state "$l720") $env_note"; return; }
+    note="fps_360p=$f360 fps_720p=$f720 over the first $ORT_FRAMES frames, one run each, model compile included (real time = source fps; choose NeuralMaxSourceHeight from these) requested=device=openvino(device_type=GPU) ffmpeg_ort_360p=$(ort_chain_state "$l360") ffmpeg_ort_720p=$(ort_chain_state "$l720") $env_note"
     if ! have_api; then
         if [[ "$API_WHY" == rejected ]]; then
             record 5 FAIL "$note token rejected (HTTP $API_CODE) by $JF_URL/System/Info"
@@ -881,7 +953,17 @@ row_5() {
     dev=$(jq -r '.NeuralDevice // "none"' <<<"$rec")
     applied=$(jq -r '.NeuralApplied // false' <<<"$rec")
     [[ "$dev" == openvino ]] || status=FAIL
-    record 5 "$status" "$note device=$dev neural_applied=$applied"
+    note+=" device=$dev neural_applied=$applied"
+    if [[ "$dev" != openvino ]]; then
+        # NeuralDevice is null unless the engine built an ort node: none means the session never ran ORT, which is not
+        # an ORT fallback (that reads cpu, with the reason in the direct chain's log above).
+        req=$(jq -r '.NeuralRequested // "off"' <<<"$rec")
+        withheld=$(jq -r '.Record.GpuWithheldUnmeasured // empty' <<<"$rec")
+        routing=$(jq -r '.NeuralRouting // empty' <<<"$rec")
+        sumry=$(jq -r '.Record.Summary // empty' <<<"$rec")
+        note+=" session_neural_requested=$req session_withheld=${withheld:-none} session_routing=${routing:-none} session_summary=${sumry:0:300}"
+    fi
+    record 5 "$status" "$note"
 }
 
 # The plugin's configuration is changed for row 6 and put back as it was found, on any exit.
@@ -929,11 +1011,12 @@ row_6() {
     if [[ "$routing" == *"NOT run"* && "$applied" != true ]]; then
         record 6 PASS "NeuralRouting=$routing"
     else
-        record 6 FAIL "a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied"
+        record 6 FAIL "a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied neural_requested=$(jq -r '.NeuralRequested // "off"' <<<"$rec") session_withheld=$(jq -r '.Record.GpuWithheldUnmeasured // "none"' <<<"$rec")"
     fi
 }
 
 row_7() {
+    has_fsr2 || { record 7 SKIP "$FSR2_SKIP_WHY"; return; }
     [[ -f "$CLIPS/still_720p.png" ]] || { record 7 SKIP "no $CLIPS/still_720p.png"; return; }
     local skip kind status=PASS detail f rc
     skip=$(still_skip 1.5)
@@ -955,6 +1038,7 @@ row_7() {
 }
 
 row_8() {
+    has_fsr2 || { record 8 SKIP "$FSR2_SKIP_WHY"; return; }
     [[ -f "$CLIPS/pan_720p.mkv" && -f "$CLIPS/pan_1080p.mkv" ]] || { record 8 SKIP "no pan_720p.mkv / pan_1080p.mkv"; return; }
     local d ow oh rc=0 fsr2_out="$RUN_OUT/pan-fsr2.mkv" bicubic_out="$RUN_OUT/pan-bicubic.mkv"
     read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"
@@ -966,7 +1050,7 @@ row_8() {
     score_inputs 8 "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv" || return 0
     d=$(xpsnr_delta "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv") || { rc=$?; record 8 FAIL "xpsnr failed ($(why "$rc" "the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv"))"; return; }
     if ge "$d" 0; then record 8 PASS "xpsnr_delta=${d}dB"
-    else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda ($(xpsnr_frames "$RUN_OUT/xpsnr-$(basename "$fsr2_out").txt"); fsr2 gets zero motion vectors without CUDA, docs/intel-patched-ffmpeg-libplacebo.md)"; fi
+    else record 8 FAIL "xpsnr_delta=${d}dB: fsr2 loses to bicubic on moving content ($(xpsnr_frames "$RUN_OUT/xpsnr-$(basename "$fsr2_out").txt"); fsr2 gets zero motion vectors without CUDA, docs/intel-patched-ffmpeg-libplacebo.md)"; fi
 }
 
 # hwdec_source: the H.264 1080p clip row 9 reads, cut once from the lossless master when there is none. Called
@@ -1155,7 +1239,7 @@ mkdir "$RUN_OUT" || die "cannot create $RUN_OUT"
 # The list is captured, then searched: `-filters | grep -q` lets grep quit at its match, the writer takes
 # SIGPIPE, and pipefail reports a filter that is there as missing.
 FILTERS=$("$PATCHED_FFMPEG" -hide_banner -filters 2>/dev/null) || die "$PATCHED_FFMPEG -filters failed"
-for filter in $(ffmpeg_required_filters intel) fsr2 libplacebo xpsnr; do
+for filter in $(ffmpeg_required_filters intel) libplacebo xpsnr; do
     grep -qE "^ [A-Z.]+ +$filter " <<<"$FILTERS" || die "$PATCHED_FFMPEG lists no $filter filter: this is not the Intel build"
 done
 STOCK_FILTERS=$("$STOCK_FFMPEG" -hide_banner -filters 2>/dev/null) || die "$STOCK_FFMPEG -filters failed"
