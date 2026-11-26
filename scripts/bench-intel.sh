@@ -1096,10 +1096,11 @@ zerocopy_note() {
     rm -f "$log"
 }
 
-# cpu_secs: the user+system CPU seconds of the last `bench:` line on stdin (-benchmark); nothing when there is none.
+# cpu_secs: the user+system CPU seconds of the `bench: utime=` line on stdin (-benchmark); nothing when there is none.
+# ffmpeg ends with a `bench: maxrss=` line that has neither field, so only the utime line is read.
 # System time counts: VA-API decode and hwdownload spend it in the kernel.
 cpu_secs() {
-    tr '\r' '\n' | awk '/^bench:/ {
+    tr '\r' '\n' | awk '/^bench: utime=/ {
         u = s = 0
         for (i = 1; i <= NF; i++) {
             v = $i; sub(/s$/, "", v)
