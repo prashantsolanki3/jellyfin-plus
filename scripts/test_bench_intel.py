@@ -18,8 +18,8 @@ Needs no GPU, ffmpeg, docker, network or Jellyfin. It runs the real scripts/benc
   - a row scores only files its own run wrote (rev-hxlit): a fresh run-<id> directory per run, a used id
     refused, any failed write a FAIL, a missing or old scored file a FAIL;
   - scripts/plugin-meta.sh holds the plugin GUID and target ABI once (Plugin.cs and manifest.json agree);
-  - docker/intel/Dockerfile keeps its pins (base digest, FSR2 commit, SDK sha512), builds the Intel
-    variant, carries the acceptance checks, and its digest matches the spec page;
+  - docker/intel/Dockerfile keeps its pins (base digest, SDK sha512), builds the Intel
+    variant without fsr2, carries the acceptance checks, and its digest matches the spec page;
   - mutation: each deliberate breakage of bench-intel.sh is caught by the plan checks.
 
 It does not build the image and does not run a row against a GPU. Exit status: 0 every check passed,
@@ -32,7 +32,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
+
+WORKERS = 8
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -61,6 +64,21 @@ def bicubic(w, h):
 
 
 YUV_END = "format=yuv420p,hwdownload,format=yuv420p"
+
+
+def ewa(w, h):
+    """Row 2's `ewa` alternative: libplacebo's ewa_lanczos, no shader."""
+    return f"format=yuv420p,hwupload,libplacebo=w={w}:h={h}:upscaler=ewa_lanczos:{YUV_END}"
+
+
+def shader_bicubic(mw, mh, w, h):
+    """Row 2's `x2-bicubic` / `lowtarget` alternatives: FSRCNNX to mw x mh, then bicubic to the master's size w x h."""
+    return (f"format=yuv420p,hwupload,libplacebo=w={mw}:h={mh}:upscaler=ewa_lanczos:custom_shader_path={SHADER}:"
+            f"{YUV_END},scale={w}:{h}:flags=bicubic,format=yuv420p")
+
+
+# the 360p fixture is not on disk in a dry run, so the plan takes the nominal 640x360: 2x is 1280x720, 1.5x is 960x540
+ALTS = ("ewa", "x2-bicubic", "lowtarget")
 # the tail the bench and production used until rev-8j46u: every chain that carries it is a regression
 RGBA_TAIL = "format=rgba,hwdownload,format=rgba"
 FSR2_CHAIN = ("format=yuv420p,format=gbrpf32le,fsr2=w=1920:h=1080,format=yuv420p,hwupload,"
@@ -142,12 +160,18 @@ THRESHOLD = {
 
 EXACT = [
     "plan: bench-intel: rows=1 2 3 4 5 6 7 8 9 10 11 12 13 runs=3 mode=dry-run",
-    "plan: required filters: oidn ort fsr2",
+    "plan: required filters: oidn ort",
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), ff=STOCK),
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), f"{RUN}/r2-shader.mkv", ff=STOCK),
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080), f"{RUN}/r2-bicubic.mkv", ff=STOCK),
     "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-shader.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
     "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-bicubic.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", ewa(1920, 1080), f"{RUN}/r2-alt-ewa.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-alt-ewa.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader_bicubic(1280, 720, 1920, 1080), f"{RUN}/r2-alt-x2-bicubic.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-alt-x2-bicubic.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader_bicubic(960, 540, 1920, 1080), f"{RUN}/r2-alt-lowtarget.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-alt-lowtarget.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
     "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160), ff=STOCK),
     "plan: row 4 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(3840, 2160), f"{RUN}/r4-shader.mkv", ff=STOCK),
     "plan: row 4 cmd: " + xpsnr_cmd(f"{RUN}/r4-bicubic.mkv", "/clips/tears_2160p.mkv", ff=STOCK),
@@ -173,13 +197,17 @@ FAILS = []
 PASSES = 0
 
 
+LOCK = threading.Lock()
+
+
 def check(name, ok, detail=""):
     global PASSES
-    if ok:
-        PASSES += 1
-    else:
-        FAILS.append(name)
-        print(f"FAIL {name} {detail}".rstrip())
+    with LOCK:
+        if ok:
+            PASSES += 1
+        else:
+            FAILS.append(name)
+            print(f"FAIL {name} {detail}".rstrip())
 
 
 def clean_env(extra=None, path=None):
@@ -393,11 +421,17 @@ FFMPEG_STUB = r'''#!/bin/sh
 [ -z "${FAKE_FFMPEG_LOG:-}" ] || echo "$*" >> "$FAKE_FFMPEG_LOG"
 case "$*" in
 *-filters*)
-    for f in oidn ort fsr2 libplacebo xpsnr; do echo " T.. $f  V->V stub"; done
+    for f in oidn ort fsr2 libplacebo xpsnr; do
+        # FAKE_NO_FSR2=1: the Intel image's binary, which carries no fsr2 filter
+        [ "$f" = fsr2 ] && [ "${FAKE_NO_FSR2:-}" = 1 ] && continue
+        echo " T.. $f  V->V stub"
+    done
     i=0; while [ $i -lt 4000 ]; do echo " T.. pad$i  V->V padding so the pipe fills"; i=$((i + 1)); done
     exit 0;;
 *xpsnr=*)
     [ "${FAKE_XPSNR_FAIL:-}" = 1 ] && exit 1
+    # FAKE_XPSNR_FAIL_ON: a substring of a scored file's path whose score fails (one row 2 alternative missing its score)
+    if [ -n "${FAKE_XPSNR_FAIL_ON:-}" ]; then case "$*" in *"$FAKE_XPSNR_FAIL_ON"*) exit 1;; esac; fi
     [ "${FAKE_XPSNR_HANG:-}" = 1 ] && exec sleep 4
     # real ffmpeg 9 prints two spaces after XPSNR and between the planes: `XPSNR  y: 14.4167  u: 30.1  v: 30.2`
     # FAKE_XPSNR_SWAP=1: the candidates (shader, fsr2) score below their bicubic control, a negative delta
@@ -407,6 +441,10 @@ case "$*" in
     *shader.mkv* | *pan-fsr2.mkv*) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=30 || y=40;;
     *) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=40 || y=30;;
     esac
+    # FAKE_XPSNR_ALT="ewa=34 lowtarget=36": the luma score of a row 2 alternative (r2-alt-<name>.mkv), whole dB
+    for kv in ${FAKE_XPSNR_ALT:-}; do
+        case "$*" in *"r2-alt-${kv%%=*}.mkv"*) y=${kv#*=};; esac
+    done
     # FAKE_XPSNR_GREEN=1: the shader outputs keep their luma score but have lost their chroma, as ANV's green frames did
     c=$y
     case "$*" in *shader.mkv*) [ "${FAKE_XPSNR_GREEN:-}" = 1 ] && c=3;; esac
@@ -443,6 +481,12 @@ case "$*" in
 *-benchmark*)
     [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4
+    # FAKE_ORT_WARN: what the ort filter says on stderr when the OpenVINO provider is not there (vf_ort.c append_openvino)
+    # FAKE_ORT_NOISE: three OpenVINO lines before the warning; FAKE_ORT_DEVICE: the device line vf_ort config_input prints
+    case "$*" in *ort=*)
+        [ -z "${FAKE_ORT_NOISE:-}" ] || for n in 1 2 3; do echo "[Parsed_ort_3 @ 0x1] OpenVINO runtime note $n" >&2; done
+        [ -z "${FAKE_ORT_WARN:-}" ] || echo "[Parsed_ort_3 @ 0x1] $FAKE_ORT_WARN" >&2
+        [ -z "${FAKE_ORT_DEVICE:-}" ] || echo "[Parsed_ort_3 @ 0x1] onnxruntime 1.20.1: /m/model.onnx, 640x360 -> 1280x720 (x2), device=$FAKE_ORT_DEVICE" >&2;; esac
     # an ffv1 write leaves its output (the last argument) as ffmpeg does. FAKE_FFV1_FAIL / _SKIP / _STALE hold a substring
     # of the output path they apply to: _FAIL exits 1 (a full disk), _SKIP exits 0 and writes nothing, _STALE writes it
     # with a year-2000 mtime, as a leftover of an earlier run would be.
@@ -459,7 +503,8 @@ case "$*" in
         if [ -z "$skip" ]; then
             # the file says what was asked of it (size from the chain, 480 frames like the masters), so ffprobe can report it.
             # FAKE_FFV1_SHORT / _BADSIZE hold a substring of the output path: one frame short, or a 1280x572 picture.
-            dims=$(echo "$*" | sed -n 's/.*libplacebo=w=\([0-9]*\):h=\([0-9]*\).*/\1 \2/p;s/.*scale=\([0-9]*\):\([0-9]*\):.*/\1 \2/p')
+            # a trailing scale (the shader-then-bicubic alternatives) is the final size; else the libplacebo one
+            dims=$(echo "$*" | sed -n -e 's/.*scale=\([0-9]*\):\([0-9]*\):.*/\1 \2/p' -e t -e 's/.*libplacebo=w=\([0-9]*\):h=\([0-9]*\).*/\1 \2/p')
             n=480
             if [ -n "${FAKE_FFV1_SHORT:-}" ]; then
                 case "$last" in *"$FAKE_FFV1_SHORT"*) n=479;; esac
@@ -546,7 +591,8 @@ DATE_STUB = ('#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${F
 # `sleep 5` (row 10's measuring window) is the only thing it fakes: with FAKE_VANISH set to a directory, the second of the two
 # 5 s sleeps (the load reader's and the fdinfo sampler's, in whichever order they start) removes it, so a stand-in /proc
 # entry vanishes mid-window as an exited transcode does. mkdir of FAKE_VANISH_LOCK is the atomic "first caller" test.
-SLEEP_STUB = ('#!/bin/sh\nif [ -n "${FAKE_VANISH:-}" ] && [ "$1" = 5 ]; then\n'
+SLEEP_STUB = ('#!/bin/sh\n[ -z "${FAKE_SLEEP_LOG:-}" ] || echo "$1" >>"$FAKE_SLEEP_LOG"\n'
+              'if [ -n "${FAKE_VANISH:-}" ] && [ "$1" = 5 ]; then\n'
               '  mkdir "$FAKE_VANISH_LOCK" 2>/dev/null || rm -rf "$FAKE_VANISH"\nfi\n'
               # row 10's 1/2/5 s waits run at a tenth of their length; the fake plugin's 5 s cache window shrinks with them
               'if [ -n "${FAKE_FAST_WAIT:-}" ]; then\n  case "$1" in 1) set -- 0.1;; 2) set -- 0.2;; 5) set -- 0.5;; esac\nfi\n'
@@ -656,7 +702,7 @@ if path.startswith("/JellyfinPlus/Session/"):
         shimlog(sc.get("probe_logs"))
     s = st["sessions"].get(sid)
     if s is None:
-        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": ["off", "fsr2"]}
+        levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": sc.get("game_levels", ["off", "fsr2"])}
         if cfg_max > 0 and sc.get("config_applies", True):
             levels["NeuralMaxSourceHeight"] = cfg_max
         out({"Known": False, "Levels": levels})
@@ -664,8 +710,13 @@ if path.startswith("/JellyfinPlus/Session/"):
     if cfg_max > 0 and s["neural"] and s["src_height"] > cfg_max:
         routing = "neural %s NOT run: the source is %dp, taller than NeuralMaxSourceHeight %d, so the shader path ran" % (
             s["neural"], s["src_height"], cfg_max)
-    out({"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False), "Encoder": sc.get("encoder"),
-         "NeuralDevice": sc.get("device", "openvino"), "NeuralRouting": sc["routing"] if "routing" in sc else routing})
+    rec = {"Known": True, "SourceHeight": s["src_height"], "NeuralApplied": sc.get("applied", False), "Encoder": sc.get("encoder"),
+           "NeuralDevice": sc.get("device", "openvino"), "NeuralRouting": sc["routing"] if "routing" in sc else routing}
+    if "requested" in sc:
+        rec["NeuralRequested"] = sc["requested"]
+    if "withheld" in sc:
+        rec["Record"] = {"GpuWithheldUnmeasured": sc["withheld"]}
+    out(rec)
 if path.endswith("/master.m3u8"):
     if sc.get("fail_master"):
         fail()
@@ -818,13 +869,19 @@ def test_mutants(tmp):
         ("chroma-floor-zero", "CHROMA_XPSNR_MIN=25", "CHROMA_XPSNR_MIN=0"),
         ("hwdec-no-download", 'echo "hwdownload,format=nv12,hwupload,libplacebo', 'echo "hwupload,libplacebo'),
         ("hwdec-ffv1-plan", 'cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)"', 'cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)"'),
+        ("alt-no-final-resize", '$YUV_END,scale=$1:$2:flags=bicubic,format=yuv420p"; }', '$YUV_END"; }'),
+        ("alt-shader-at-target", "libplacebo=w=$ALT_MID_W:h=$ALT_MID_H:", "libplacebo=w=$1:h=$2:"),
+        ("alt-low-is-x2", "ALT_LOW=1.5", "ALT_LOW=2"),
+        ("alt-ewa-with-shader", 'chain_ewa() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:$YUV_END"; }',
+         'chain_ewa() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }'),
+        ("alts-not-planned", "                plan_alts 2 360 1080 1920 1080\n", ""),
+        ("alts-dropped-from-plan", 'ROW2_ALTS="ewa x2-bicubic lowtarget"', 'ROW2_ALTS="ewa x2-bicubic"'),
     ]:
         path = mutant_dir(tmp, name, old, new)
         rc, out, _ = run(path, ["--dry-run"])
         check(f"mutant {name} is caught", rc != 0 or bool(plan_failures(out)))
 
-    pool = ThreadPoolExecutor(max_workers=8)
-    pending = []
+    behaviour = []
     for name, old, new, fn in [
         ("octal-hhmm", 'hm=$((10#$(TZ="$BLOCK_TZ" date +%H%M)))', 'hm=$(TZ="$BLOCK_TZ" date +%H%M)', gate_failures),
         ("octal-window-start", "lo=$((10#${item%-*}))", "lo=$((${item%-*}))", gate_failures),
@@ -833,7 +890,7 @@ def test_mutants(tmp):
         ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
         ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
-        ("run-fps-lost-failure", '|| { rc=$?; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
+        ("run-fps-lost-failure", '|| { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
         ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"',
          'curl -fsS -H "Authorization: MediaBrowser Token=\\"$JF_TOKEN\\"" "$@" "$JF_URL$p"', token_failures),
         ("legacy-header", 'Authorization: MediaBrowser Token=\\\\"%s\\\\"', "X-Emby-Token: %s", token_failures),
@@ -880,28 +937,41 @@ def test_mutants(tmp):
         ("size-unchecked", '("$mw" != "?" && "$w" != "$mw") || ("$mh" != "?" && "$h" != "$mh") || ', "", inputs_failures),
         ("inf-read-as-zero-y", "print (v ~ /^[+-]?[Ii]nf/ ? 999 : v + 0)", "print v + 0", inputs_failures),
         ("inf-read-as-zero-chroma", "return x ~ /^[+-]?[Ii]nf/ ? 999 : x + 0", "return x + 0", inputs_failures),
-        ("trace-silent", """printf 'trace: row %s: %s\\n' "${CUR_ROW:-?}" "${CMD[*]}" >&9;""", ":;", trace_failures),
+        ("alts-dropped", 'ROW2_ALTS="ewa x2-bicubic lowtarget"', 'ROW2_ALTS=""', alt_failures),
+        ("alt-fails-the-row", 'detail+="$ALT_DETAIL"', 'detail+="$ALT_DETAIL"; [[ "$ALT_DETAIL" != *FAIL* ]] || status=FAIL', alt_failures),
+        ("alt-tie-goes-late", 'if gt "$d" "$best_d"; then best="$name"', 'if ge "$d" "$best_d"; then best="$name"', alt_failures),
+        ("alt-not-lined-up", 'if ! why_not=$(lines_up "$out" "$master"); then', 'if ! why_not=$(:); then', alt_failures),
+        ("alts-after-failed-score", 'if [[ "$alts" == 1 && "$xrc" == 0 ]]; then', 'if [[ "$alts" == 1 ]]; then', alt_failures),
+        ("alts-on-row-3", 'row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1; }', 'row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1 1; }', alt_failures),
+        ("trace-silent","""printf 'trace: row %s: %s\\n' "${CUR_ROW:-?}" "${CMD[*]}" >&9;""", ":;", trace_failures),
         ("row10-no-prime",'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
         ("row10-short-wait", "LOAD_WAIT=5", "LOAD_WAIT=1", row10_prime_failures),
+        ("row10-wait-4s", "LOAD_WAIT=5", "LOAD_WAIT=4", row10_prime_failures),
         ("row10-fdinfo-none", 'fdnote="fdinfo=not visible from the bench pod"', 'fdnote="fdinfo_busy=none"', row10_prime_failures),
         ("row10-stock-unmatched", "jellyfin-ffmpeg(-oidn)?/ffmpeg", "jellyfin-ffmpeg-oidn/ffmpeg",
          lambda sc, t, g: row10_fdinfo_failures(sc, t, g, ("stock",))),
         ("row10-oidn-unmatched", "jellyfin-ffmpeg(-oidn)?/ffmpeg", "jellyfin-ffmpeg/ffmpeg",
          lambda sc, t, g: row10_fdinfo_failures(sc, t, g, ("oidn",))),
     ]:
-        # each behaviour check is hermetic (its own World dirs under a tag of its own) and mostly waits on stub sleeps, so
-        # they run side by side; the verdicts are recorded here, in table order
-        pending.append((name, pool.submit(fn, mutant_dir(tmp, name, old, new), tmp, "mut-" + name)))
-    for name, fut in pending:
-        check(f"mutant {name} is caught by its behaviour check", bool(fut.result()))
-    pool.shutdown()
+        path = mutant_dir(tmp, name, old, new)
+        behaviour.append((name, path, fn))
+
+    # each behaviour check runs the script for seconds (some wait out a stub hang): in parallel, each in its own directory
+    def caught(item):
+        name, path, fn = item
+        sub = os.path.join(tmp, "b-" + name)
+        os.makedirs(sub)
+        return name, bool(fn(path, sub, "mut-" + name))
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for name, ok in pool.map(caught, behaviour):
+            check(f"mutant {name} is caught by its behaviour check", ok)
 
 
 def build_apt_checks(df):
     """The build stage's apt line carries every dev package build-ffmpeg.sh installs for the Intel build.
 
-    The FSR2 compile runs before the script's own apt step, and a header missing there (vulkan/vulkan.h)
-    failed the first CI build.
+    A header missing there (vulkan/vulkan.h) failed the first CI build.
     """
     stage = re.search(r"^FROM \S+ AS build\n(.*?)(?=^FROM )", df, re.M | re.S)
     check("the Dockerfile has a build stage", bool(stage))
@@ -921,9 +991,7 @@ def build_apt_checks(df):
     missing = [p for p in wanted if p not in pkgs]
     check("the build stage installs everything build-ffmpeg.sh apt-installs for intel", not missing, str(missing))
 
-    fetch = body.find("git fetch")
-    at = apt.start() if apt else -1
-    check("the apt install comes before the FSR2 fetch and compile", 0 <= at < fetch, f"{at} {fetch}")
+    check("the build stage fetches no FSR2 source", "git fetch" not in body and "FidelityFX" not in body)
     check("the distro shaderc is not installed (it broke nlmeans_vulkan)", "libshaderc" not in " ".join(pkgs))
     check("build-ffmpeg.sh apt-installs zlib1g-dev for intel (png needs zlib)", "zlib1g-dev" in (intel.group(1).split() if intel else []))
     check("build-ffmpeg.sh passes --enable-zlib for intel", bool(re.search(r"HWACCEL_FLAGS=\([^)]*--enable-zlib", script.split("else\n    VENDOR_PATCHES=(")[0])))
@@ -1120,20 +1188,21 @@ def dockerfile_checks(tmp):
     digest = re.search(r"^ARG JELLYFIN_IMAGE=(\S+@sha256:[0-9a-f]{64})$", df, re.M)
     check("base image is pinned by digest", bool(digest))
     check("the spec page names the same base image", bool(digest) and digest.group(1).split("docker.io/")[1] in spec)
-    commit = re.search(r"^ARG FSR2_COMMIT=([0-9a-f]{40})$", df, re.M)
-    check("FSR2 is pinned to a full commit", bool(commit))
-    check("the spec page names the FSR2 commit", bool(commit) and commit.group(1) in spec)
+    check("the image builds no fsr2 (zero motion vectors without CUDA): no SDK, no WITH_FSR2",
+          not re.search(r"WITH_FSR2|FSR2_|gen_perm|fsr2compat|FidelityFX", df))
+    check("the build acceptance requires the fsr2 marker absent and the filter absent",
+          "test ! -e /usr/lib/jellyfin-ffmpeg-oidn/fsr2-nocuda" in df and "carries fsr2: not shipped on Intel" in df)
     check("the .NET SDK sha512 is pinned and checked",
           bool(re.search(r"^ARG DOTNET_SDK_SHA512=[0-9a-f]{128}$", df, re.M)) and "sha512sum -c" in df)
     check("no :latest", ":latest" not in df)
     froms = re.findall(r"^FROM (\S+)", df, re.M)
     check("every stage starts from the pinned base", froms and all(f == "${JELLYFIN_IMAGE}" for f in froms), str(froms))
-    for needle in ["GPU_VENDOR=intel", "WITH_ORT=1", "ORT_EP=openvino", "WITH_FSR2=1", "FSR2_SDK=", "FSR2_LIB=",
-                   "PREFIX=/usr/lib/jellyfin-ffmpeg-oidn", "scripts/build-ffmpeg.sh", "fsr2-nocuda",
+    for needle in ["GPU_VENDOR=intel", "WITH_ORT=1", "ORT_EP=openvino",
+                   "PREFIX=/usr/lib/jellyfin-ffmpeg-oidn", "scripts/build-ffmpeg.sh",
                    "ffmpeg_required_filters intel", "-hwaccels", "h264_qsv", "-encoders | grep -qE '^ V.{5} png '",
                    "-decoders | grep -qE '^ V.{5} png '", "cmp /tmp/base-ffmpeg",
                    "not found", "S=/usr/lib/jellyfin-ffmpeg/lib", "libvulkan.so.1 libshaderc_shared.so.1",
-                   'loads $so from $got, not $S', "git rev-parse HEAD", "FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
+                   'loads $so from $got, not $S',"FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
                    "/var/cache/jellyfin/jellyfin-upscale.json", "jellyfin-ffmpeg-upscale"]:
         check(f"Dockerfile carries {needle}", needle in df)
     check("Dockerfile publishes nothing and sets no USER", not re.search(r"docker push|^USER ", df, re.M))
@@ -1152,7 +1221,7 @@ def dockerfile_checks(tmp):
     check("dockerignore keeps what the build needs", not [n for n in need if n in ignore], str(ignore))
     for rel in ["shim/jellyfin-ffmpeg-upscale", "scripts/bench-intel.sh", "scripts/ffmpeg-vendor.sh", "scripts/build-ffmpeg.sh",
                 "scripts/install-shaders.sh", "scripts/jellyfin-plus-webinject", "scripts/build-web-panel.sh",
-                "ffmpeg/gen_perm.py", "ffmpeg/fsr2compat.h", "web/theme/jellyfinplus.css", "web/package-lock.json",
+                "web/theme/jellyfinplus.css", "web/package-lock.json",
                 "assets/jellyfinplus.png", "assets/plugin-meta.json", "docker/intel/stage-plugin.sh",
                 "docker/intel/entrypoint.py", "docker/intel/accept-plugin.sh", "scripts/test_entrypoint.py"]:
         check(f"{rel} exists", os.path.isfile(os.path.join(REPO, rel)))
@@ -1472,7 +1541,11 @@ def size_failures(script, tmp, tag):
             bad.append(f"row{row}-{title}:no ffmpeg run")
         for l in lines:
             sizes = re.findall(r"(?:w=(\d+):h=(\d+)|scale=(\d+):(\d+):)", l)
-            if not want.search(l) or any((a or c, b or d) != (str(ow), str(oh)) for a, b, c, d in sizes):
+            if "r2-alt-" in l:
+                # a shader-then-bicubic alternative runs its shader at an intermediate size; the file it writes is the master's
+                if not sizes or (sizes[-1][0] or sizes[-1][2], sizes[-1][1] or sizes[-1][3]) != (str(ow), str(oh)):
+                    bad.append(f"row{row}-{title}-alt:{l[-90:]}")
+            elif not want.search(l) or any((a or c, b or d) != (str(ow), str(oh)) for a, b, c, d in sizes):
                 bad.append(f"row{row}-{title}:{l[-90:]}")
     return bad
 
@@ -1777,7 +1850,7 @@ def row9_failures(script, tmp, tag):
     return bad
 
 
-RUN_FILES = ["r2-shader.mkv", "r2-bicubic.mkv", "r3-shader.mkv", "r3-bicubic.mkv", "r4-shader.mkv", "r4-bicubic.mkv",
+RUN_FILES = ["r2-shader.mkv", "r2-bicubic.mkv", "r2-alt-ewa.mkv", "r2-alt-x2-bicubic.mkv", "r2-alt-lowtarget.mkv", "r3-shader.mkv", "r3-bicubic.mkv", "r4-shader.mkv", "r4-bicubic.mkv",
              "pan-fsr2.mkv", "pan-bicubic.mkv", "hwdec-on.mkv", "hwdec-off.mkv"]
 SHARED = ("results.jsonl", "tears_1080p_h264.mkv")
 
@@ -1895,12 +1968,20 @@ def argv_failures(script, tmp, tag):
     sh, bi = f"{run_dir}/r2-shader.mkv", f"{run_dir}/r2-bicubic.mkv"
     xp = [l for l in r2 if "xpsnr=" in l]
     pairs = [re.search(r" -i (\S+) -i (\S+) -lavfi ", l).groups() for l in xp]
-    if pairs != [(sh, master), (bi, master), (sh, master)]:
+    alt = {n: f"{run_dir}/r2-alt-{n}.mkv" for n in ALTS}
+    want_pairs = [(sh, master), (bi, master), (sh, master)]
+    for n in ALTS:  # each alternative is scored against the master, then the same bicubic control again
+        want_pairs += [(alt[n], master), (bi, master)]
+    if pairs != want_pairs:
         bad.append(f"row2-xpsnr-inputs:{pairs}")
     if any(PAIR not in l for l in xp):
         bad.append("row2-xpsnr-pairing-not-by-index")
     writes = [l for l in r2 if "-c:v ffv1" in l]
-    want_writes = [run_cmd(src, shader(1920, 858), sh), run_cmd(src, bicubic(1920, 858), bi)]
+    # the source is 640x286, so 2x is 1280x572 and 1.5x is 960x430 (even); every alternative ends at the master's 1920x858
+    want_writes = [run_cmd(src, shader(1920, 858), sh), run_cmd(src, bicubic(1920, 858), bi),
+                   run_cmd(src, ewa(1920, 858), alt["ewa"]),
+                   run_cmd(src, shader_bicubic(1280, 572, 1920, 858), alt["x2-bicubic"]),
+                   run_cmd(src, shader_bicubic(960, 430, 1920, 858), alt["lowtarget"])]
     if writes != [l.replace(FF, ff, 1) for l in want_writes]:
         bad.append(f"row2-writes:{writes}")
     fps = [l for l in r2 if "-f null -" in l and "xpsnr=" not in l]
@@ -1966,7 +2047,8 @@ def trace_failures(script, tmp, tag):
     bad = []
     w = World(tmp, tag)
     rc, out, err = w.run(["--rows", "2"], script=script, BENCH_TRACE="1")
-    if len([l for l in err.splitlines() if l.startswith("trace: row 2: ")]) != 6:
+    # fps, 2 writes, 3 scores and a chroma score, then 3 alternatives of a write and 2 scores each
+    if len([l for l in err.splitlines() if l.startswith("trace: row 2: ")]) != 15:
         bad.append(f"trace:{err[:120]}")
     rc, out, err = w.run(["--rows", "2"], script=script)
     if "trace:" in err or "trace:" in out:
@@ -1974,8 +2056,81 @@ def trace_failures(script, tmp, tag):
     return bad
 
 
+def alt_failures(script, tmp, tag):
+    """rev-zlqhh: FSRCNNX 360p to 1080p lost 0.69 dB to bicubic (run20). Row 2 also scores ewa, FSRCNNX at 2x then bicubic and
+    FSRCNNX at 1.5x then bicubic on the same fixture, against the same bicubic control, and prints each delta and the best of
+    all the paths. The alternatives are evidence: they never change the row's status (the +0.5 dB threshold on FSRCNNX does),
+    one that cannot be scored says so and the others still run, and rows 3 and 4 have none."""
+    bad = []
+
+    def row2(label, **env):
+        w = World(tmp, f"{tag}-{label}")
+        rc, out, err = w.run(["--rows", "2"], script=script, **env)
+        st, detail = results(out).get(2, ("", ""))
+        return w, st, detail
+
+    # FSRCNNX +10 dB over bicubic, every alternative below it: FSRCNNX is the best path
+    w, st, detail = row2("good", FAKE_XPSNR_ALT="ewa=34 x2-bicubic=31 lowtarget=36")
+    for want in ("xpsnr_delta=+10.00dB", "alt_ewa=+4.00dB", "alt_x2-bicubic=+1.00dB", "alt_lowtarget=+6.00dB", "best=fsrcnnx"):
+        if want not in detail:
+            bad.append(f"good:missing {want}:{detail[:200]}")
+    if st != "PASS":
+        bad.append(f"good:{st}")
+
+    # an alternative that beats FSRCNNX is named best, and the row still FAILs on FSRCNNX against its own threshold
+    w, st, detail = row2("swap", FAKE_XPSNR_SWAP="1", FAKE_XPSNR_ALT="ewa=41 x2-bicubic=39 lowtarget=43")
+    for want in ("xpsnr_delta=-10.00dB", "alt_ewa=+1.00dB", "alt_x2-bicubic=-1.00dB", "alt_lowtarget=+3.00dB", "best=lowtarget"):
+        if want not in detail:
+            bad.append(f"swap:missing {want}:{detail[:200]}")
+    if st != "FAIL":
+        bad.append(f"swap:{st}")
+
+    # nothing beats bicubic: it is the best path (a delta of 0 is its own score)
+    w, st, detail = row2("none", FAKE_XPSNR_SWAP="1", FAKE_XPSNR_ALT="ewa=39 x2-bicubic=38 lowtarget=37")
+    if "best=bicubic" not in detail or st != "FAIL":
+        bad.append(f"none:{st}:{detail[:200]}")
+
+    # a tie keeps the earlier path
+    w, st, detail = row2("tie", FAKE_XPSNR_ALT="ewa=40")
+    if "alt_ewa=+10.00dB" not in detail or "best=fsrcnnx" not in detail:
+        bad.append(f"tie:{detail[:200]}")
+
+    # a bad alternative never fails a passing row
+    w, st, detail = row2("worse", FAKE_XPSNR_ALT="ewa=20 x2-bicubic=20 lowtarget=20")
+    if st != "PASS" or "alt_ewa=-10.00dB" not in detail:
+        bad.append(f"worse:{st}:{detail[:200]}")
+
+    # one alternative without a score: named, never +0.00, never the best; the others are still scored
+    w, st, detail = row2("noscore", FAKE_XPSNR_FAIL_ON="r2-alt-x2-bicubic.mkv", FAKE_XPSNR_ALT="ewa=34 lowtarget=36")
+    if "alt_x2-bicubic=FAIL(" not in detail or "alt_x2-bicubic=+" in detail or "alt_ewa=+4.00dB" not in detail \
+            or "alt_lowtarget=+6.00dB" not in detail or st != "PASS":
+        bad.append(f"noscore:{st}:{detail[:200]}")
+
+    # an alternative whose write fails, or whose file does not line up with the master, is named and not scored
+    for label, env, alt, note in (("write", {"FAKE_FFV1_FAIL": "r2-alt-ewa"}, "ewa", "No space left"),
+                                  ("short", {"FAKE_FFV1_SHORT": "r2-alt-lowtarget"}, "lowtarget", "479 frames"),
+                                  ("size", {"FAKE_FFV1_BADSIZE": "r2-alt-x2-bicubic"}, "x2-bicubic", "1280x572")):
+        w, st, detail = row2(label, **env)
+        if f"alt_{alt}=FAIL(" not in detail or note not in detail or st != "PASS" or "xpsnr_delta=+10.00dB" not in detail:
+            bad.append(f"{label}:{st}:{detail[:240]}")
+        if any(f"r2-alt-{alt}.mkv" in l and "xpsnr=" in l for l in ffmpeg_log(w)):
+            bad.append(f"{label}:scored a file that does not line up")
+
+    # no FSRCNNX score, no alternatives: the row FAILs as before and runs nothing more
+    w, st, detail = row2("noxpsnr", FAKE_XPSNR_FAIL="1")
+    if st != "FAIL" or "alt_" in detail or any("r2-alt-" in l for l in ffmpeg_log(w)):
+        bad.append(f"noxpsnr:{st}:{detail[:120]}")
+
+    # rows 3 and 4 have none
+    w = World(tmp, tag + "-rows34")
+    rc, out, err = w.run(["--rows", "3,4"], script=script, BENCH_RUN_ID="r34")
+    if "alt_" in out or any("-alt-" in l for l in ffmpeg_log(w)):
+        bad.append("rows 3 and 4 ran an alternative")
+    return bad
+
+
 def test_scored_inputs(tmp):
-    for name, fn in (("argv", argv_failures), ("inputs", inputs_failures), ("trace", trace_failures)):
+    for name, fn in (("argv", argv_failures), ("inputs", inputs_failures), ("trace", trace_failures), ("alts", alt_failures)):
         got = fn(BENCH, tmp, name)
         check(f"scored inputs: {name}", not got, str(got))
 
@@ -1996,11 +2151,16 @@ def row10_prime_failures(script, tmp, tag):
     bad = []
     w = World(tmp, tag, {"load_needs_prime": True}, {"BENCH_PROC": os.path.join(tmp, tag + "-emptyproc")})
     os.makedirs(os.path.join(tmp, tag + "-emptyproc"))
-    rc, out, err = w.run(["--rows", "10"], script=script)
+    sleeps = os.path.join(tmp, tag + "-sleeps")
+    rc, out, err = w.run(["--rows", "10"], script=script, FAKE_SLEEP_LOG=sleeps)
     st, detail = results(out).get(10, ("", ""))
     loads = [e["t"] for e in w.log() if e["url"].endswith("/JellyfinPlus/Gpu/Load")]
     if len(loads) < 2 or loads[-1] - loads[0] < 0.5:  # 5 s at FAKE_FAST_WAIT's tenth-length waits
         bad.append(f"calls:{len(loads)}:{[round(t - loads[0], 1) for t in loads]}")
+    # the stub shortens the wait tenfold, so the gap alone cannot tell 4 s from 5 s: the sleep it was asked for can
+    asked = open(sleeps).read().split() if os.path.exists(sleeps) else []
+    if "5" not in asked:
+        bad.append(f"requested-sleeps:{asked}")
     if "gpuBusyPercent=12 " not in detail + " " or "gpuBusyPercent=none" in detail:
         bad.append(f"load:{detail[:120]}")
     if "fdinfo=not visible from the bench pod" not in detail or "none" in detail.replace("encoder=none", ""):
@@ -2138,36 +2298,34 @@ def test_hermetic_api(tmp):
     res = results(out)
     check("a stream with no segment is a FAIL, not a 0x PASS", res.get(3, ("",))[0] == "FAIL" and res.get(12, ("",))[0] == "FAIL", str(res))
 
-    bad = token_failures(BENCH, tmp, "token")
-    check("the token is on curl's stdin, not its command line", not bad, str(bad))
-    bad = runfps_failures(BENCH, tmp, "runfps")
-    check("a failed ffmpeg run reaches the FAIL branch of rows 2 and 11", not bad, str(bad))
-    bad = size_failures(BENCH, tmp, "sizes")
-    check("rows 2, 3, 4, 8 and 11 scale to the master's letterboxed size, a 16:9 clip keeps 16:9", not bad, str(bad))
-    bad = xpsnr_failures(BENCH, tmp, "xpsnr")
-    check("a failed xpsnr is FAIL 'xpsnr failed' on rows 2, 3, 4, 8 and 9, never +0.00 dB", not bad, str(bad))
-    bad = timeout_failures(BENCH, tmp, "timeouts")
-    check("every measured ffmpeg runs under timeout --kill-after=10 (BENCH_RUN_TIMEOUT, default 240) and a timeout is FAIL 'timeout after Ns'", not bad, str(bad))
-    bad = row5_budget_failures(BENCH, tmp, "row5-budget")
-    check("row 5 runs once per clip and stops after 48 frames; other rows are not cut", not bad, str(bad))
-    bad = item_failures(BENCH, tmp, "items")
-    check("an item lookup HTTP error is its own FAIL, distinct from 'not in the library'", not bad, str(bad))
-    bad = signed_failures(BENCH, tmp, "signed")
-    check("rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-", not bad, str(bad))
-    bad = chroma_failures(BENCH, tmp, "chroma")
-    check("rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not", not bad, str(bad))
-    bad = binary_failures(BENCH, tmp, "binary")
-    check("rows 2, 3 and 4 run the stock ffmpeg (as the shim) and row 8 the patched one, in the plan and in commands.log", not bad, str(bad))
-    bad = row9_failures(BENCH, tmp, "row9")
-    check("row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it", not bad, str(bad))
-    bad = stale_output_failures(BENCH, tmp, "stale")
-    check("a row scores only files this run wrote: a fresh run-<id> directory (a used id is refused), any failed write is FAIL, a missing or old file is FAIL 'not written by this run'", not bad, str(bad))
-    bad = row10_prime_failures(BENCH, tmp, "row10-prime")
-    check("row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod", not bad, str(bad))
-    bad = row10_fdinfo_failures(BENCH, tmp, "row10-fd")
-    check("row 10 finds the transcode of the stock and of the oidn ffmpeg", not bad, str(bad))
-    bad = row10_reason_failures(BENCH, tmp, "row10-reason")
-    check("row 10 judges the codec by the session's encoder, tolerates a vanished pid, MANUALs a vanished transcode and names every FAIL", not bad, str(bad))
+    # each of these runs the script for seconds, some waiting out a stub hang: in parallel, each in its own directory
+    table = [
+        (token_failures, "token", "the token is on curl's stdin, not its command line"),
+        (runfps_failures, "runfps", "a failed ffmpeg run reaches the FAIL branch of rows 2 and 11"),
+        (size_failures, "sizes", "rows 2, 3, 4, 8 and 11 scale to the master's letterboxed size, a 16:9 clip keeps 16:9"),
+        (xpsnr_failures, "xpsnr", "a failed xpsnr is FAIL 'xpsnr failed' on rows 2, 3, 4, 8 and 9, never +0.00 dB"),
+        (timeout_failures, "timeouts", "every measured ffmpeg runs under timeout --kill-after=10 (BENCH_RUN_TIMEOUT, default 240) and a timeout is FAIL 'timeout after Ns'"),
+        (row5_budget_failures, "row5-budget", "row 5 runs once per clip and stops after 48 frames; other rows are not cut"),
+        (item_failures, "items", "an item lookup HTTP error is its own FAIL, distinct from 'not in the library'"),
+        (signed_failures, "signed", "rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-"),
+        (chroma_failures, "chroma", "rows 2, 3 and 4 FAIL on chroma XPSNR when the shader output lost its chroma, and print it when it did not"),
+        (binary_failures, "binary", "rows 2, 3 and 4 run the stock ffmpeg (as the shim) and row 8 the patched one, in the plan and in commands.log"),
+        (row9_failures, "row9", "row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it"),
+        (stale_output_failures, "stale", "a row scores only files this run wrote: a fresh run-<id> directory (a used id is refused), any failed write is FAIL, a missing or old file is FAIL 'not written by this run'"),
+        (row10_prime_failures, "row10-prime", "row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod"),
+        (row10_fdinfo_failures, "row10-fd", "row 10 finds the transcode of the stock and of the oidn ffmpeg"),
+        (row10_reason_failures, "row10-reason", "row 10 judges the codec by the session's encoder, tolerates a vanished pid, MANUALs a vanished transcode and names every FAIL"),
+    ]
+
+    def judged(item):
+        fn, tag, _ = item
+        sub = os.path.join(tmp, "c-" + tag)
+        os.makedirs(sub)
+        return fn(BENCH, sub, tag)
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for (_, _, msg), bad in zip(table, pool.map(judged, table)):
+            check(msg, not bad, str(bad))
 
 
 def test_token_rejected(tmp):
@@ -2210,6 +2368,32 @@ def test_row_1_scope(tmp):
     w = World(tmp, "row12-new", {"stream_logs": "libplacebo=w=1920"})
     rc, out, err = w.run(["--rows", "12"])
     check("row 12 passes on a libplacebo line written during the run", results(out).get(12, ("",))[0] == "PASS", str(results(out)))
+
+
+def test_no_fsr2(tmp):
+    """The Intel image ships no fsr2 filter: rows 7 and 8 are SKIP with the reason, row 1 wants it withheld."""
+    w = World(tmp, "nofsr2", {"game_levels": ["off"]}, extra={"FAKE_NO_FSR2": "1"})
+    pan_clips(w)
+    os.remove(os.path.join(w.stubs, "fsr2-nocuda"))
+    rc, out, err = w.run(["--rows", "1,7,8"])
+    res = results(out)
+    check("without an fsr2 filter the run is not refused", rc == 0 and "not the Intel build" not in err, f"rc={rc} {err}")
+    for row in (7, 8):
+        st, detail = res.get(row, ("", ""))
+        check(f"row {row} is SKIP, not FAIL, on a binary without fsr2",
+              st == "SKIP" and "no fsr2 filter" in detail and "zero motion vectors without CUDA" in detail, f"{st} {detail}")
+    check("row 8 runs no ffmpeg when it skips", not [l for l in ffmpeg_log(w) if "pan_" in l], str(ffmpeg_log(w)))
+    st, detail = res.get(1, ("", ""))
+    check("row 1 passes with fsr2 withheld and no marker", st == "PASS" and "fsr2 not offered" in detail, f"{st} {detail}")
+
+    w = World(tmp, "nofsr2-offered", {"game_levels": ["off", "fsr2"]}, extra={"FAKE_NO_FSR2": "1"})
+    os.remove(os.path.join(w.stubs, "fsr2-nocuda"))
+    st, detail = results(w.run(["--rows", "1"])[1]).get(1, ("", ""))
+    check("row 1 fails when fsr2 is still offered", st == "FAIL" and "offered:fsr2" in detail, f"{st} {detail}")
+
+    w = World(tmp, "nofsr2-marker", {"game_levels": ["off"]}, extra={"FAKE_NO_FSR2": "1"})
+    st, detail = results(w.run(["--rows", "1"])[1]).get(1, ("", ""))
+    check("row 1 fails when the marker is left in the image", st == "FAIL" and "marker-present" in detail, f"{st} {detail}")
 
 
 def drm_fixture(root, cards, in_dri):
@@ -2324,6 +2508,16 @@ def test_row_6(tmp):
         w, rc, out, err, (st, detail) = row6_case(tmp, "r6-" + tag, scn)
         check(f"row 6 FAILs on a record that is not the NOT-run wording ({tag})", st == "FAIL", f"{st} {detail}")
 
+    # a FAIL names what the session asked for and what withheld it, with the values the record held
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-why", {"applied": True, "requested": "realesr-anime-x2",
+                                                              "withheld": "not measured on Intel"})
+    check("row 6 FAIL prints neural_requested= and session_withheld= with the record's values",
+          st == "FAIL" and "neural_requested=realesr-anime-x2" in detail and "session_withheld=not measured on Intel" in detail,
+          f"{st} {detail}")
+    w, rc, out, err, (st, detail) = row6_case(tmp, "r6-why-empty", {"applied": True})
+    check("row 6 FAIL prints neural_requested=off and session_withheld=none when the record has neither",
+          st == "FAIL" and "neural_requested=off" in detail and "session_withheld=none" in detail, f"{st} {detail}")
+
     rc, out, err = World(tmp, "r6-fast").run(["--rows", "6"], BENCH_NEURAL_LEVEL="fast")
     check("BENCH_NEURAL_LEVEL=fast is refused (it is not a level)", rc == 2 and "BENCH_NEURAL_LEVEL" in err, f"rc={rc} {err}")
 
@@ -2361,6 +2555,72 @@ def test_row_5(tmp):
     w = World(tmp, "r5-nostream", {"fail_master": True}, extra)
     st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
     check("row 5 FAILs when its stream cannot start", st == "FAIL", f"{st} {detail}")
+
+    # the exact fallback reason: the ort filter's own warning, the environment's answers, and what the session record says
+    warn = "OpenVINO execution provider unavailable (Device GPU is not available), using CPU"
+    w = World(tmp, "r5-reason", {"device": None, "applied": False,
+                                 "routing": "neural realesr-anime-x2 NOT run: not measured on Intel"},
+              dict(extra, FAKE_ORT_WARN=warn))
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 prints the ort filter's fallback reason for both clips",
+          detail.count("CPU_FALLBACK[") == 2 and "Device GPU is not available" in detail, detail)
+    both = "libonnxruntime_providers_openvino.so,libopenvino_intel_gpu_plugin.so,"
+    check("row 5 names both ORT libraries as missing when $PREFIX/ort/lib has neither",
+          f"ep_libs_missing={both} " in detail and "gpu_plugin_unresolved=none " in detail
+          and "libOpenCL=UNKNOWN(" in detail and "open=FAIL(" in detail and "process_gids=" in detail, detail)
+    ldconfig = any(os.path.exists(p) for p in ("/sbin/ldconfig", "/usr/sbin/ldconfig"))
+    z = re.search(r"level_zero_loader=(\S+)", detail)
+    check("row 5 reports the Level Zero loader as UNKNOWN(no ldconfig) only when the host has no ldconfig",
+          bool(z) and (z.group(1) in ("present", "MISSING") if ldconfig else z.group(1) == "UNKNOWN(no"), detail)
+
+    # seed the ort lib directory the report reads, and a fake ldd for the GPU plugin
+    lib = os.path.join(w.stubs, "ort", "lib")
+    os.makedirs(lib)
+    open(os.path.join(lib, "libonnxruntime_providers_openvino.so"), "w").close()
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 names only the GPU plugin as missing when the provider is there",
+          "ep_libs_missing=libopenvino_intel_gpu_plugin.so, " in detail, detail)
+    open(os.path.join(lib, "libopenvino_intel_gpu_plugin.so"), "w").close()
+    ldd = os.path.join(w.stubs, "ldd")
+    open(ldd, "w").write('#!/bin/sh\ncat "$FAKE_LDD_OUT"\n')
+    os.chmod(ldd, 0o755)
+    ldd_out = os.path.join(w.root, "ldd.txt")
+    open(ldd_out, "w").write("\tlibOpenCL.so.1 => not found\n\tlibc.so.6 => /lib/libc.so.6 (0x1)\n")
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out)[1]).get(5, ("", ""))[1]
+    check("row 5 reports no missing ORT library, the unresolved plugin library, and libOpenCL missing from that ldd",
+          "ep_libs_missing=none " in detail and "gpu_plugin_unresolved=libOpenCL.so.1, " in detail
+          and "libOpenCL=MISSING " in detail, detail)
+    open(ldd_out, "w").write("\tlibOpenCL.so.1 => /usr/lib/libOpenCL.so.1 (0x1)\n")
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out)[1]).get(5, ("", ""))[1]
+    check("row 5 reports libOpenCL present when the plugin's ldd resolves it",
+          "gpu_plugin_unresolved=none " in detail and "libOpenCL=present " in detail, detail)
+    detail = results(w.run(["--rows", "5"], FAKE_LDD_OUT=ldd_out, BENCH_RENDER_NODE="/dev/null")[1]).get(5, ("", ""))[1]
+    check("row 5 reports open=ok for a render node this process can open (a character device)",
+          "render_node=/dev/null open=ok " in detail, detail)
+    check("row 5 says a null device is a session that never ran ORT, with the routing it recorded",
+          st == "FAIL" and "device=none" in detail and "session_neural_requested=" in detail and "NOT run: not measured on Intel" in detail, f"{st} {detail}")
+    check("row 5 keeps each chain's ffmpeg log in the run directory",
+          all(os.path.isfile(os.path.join(w.out, "run-w1", f"row5-{h}p.ffmpeg.log")) for h in (360, 720)), os.listdir(w.out))
+    w = World(tmp, "r5-quiet", extra=extra)
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 without a fallback line says so instead of claiming openvino", "ffmpeg_ort_360p=no_ort_line_in_log" in detail, detail)
+    # ort_why: `using CPU` is read first, and the device line alone is enough to call a CPU run a fallback
+    w = World(tmp, "r5-noise", extra=dict(extra, FAKE_ORT_NOISE="1", FAKE_ORT_WARN=warn))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 keeps the `using CPU` reason when three earlier OpenVINO lines precede it",
+          detail.count("CPU_FALLBACK[") == 2 and "using CPU" in detail and "OpenVINO runtime note 2" in detail
+          and "OpenVINO runtime note 3" not in detail, detail)
+    w = World(tmp, "r5-devcpu", extra=dict(extra, FAKE_ORT_DEVICE="cpu"))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 flags CPU_FALLBACK from a device=cpu line with no `using CPU` warning",
+          detail.count("CPU_FALLBACK[") == 2 and "device=cpu" in detail and "using CPU" not in detail, detail)
+    w = World(tmp, "r5-devgpu", extra=dict(extra, FAKE_ORT_DEVICE="openvino"))
+    detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))[1]
+    check("row 5 does not flag a device=openvino line as a fallback",
+          "CPU_FALLBACK" not in detail and "ffmpeg_ort_360p=log[" in detail and "device=openvino" in detail, detail)
+    w = World(tmp, "r5-chainfail", extra=dict(extra, FAKE_FFMPEG_FAIL="1"))
+    st, detail = results(w.run(["--rows", "5"])[1]).get(5, ("", ""))
+    check("row 5 FAILs with the environment report when the ort chain dies", st == "FAIL" and "ort_env:" in detail, f"{st} {detail}")
 
 
 def stage_meta_check(tmp, label, guid, abi, strip_source):
@@ -2437,12 +2697,19 @@ def main():
         print("no bash")
         return 1
     with tempfile.TemporaryDirectory() as tmp:
-        for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
-                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_render_node_pick, test_row_6, test_row_5,
-                     test_shared_files, test_scored_inputs):
+        parts = (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
+                 test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_no_fsr2,
+                 test_render_node_pick, test_row_6, test_row_5, test_shared_files, test_scored_inputs)
+
+        def go(part):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)
             part(sub)
+
+        # the parts share nothing but the check() counters: the two long ones (mutants, hermetic API) overlap the rest
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for f in [pool.submit(go, p) for p in parts]:
+                f.result()
         dockerfile_checks(tmp)
     print(f"{PASSES} checks passed, {len(FAILS)} failed")
     return 1 if FAILS else 0
