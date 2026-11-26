@@ -25,6 +25,9 @@ FROM ${JELLYFIN_IMAGE} AS build
 # The .NET 10 SDK, from Microsoft's release metadata, checked against its published sha512.
 ARG DOTNET_SDK_URL=https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.404/dotnet-sdk-10.0.404-linux-x64.tar.gz
 ARG DOTNET_SDK_SHA512=577d0eb17fec33d029104c5c63a1ab0accc3e28776274abef2218dbac5af18d2109b5406d26b31d76f5c245215e3ba0926a94c20246c672c41847c9e1eb1dc50
+ARG LIBZE_VERSION=26.35.39758.10-0
+ARG LIBZE_DEB_URL=https://github.com/intel/compute-runtime/releases/download/26.35.39758.10/libze-intel-gpu1_${LIBZE_VERSION}_amd64.deb
+ARG LIBZE_DEB_SHA256=c19a641b953d55aebbf1d51bec364a84bf629f985e02fbbe6dc70224c0e88470
 ARG JELLYFIN_BIN=/jellyfin
 ARG JELLYFIN_WEB=/jellyfin/jellyfin-web
 ARG PLUGIN_VERSION=1.0.0.0
@@ -46,6 +49,13 @@ RUN curl -fsSL "$DOTNET_SDK_URL" -o /tmp/dotnet.tar.gz \
  && mkdir -p /opt/dotnet \
  && tar -C /opt/dotnet -xzf /tmp/dotnet.tar.gz \
  && rm /tmp/dotnet.tar.gz
+
+# The Level Zero GPU driver deb, from the same intel/compute-runtime release as the base's intel-opencl-icd
+# (the base takes its Intel stack from those release debs, not from Debian), checked against its published
+# sha256. It is only fetched here: this stage has curl, the final stage installs it.
+RUN mkdir -p /out \
+ && curl -fsSL "$LIBZE_DEB_URL" -o /out/libze-intel-gpu1.deb \
+ && echo "$LIBZE_DEB_SHA256  /out/libze-intel-gpu1.deb" | sha256sum -c -
 
 COPY . /src
 WORKDIR /src
@@ -125,6 +135,15 @@ RUN set -eu; \
     rm -f /etc/apt/sources.list.d/intel-non-free.sources; \
     rm -rf /var/lib/apt/lists/*
 
+# The Level Zero loader (libze1, Debian trixie main) and the Level Zero GPU driver deb the OpenVINO GPU plugin
+# loads through it, at the version of the base's intel-opencl-icd. Bench run22 printed level_zero_loader=MISSING.
+# apt resolves the deb's Depends (the base already carries libigdgmm12 and the IGC).
+COPY --from=build /out/libze-intel-gpu1.deb /tmp/libze-intel-gpu1.deb
+RUN set -eu; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libze1 /tmp/libze-intel-gpu1.deb; \
+    rm -rf /var/lib/apt/lists/* /tmp/libze-intel-gpu1.deb
+
 COPY --from=build /usr/lib/jellyfin-ffmpeg-oidn /usr/lib/jellyfin-ffmpeg-oidn
 # The base lists /usr/local/lib in /etc/ld.so.conf.d/libc.conf (checked on the pinned image); the cache
 # is rebuilt here, before the acceptance check below resolves the binary's libraries.
@@ -143,6 +162,22 @@ RUN set -eu; \
     ihd=/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so; \
     test -f "$ihd"; \
     if ldd "$ihd" | grep 'not found'; then echo "unresolved libraries in $ihd" >&2; exit 1; fi
+# Level Zero acceptance: the loader and the Intel driver are in the linker cache and resolve every dependency,
+# so does the OpenVINO GPU plugin, and the driver deb is the same release as the base's OpenCL driver. The
+# plugin's device query needs the Arc card, which a build does not have: the bench ort_env line is that proof.
+RUN set -eu; \
+    cache=$(ldconfig -p); \
+    for so in libze_loader.so.1 libze_intel_gpu.so.1; do \
+        l=$(echo "$cache" | awk -v n="$so" '$1 == n { print $NF; exit }'); \
+        [ -n "$l" ] || { echo "$so is not in the ldconfig cache" >&2; exit 1; }; \
+        if ldd "$l" | grep 'not found'; then echo "unresolved libraries in $l" >&2; exit 1; fi; \
+    done; \
+    ov=/usr/lib/jellyfin-ffmpeg-oidn/ort/lib/libopenvino_intel_gpu_plugin.so; \
+    test -f "$ov"; \
+    if ldd "$ov" | grep 'not found'; then echo "unresolved libraries in $ov" >&2; exit 1; fi; \
+    ze=$(dpkg-query -W -f='${Version}' libze-intel-gpu1); \
+    ocl=$(dpkg-query -W -f='${Version}' intel-opencl-icd); \
+    [ -n "$ze" ] && [ "$ze" = "$ocl" ] || { echo "libze-intel-gpu1 $ze differs from intel-opencl-icd $ocl: move LIBZE_VERSION" >&2; exit 1; }
 COPY --from=build /out/patcher /usr/lib/jellyfin-plus
 COPY --from=build /out/plugin-dist /usr/lib/jellyfin-plus-dist
 COPY --from=build /usr/share/jellyfin-shaders /usr/share/jellyfin-shaders
