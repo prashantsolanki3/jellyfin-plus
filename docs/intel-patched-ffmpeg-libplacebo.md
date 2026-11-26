@@ -120,6 +120,8 @@ PREFIX=/usr/lib/jellyfin-ffmpeg-oidn bash scripts/build-ffmpeg.sh` on the Jellyf
 | libplacebo | `v7.351.0`, static: `meson setup --prefix=/usr/local --libdir=lib/x86_64-linux-gnu --default-library=static -Dvulkan=enabled -Dshaderc=enabled -Ddemos=false` and nothing else | `:279`, `:600-604` |
 | ffmpeg configure | `--enable-vulkan --enable-libplacebo --enable-libshaderc --enable-vaapi --enable-libvpl --enable-libdrm` | `:929-939`, `:480` |
 
+The final stage also installs `libze1` (Debian) and the sha256-pinned `libze-intel-gpu1` deb from the same intel/compute-runtime release as the base's `intel-opencl-icd`: the OpenVINO GPU plugin reaches the Arc card through Level Zero, and bench run22 reported `level_zero_loader=MISSING`.
+
 The libplacebo clone is `--depth 1 -b v7.351.0 --recursive`, so its submodules (glad, the Vulkan registry,
 fast_float, xxhash) are whatever that tag pins. Stamp files skip the rebuild when the tag is unchanged.
 
