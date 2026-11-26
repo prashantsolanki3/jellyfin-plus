@@ -5,7 +5,7 @@
 # file into an upstream PR branch; cut upstream branches from upstream/main.
 #
 # What it does: builds docker/intel/Dockerfile (Intel Arc image: patched ffmpeg, plugin,
-# patcher, fsr2-nocuda marker), runs the acceptance checks inside the built image, and only
+# patcher; no fsr2 since PR 48), runs the acceptance checks inside the built image, and only
 # if every check passes pushes it to ghcr.io/prashantsolanki3/jellyfin-plus-intel:<short-sha>
 # and prints the digest in the job summary, so a consumer can pin by digest.
 #
