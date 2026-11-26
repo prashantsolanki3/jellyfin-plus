@@ -30,7 +30,7 @@ applies `builder/patches/libplacebo/*.patch` (jellyfin's `0001`, libplacebo issu
 stamp now covers the ref, the patches and the flags. Not yet proven: that the patch applies to that commit and
 that it fixes the output. Check after the next Arc image build: bench row 8 (fsr2) and a plain
 `hwupload,libplacebo,hwdownload` chain on the patched binary must score close to stock (25.7 dB; patched was 4.73 dB),
-`-filters` still lists `oidn ort fsr2`, and `ldd` shows no `not found`. The tables below describe the build as it
+`-filters` still lists `oidn ort`, and `ldd` shows no `not found`. The tables below describe the build as it
 was before this change.
 
 ## fsr2 without CUDA on moving content (bead rev-cpmuj, bench row 8: -38.10 dB)
@@ -66,8 +66,13 @@ so a good `frame1` with a collapsed `frames2+` confirms the cause is temporal (z
 means the fault is in the per-frame path (packing, colour range, pairing). `scripts/test_bench_intel.py` covers the
 format. Not yet run on the Arc.
 
-**Recommendation: ship the image without fsr2-nocuda** (the row's own threshold text says a miss means exactly this).
-No fix is shipped here, because the one candidate is not small and cannot be shown to help:
+**Decision (owner, 2026-11-26): the Intel image ships without fsr2.** `docker/intel/Dockerfile` no longer builds the
+FSR2 library or passes `WITH_FSR2=1`, so the binary has no `fsr2` filter and no `fsr2-nocuda` marker, and the plugin
+withholds the level on Intel (`GpuCapability.NoCudaGameAvailable` is the marker). The build fails if either is present.
+Bench rows 7 and 8 report SKIP on a binary without the filter, and row 1 requires fsr2 not to be offered. The pinned
+FSR2 commit was `1680d1edd5c034f88ebbbb793d8b88f8842cf804` and the build recipe stays in `docs/filters/FSR2.md`, for the
+experiment below. `.github/workflows/build-arc-image.yml` still checks for the filter and marker until the owner removes
+those steps. No fix is shipped here, because the one candidate is not small and cannot be shown to help:
 a uniform motion field built from the phase-correlation shift (already measured, `gu_inputs.h:245`) would fix pans but
 not local motion, and even exact vectors cannot reach the pass line: with a near-null jitter sequence FSR2 is a temporal
 denoise plus a fixed Lanczos upsample (`vf_fsr2.c:40-46`), which is not expected to beat bicubic by itself. If someone
@@ -101,14 +106,14 @@ Measured in the Arc test pod (rev-hxlit comment of 2026-11-25 5:05 am IST; `vulk
 
 ## How the patched ffmpeg is built
 
-`docker/intel/Dockerfile:75-78` runs `GPU_VENDOR=intel WITH_ORT=1 ORT_EP=openvino WITH_FSR2=1
-PREFIX=/usr/lib/jellyfin-ffmpeg-oidn bash scripts/build-ffmpeg.sh` on the Jellyfin (Debian trixie) base,
-with `libvulkan-dev` and no `libshaderc-dev` (`Dockerfile:43-45`). In `scripts/build-ffmpeg.sh`:
+`docker/intel/Dockerfile` runs `GPU_VENDOR=intel WITH_ORT=1 ORT_EP=openvino
+PREFIX=/usr/lib/jellyfin-ffmpeg-oidn bash scripts/build-ffmpeg.sh` on the Jellyfin (Debian trixie) base
+(`WITH_FSR2=1` was dropped, see the decision above), with `libvulkan-dev` and no `libshaderc-dev`. In `scripts/build-ffmpeg.sh`:
 
 | Piece | What it does | Where |
 |---|---|---|
 | FFmpeg | vanilla 8.1.2 from the ffmpeg.org tarball | `:109`, `:675-678` |
-| FFmpeg patches (Intel) | only `0008` and `0009` (generic hwmap format negotiation) plus the fsr2 patch; no `hwcontext_vulkan.c` or `vf_libplacebo.c` change | `:476`, `:500` |
+| FFmpeg patches (Intel) | only `0008` and `0009` (generic hwmap format negotiation), no fsr2 patch since `WITH_FSR2=1` was dropped; no `hwcontext_vulkan.c` or `vf_libplacebo.c` change | `:476`, `:500` |
 | Vulkan headers | Vulkan-Headers `v1.3.280` copied into `/usr/local/include`, over the distro `libvulkan-dev` headers | `:546-548` |
 | Vulkan loader | the distro `libvulkan.so.1` (`libvulkan-dev` is the only Vulkan package); nothing builds a loader | `Dockerfile:45` |
 | shaderc | `v2026.4` built from source, shared, into `/usr/local/lib`; copied into the image as `libshaderc_shared.so.1` by the Dockerfile's `local-libs` step | `:282`, `:576-585`, `Dockerfile:85-88` |

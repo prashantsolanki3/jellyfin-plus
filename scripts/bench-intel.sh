@@ -150,7 +150,7 @@ row_must() {
         5)  echo "session record device=openvino (not a CPU fallback); fps measured at 360p and 720p; xpsnr>=FSRCNNX where it runs; slower than real time is a valid result" ;;
         6)  echo "NeuralMaxSourceHeight=480: a 720p source goes to the shader path and the record says why" ;;
         7)  echo "after the first ceil(8*scale^2) frames: mean consecutive-frame luma difference<=0.5, per-frame max<=16 in 99% of frames; FSRCNNX control exactly 0" ;;
-        8)  echo "xpsnr on the panning cut >= bicubic (a miss means the image ships without fsr2-nocuda: a result, not a blocker)" ;;
+        8)  echo "xpsnr on the panning cut >= bicubic (SKIP when the patched ffmpeg has no fsr2 filter: the image ships without it, a result, not a blocker)" ;;
         9)  echo "on, an H.264 1080p source: -hwaccel vaapi, download and upload into libplacebo (the zero-copy hwmap=derive_device=vulkan is tried once and its failure recorded, not failed on), no 'Conversion failed!', video engine busy, cpu time per frame >=30% lower, xpsnr(on,off)>=50dB; off: command identical to a build without hardware decode" ;;
         10) echo "h264_qsv/hevc_qsv chosen; the served segment's codec matches; encoderSessions counts the session; /Gpu/Load (primed, read again >=5 s later) within +-10 points of the fdinfo figure when the transcode is visible to the bench pod, else MANUAL with the plugin's figure" ;;
         11) echo "one stream holds fps>=36 while one Plex hardware transcode runs" ;;
@@ -301,7 +301,7 @@ plan_shader_row() {
 print_plan() {
     local r ow oh
     echo "plan: bench-intel: rows=${ROWS[*]} runs=$RUNS mode=dry-run"
-    echo "plan: required filters: $(ffmpeg_required_filters intel) fsr2"
+    echo "plan: required filters: $(ffmpeg_required_filters intel)"
     echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
     echo "plan: every measured ffmpeg runs under timeout --kill-after=10 ${RUN_TIMEOUT}s (BENCH_RUN_TIMEOUT); row 5 runs ${ORT_RUNS}x per clip, ${ORT_FRAMES} frames"
     echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; run dir: $RUN_OUT (fresh, refused if it exists); render node: $NODE"
@@ -675,9 +675,14 @@ api_stream() {
 
 # ---- the rows --------------------------------------------------------------------------------------
 
+# The image ships without fsr2 (zero motion vectors without CUDA: docs/intel-patched-ffmpeg-libplacebo.md); rows 7
+# and 8 and the fsr2 half of row 1 run only on a patched binary that still carries the filter.
+FSR2_SKIP_WHY="the patched ffmpeg has no fsr2 filter: the image ships without it, fsr2 gets zero motion vectors without CUDA (docs/intel-patched-ffmpeg-libplacebo.md)"
+has_fsr2() { grep -qE "^ [A-Z.]+ +fsr2 " <<<"$FILTERS"; }
+
 row_1() {
     have_api || { no_api 1 "no Jellyfin API: set BENCH_JELLYFIN_URL and BENCH_JELLYFIN_TOKEN"; return; }
-    local st probe bad="" why="" offered
+    local st probe bad="" why="" offered fsr2_note
     st=$(api /JellyfinPlus/Status) || { record 1 FAIL "GET /JellyfinPlus/Status failed"; return; }
     probe=$(api /JellyfinPlus/Session/bench-probe) || { record 1 FAIL "GET /JellyfinPlus/Session failed"; return; }
     [[ "$(jq -r '.Gpu.Vendor' <<<"$st")" == intel ]] || bad+=" vendor=$(jq -r '.Gpu.Vendor' <<<"$st")"
@@ -687,8 +692,15 @@ row_1() {
     for lvl in optix optix-temporal dlpp-1 dlpp-2 dlpp-3 dlpp-4 vsr-rtcuda dlss dlaa; do
         [[ " $offered " != *" $lvl "* ]] || bad+=" offered:$lvl"
     done
-    [[ " $offered " == *" fsr2 "* ]] || bad+=" fsr2-not-offered"
-    [[ -f "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-missing"
+    if has_fsr2; then
+        [[ " $offered " == *" fsr2 "* ]] || bad+=" fsr2-not-offered"
+        [[ -f "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-missing"
+        fsr2_note="fsr2 offered"
+    else
+        [[ " $offered " != *" fsr2 "* ]] || bad+=" offered:fsr2"
+        [[ ! -e "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-present"
+        fsr2_note="fsr2 not offered"
+    fi
     if [[ -r "$SHIM_LOG" ]]; then
         local hits
         hits=$(shim_log_new | grep -ciE 'nvenc|cuda' || true)
@@ -698,7 +710,7 @@ row_1() {
     fi
     "$PATCHED_FFMPEG" -hide_banner -nostdin -init_hw_device "vulkan=vk:$VK_DEV" \
         -f lavfi -i nullsrc=s=64x64 -frames:v 1 -f null - >/dev/null 2>&1 || bad+=" vulkan-vk:$VK_DEV-failed"
-    if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, fsr2 offered, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
+    if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, $fsr2_note, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
 }
 
 xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB, signed (+1.25, -0.40: callers print it as is); non-zero (xpsnr_y's status) when either score is missing
@@ -852,6 +864,7 @@ row_6() {
 }
 
 row_7() {
+    has_fsr2 || { record 7 SKIP "$FSR2_SKIP_WHY"; return; }
     [[ -f "$CLIPS/still_720p.png" ]] || { record 7 SKIP "no $CLIPS/still_720p.png"; return; }
     local skip kind status=PASS detail f rc
     skip=$(still_skip 1.5)
@@ -873,6 +886,7 @@ row_7() {
 }
 
 row_8() {
+    has_fsr2 || { record 8 SKIP "$FSR2_SKIP_WHY"; return; }
     [[ -f "$CLIPS/pan_720p.mkv" && -f "$CLIPS/pan_1080p.mkv" ]] || { record 8 SKIP "no pan_720p.mkv / pan_1080p.mkv"; return; }
     local d ow oh rc=0 fsr2_out="$RUN_OUT/pan-fsr2.mkv" bicubic_out="$RUN_OUT/pan-bicubic.mkv"
     read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"
@@ -884,7 +898,7 @@ row_8() {
     score_inputs 8 "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv" || return 0
     d=$(xpsnr_delta "$fsr2_out" "$bicubic_out" "$CLIPS/pan_1080p.mkv") || { rc=$?; record 8 FAIL "xpsnr failed ($(why "$rc" "the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv"))"; return; }
     if ge "$d" 0; then record 8 PASS "xpsnr_delta=${d}dB"
-    else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda ($(xpsnr_frames "$RUN_OUT/xpsnr-$(basename "$fsr2_out").txt"); fsr2 gets zero motion vectors without CUDA, docs/intel-patched-ffmpeg-libplacebo.md)"; fi
+    else record 8 FAIL "xpsnr_delta=${d}dB: fsr2 loses to bicubic on moving content ($(xpsnr_frames "$RUN_OUT/xpsnr-$(basename "$fsr2_out").txt"); fsr2 gets zero motion vectors without CUDA, docs/intel-patched-ffmpeg-libplacebo.md)"; fi
 }
 
 # hwdec_source: the H.264 1080p clip row 9 reads, cut once from the lossless master when there is none. Called
@@ -1073,7 +1087,7 @@ mkdir "$RUN_OUT" || die "cannot create $RUN_OUT"
 # The list is captured, then searched: `-filters | grep -q` lets grep quit at its match, the writer takes
 # SIGPIPE, and pipefail reports a filter that is there as missing.
 FILTERS=$("$PATCHED_FFMPEG" -hide_banner -filters 2>/dev/null) || die "$PATCHED_FFMPEG -filters failed"
-for filter in $(ffmpeg_required_filters intel) fsr2 libplacebo xpsnr; do
+for filter in $(ffmpeg_required_filters intel) libplacebo xpsnr; do
     grep -qE "^ [A-Z.]+ +$filter " <<<"$FILTERS" || die "$PATCHED_FFMPEG lists no $filter filter: this is not the Intel build"
 done
 STOCK_FILTERS=$("$STOCK_FFMPEG" -hide_banner -filters 2>/dev/null) || die "$STOCK_FFMPEG -filters failed"
