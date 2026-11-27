@@ -47,6 +47,8 @@
 #   BENCH_BLOCK_WINDOWS   the gate's blocked clock windows, HHMM-HHMM comma list, start included, end not   0100-0700,1630-1830
 #   BENCH_TZ              the zone those windows are read in    Australia/Melbourne
 #   BENCH_BLOCK_WAIT_MAX_MIN  minutes a gated row 2-11 waits (60 s steps) for a blocked window or memory PSI to clear, then it is SKIP   240
+#   BENCH_BLOCK_WAIT_TOTAL_MAX_MIN  minutes of those waits, summed over all rows; once spent a row that would wait is SKIP "blocked window (wait budget spent)"   480
+#                         (keep it well under the run Job's activeDeadlineSeconds of 36000 s = 600 min: the rows themselves run inside that deadline too)
 #   BENCH_PROC            the /proc row 10 looks for the transcode in (the Jellyfin pod's is not this pod's)   /proc
 #
 # Clips: <title>_{360,720,1080,2160}p.mkv lossless masters (the 360/720/1080 are `scale=flags=area`
@@ -113,6 +115,8 @@ BLOCK_TZ="${BENCH_TZ:-Australia/Melbourne}"
 BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"
 PROC="${BENCH_PROC:-/proc}"
 BLOCK_WAIT_MAX_MIN="${BENCH_BLOCK_WAIT_MAX_MIN:-240}"
+BLOCK_WAIT_TOTAL_MAX_MIN="${BENCH_BLOCK_WAIT_TOTAL_MAX_MIN:-480}"
+WAIT_SPENT_MIN=0
 
 ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)
 DRY=0
@@ -534,9 +538,14 @@ row_gated() {
             return 0
         fi
         if (( waited >= BLOCK_WAIT_MAX_MIN )); then return 1; fi
+        if (( WAIT_SPENT_MIN >= BLOCK_WAIT_TOTAL_MAX_MIN )); then
+            HOLD_WHY="blocked window (wait budget spent)"
+            return 1
+        fi
         say "row $row waiting: $msg"
         sleep 60
         waited=$((waited + 1))
+        WAIT_SPENT_MIN=$((WAIT_SPENT_MIN + 1))
     done
 }
 
@@ -1492,7 +1501,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,13p;21,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p;21,52p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1511,6 +1520,7 @@ for r in "${ROWS[@]}"; do row_title "$r" >/dev/null || die "no such row: $r (row
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "BENCH_RUNS must be a positive integer, got: $RUNS"
 [[ "$RUN_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "BENCH_RUN_TIMEOUT must be a positive integer (seconds), got: $RUN_TIMEOUT"
 [[ "$BLOCK_WAIT_MAX_MIN" =~ ^[0-9]+$ ]] || die "BENCH_BLOCK_WAIT_MAX_MIN must be a non-negative integer (minutes), got: $BLOCK_WAIT_MAX_MIN"
+[[ "$BLOCK_WAIT_TOTAL_MAX_MIN" =~ ^[0-9]+$ ]] || die "BENCH_BLOCK_WAIT_TOTAL_MAX_MIN must be a non-negative integer (minutes), got: $BLOCK_WAIT_TOTAL_MAX_MIN"
 case "$NEURAL_LEVEL" in
     realesr-anime-x2 | realesr-anime-x4 | realesr-general-x4) ;;
     *) die "BENCH_NEURAL_LEVEL must be realesr-anime-x2, realesr-anime-x4 or realesr-general-x4, got: $NEURAL_LEVEL" ;;

@@ -933,7 +933,9 @@ def test_mutants(tmp):
         ("row-gate-cap-off-by-one", "waited >= BLOCK_WAIT_MAX_MIN", "waited > BLOCK_WAIT_MAX_MIN", row_gate_failures),
         ("row-gate-psi-ignored", "elif psi_hot; then", "elif false; then", row_gate_failures),
         ("row-gate-no-skip", 'record "$r" SKIP "$HOLD_WHY"; continue;', ':;', row_gate_failures),
-        ("tz-hard-coded",'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
+        ("row-gate-budget-ignored", "if (( WAIT_SPENT_MIN >= BLOCK_WAIT_TOTAL_MAX_MIN )); then", "if false; then", row_gate_failures),
+        ("row-gate-budget-not-counted", "WAIT_SPENT_MIN=$((WAIT_SPENT_MIN + 1))", ":", row_gate_failures),
+        ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
         ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
         ("run-fps-lost-failure", '|| { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
@@ -1489,7 +1491,7 @@ def gate_failures(script, tmp, tag):
 ROW_GATE_SCENARIO = {"stream_logs": "libplacebo=w=1920"}
 
 
-def row_gate_run(script, w, tag, seq, rows, cap=5, windows="0100-0415,1630-1830"):
+def row_gate_run(script, w, tag, seq, rows, cap=5, windows="0100-0415,1630-1830", total=None):
     """One gated run on a clock that follows `seq` (lines of `HHMM [hot]`, the first read by the start gate): (rc, out, err, 60 s sleeps)."""
     p = lambda n: os.path.join(w.root, f"{n}-{tag}")
     open(p("seq"), "w").write("\n".join(seq) + "\n")
@@ -1498,6 +1500,8 @@ def row_gate_run(script, w, tag, seq, rows, cap=5, windows="0100-0415,1630-1830"
     env = dict(w.env, BENCH_ASSERT_QUIET="1", BENCH_RUN_ID=f"rg-{tag}", FAKE_HM_SEQ=p("seq"), FAKE_PSI_FILE=p("psi"),
                BENCH_PSI_FILE=p("psi"), FAKE_SLEEP_LOG=p("sleeps"), BENCH_BLOCK_WINDOWS=windows,
                BENCH_BLOCK_WAIT_MAX_MIN=str(cap))
+    if total is not None:
+        env["BENCH_BLOCK_WAIT_TOTAL_MAX_MIN"] = str(total)
     rc, out, err = run(script, ["--rows", rows], env)
     return rc, out, err, open(p("sleeps")).read().split().count("60")
 
@@ -1559,6 +1563,32 @@ def row_gate_failures(script, tmp, tag):
     res = results(out)
     if "waiting" in out or n != 0 or sorted(res) != [1, 12, 13] or any("blocked window" in d for _, d in res.values()):
         bad.append(f"edges:{n}:{res}")
+
+    # 7. the cumulative budget runs out across rows (PSI waits): row 2 spends 2 of 3 minutes and hits its own cap,
+    # row 3 spends the last one, rows 3-5 are SKIP 'wait budget spent' and never run
+    rc, out, err, n = row_gate_run(script, w, "budget", ["1200", "1200 hot"], "2,3,4,5", cap=2, total=3)
+    res = results(out)
+    if n != 3:
+        bad.append(f"budget:sleeps{n}")
+    if res.get(2, ("", ""))[0] != "SKIP" or "memory pressure" not in res.get(2, ("", ""))[1]:
+        bad.append(f"budget:row2:{res.get(2)}")
+    for r in (3, 4, 5):
+        if res.get(r, ("", ""))[0] != "SKIP" or "wait budget spent" not in res.get(r, ("", ""))[1] or f"bench: row {r}: " in out:
+            bad.append(f"budget:row{r}:{res.get(r)}")
+
+    # 8. a wait is counted when it happens: row 2 waits once and runs, row 3 then finds the 1-minute budget spent
+    rc, out, err, n = row_gate_run(script, w, "budget-late", ["1200", "1200 hot", "1200", "1200 hot"], "2,3", cap=5, total=1)
+    res = results(out)
+    if n != 1 or res.get(2, ("SKIP",))[0] == "SKIP" or "bench: row 2: " not in out:
+        bad.append(f"budget-late:row2:{n}:{res.get(2)}")
+    if res.get(3, ("", ""))[0] != "SKIP" or "wait budget spent" not in res.get(3, ("", ""))[1] or "bench: row 3: " in out:
+        bad.append(f"budget-late:row3:{res.get(3)}")
+
+    # 9. the budget counts window waits too, and a zero budget means no waiting at all
+    rc, out, err, n = row_gate_run(script, w, "budget-zero", ["1200", "0100"], "2,3", cap=5, total=0)
+    res = results(out)
+    if n != 0 or any(res.get(r, ("", ""))[0] != "SKIP" or "wait budget spent" not in res.get(r, ("", ""))[1] for r in (2, 3)):
+        bad.append(f"budget-zero:{n}:{res}")
     return bad
 
 
@@ -2533,11 +2563,18 @@ def test_gates_and_confirmation(tmp):
     check("--help names --no-gates and its confirmation", rc == 0 and "--no-gates" in out and "BENCH_CONFIRM_NO_GATES" in out, out)
     check("--help names BENCH_BLOCK_WINDOWS and BENCH_TZ", "BENCH_BLOCK_WINDOWS" in out and "BENCH_TZ" in out, out)
     check("--help names BENCH_BLOCK_WAIT_MAX_MIN", "BENCH_BLOCK_WAIT_MAX_MIN" in out, out)
+    check("--help names BENCH_BLOCK_WAIT_TOTAL_MAX_MIN and the Job deadline",
+          "BENCH_BLOCK_WAIT_TOTAL_MAX_MIN" in out and "activeDeadlineSeconds" in out, out)
     for bogus in ("abc", "-1", "1.5"):
         rc, out, err = w.run(["--rows", "13"], BENCH_BLOCK_WAIT_MAX_MIN=bogus)
         check(f"BENCH_BLOCK_WAIT_MAX_MIN={bogus!r} is refused", rc == 2 and "BENCH_BLOCK_WAIT_MAX_MIN" in err, f"rc={rc} {err}")
     rc, out, err = w.run(["--rows", "13"], BENCH_BLOCK_WAIT_MAX_MIN="0")
     check("BENCH_BLOCK_WAIT_MAX_MIN=0 is accepted", rc == 0 and "MANUAL" in out, f"rc={rc} {err}")
+    for bogus in ("abc", "-1", "1.5"):
+        rc, out, err = w.run(["--rows", "13"], BENCH_BLOCK_WAIT_TOTAL_MAX_MIN=bogus)
+        check(f"BENCH_BLOCK_WAIT_TOTAL_MAX_MIN={bogus!r} is refused", rc == 2 and "BENCH_BLOCK_WAIT_TOTAL_MAX_MIN" in err, f"rc={rc} {err}")
+    rc, out, err = w.run(["--rows", "13"], BENCH_BLOCK_WAIT_TOTAL_MAX_MIN="0")
+    check("BENCH_BLOCK_WAIT_TOTAL_MAX_MIN=0 is accepted", rc == 0 and "MANUAL" in out, f"rc={rc} {err}")
 
 
 def test_hermetic_api(tmp):
