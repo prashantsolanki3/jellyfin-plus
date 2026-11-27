@@ -144,7 +144,7 @@ row_title() {
 row_must() {
     case "$1" in
         1)  echo "vendor=intel; render node $NODE; Vulkan vk:$VK_DEV; no NVIDIA-only level offered; fsr2 offered (marker present); no nvenc/cuda string in any command line" ;;
-        2)  echo "fps>=100; xpsnr>=bicubic+0.5dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
+        2)  echo "on the plugin's low-res route (FSRCNNX to ${ALT_LOW}x, then bicubic): fps>=100; xpsnr>=bicubic+0.5dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB; the session record names the low-res route (the direct chain is printed, not judged)" ;;
         3)  echo "end-to-end fps>=1.2x source fps; xpsnr>=bicubic+0.3dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
         4)  echo "scaler-only fps>=34; end-to-end with QSV encode >=1.2x source fps; xpsnr>=bicubic+0.3dB; chroma xpsnr>=${CHROMA_XPSNR_MIN}dB" ;;
         5)  echo "session record device=openvino (not a CPU fallback); fps measured at 360p and 720p; xpsnr>=FSRCNNX where it runs; slower than real time is a valid result" ;;
@@ -200,7 +200,10 @@ chain_bicubic() { echo "scale=$1:$2:flags=bicubic,format=yuv420p"; }
 # scaler with no shader. chain_shader_bicubic runs FSRCNNX to ALT_MID_W x ALT_MID_H (set by alt_setup), then scales to $1 x $2.
 ROW2_ALTS="ewa x2-bicubic lowtarget"
 ALT_X2=2
+# ALT_LOW mirrors the plugin default IntelLowResIntermediateScale: it is row 2's deciding chain and the route text the session record must carry.
 ALT_LOW=1.5
+# the summary part UpscaleEngine adds to the session record when the route is taken
+lowres_route_text() { echo "low-res route: fsrcnnx to ${ALT_LOW}x then bicubic"; }
 ALT_FN=""
 ALT_MID_W=0
 ALT_MID_H=0
@@ -314,12 +317,24 @@ plan_pair() {
 }
 
 PAIR_STEPS="fps write-candidate write-bicubic xpsnr-candidate xpsnr-bicubic xpsnr-chroma"
-# plan_shader_row <row> <source height> <master height> <nominal w> <nominal h>
+# plan_shader_row <row> <source height> <master height> <nominal w> <nominal h> [routed]: routed=1 plans row 2's deciding chain,
+# FSRCNNX to the source x ALT_LOW and then bicubic, as shader_row runs it
 plan_shader_row() {
+    local ow oh master fn=chain_shader
+    master="$(clip "$3")"
+    read -r ow oh <<<"$(master_dims "$master" "$4" "$5")"
+    if [[ "${6:-0}" == 1 ]]; then alt_setup lowtarget "$(clip "$2")"; fn="$ALT_FN"; fi
+    plan_pair "$1" "$PAIR_STEPS" "$(clip "$2")" "$fn" "$RUN_OUT/r$1-shader.mkv" "$RUN_OUT/r$1-bicubic.mkv" "$master" "$ow" "$oh"
+}
+
+# The steps of the direct chain beside the routed one: measure it, write it, score it, score the bicubic control again.
+DIRECT_STEPS="fps write-candidate xpsnr-candidate xpsnr-bicubic"
+# plan_direct <row> <source height> <master height> <nominal w> <nominal h>: the plan's lines for row_direct
+plan_direct() {
     local ow oh master
     master="$(clip "$3")"
     read -r ow oh <<<"$(master_dims "$master" "$4" "$5")"
-    plan_pair "$1" "$PAIR_STEPS" "$(clip "$2")" chain_shader "$RUN_OUT/r$1-shader.mkv" "$RUN_OUT/r$1-bicubic.mkv" "$master" "$ow" "$oh"
+    plan_pair "$1" "$DIRECT_STEPS" "$(clip "$2")" chain_shader "$RUN_OUT/r$1-direct.mkv" "$RUN_OUT/r$1-bicubic.mkv" "$master" "$ow" "$oh"
 }
 
 # The steps of one alternative: write it, score it, score the bicubic control again (the delta is candidate minus bicubic).
@@ -349,7 +364,9 @@ print_plan() {
         printf 'plan: row %s must pass: %s\n' "$r" "$(row_must "$r")"
         case "$r" in
             1)  echo "plan: row 1 cmd: curl $JF_URL/JellyfinPlus/Status (admin token), then $JF_URL/JellyfinPlus/Session/bench-probe" ;;
-            2)  plan_shader_row 2 360 1080 1920 1080
+            2)  plan_shader_row 2 360 1080 1920 1080 1
+                plan_direct 2 360 1080 1920 1080
+                echo "plan: row 2 route check: a 360p stream with sr=fsrcnnx, then Session/<its PlaySessionId> Record.Summary must carry '$(lowres_route_text)'"
                 plan_alts 2 360 1080 1920 1080
                 echo "plan: row 2 threshold: fps>=$FPS_R2 xpsnr>=+$XPSNR_R2" ;;
             3)  plan_shader_row 3 720 1080 1920 1080
@@ -789,7 +806,7 @@ xpsnr_frames() {
          END { if (n) printf "frame1=%.2fdB frames2+=%s", f, r ? sprintf("%.2fdB", s / r) : "none" }' "$1"
 }
 
-# row_alts <row> <source height> <master height> <w> <h> <FSRCNNX delta> <bicubic output>: scores each ROW2_ALTS path on the
+# row_alts <row> <source height> <master height> <w> <h> <direct FSRCNNX delta, empty when unscored> <bicubic output>: scores each ROW2_ALTS path on the
 # row's own source against the same bicubic control and master, by frame index, and sets ALT_DETAIL to ` alt_<name>=<delta>dB`
 # (or `alt_<name>=FAIL(<why>)`) for each and ` best=<name>` for the highest delta of bicubic (0 by definition), fsrcnnx and
 # the alternatives, the earlier path on a tie. Evidence only: it never touches the row's status.
@@ -799,7 +816,7 @@ row_alts() {
     master="$(clip "$h")"
     src="$(clip "$sh")"
     ALT_DETAIL=""
-    if gt "$fd" "$best_d"; then best=fsrcnnx; best_d="$fd"; fi
+    if [[ -n "$fd" ]] && gt "$fd" "$best_d"; then best=fsrcnnx; best_d="$fd"; fi
     for name in $ROW2_ALTS; do
         out="$RUN_OUT/r$row-alt-$name.mkv"
         alt_setup "$name" "$src"
@@ -816,18 +833,78 @@ row_alts() {
     ALT_DETAIL+=" best=$best (quality only, not fps)"
 }
 
-shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e] [alts]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size; alts=1 also scores the ROW2_ALTS paths
-    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" alts="${8:-0}" fps d cu status=PASS detail="" src ow oh rc=0 xrc=0
-    local shader_out="$RUN_OUT/r$row-shader.mkv" bicubic_out="$RUN_OUT/r$row-bicubic.mkv"
+# DIRECT_DETAIL / DIRECT_DELTA: row_direct's ` old_chain=direct ...` text and its delta (empty when it was not scored)
+DIRECT_DETAIL=""
+DIRECT_DELTA=""
+# row_direct <row> <source height> <master height> <w> <h> <bicubic output>: the old chain, FSRCNNX straight to the target, scored on
+# the row's own source against the same bicubic control and master. Evidence only: it never touches the row's status.
+row_direct() {
+    local row="$1" sh="$2" h="$3" ow="$4" oh="$5" bic="$6" out="$RUN_OUT/r$1-direct.mkv" src master f d why_not rc=0
+    src="$(clip "$sh")"
+    master="$(clip "$h")"
+    DIRECT_DETAIL=""
+    DIRECT_DELTA=""
+    f=$(run_fps "$src" "$(chain_shader "$ow" "$oh")") || { rc=$?; DIRECT_DETAIL=" old_chain=direct FAIL($(why "$rc" "ffmpeg failed"))"; return 0; }
+    pair_cmd write-candidate "$src" chain_shader "$out" "$bic" "$master" "$ow" "$oh"
+    if ! write_run "$out"; then DIRECT_DETAIL=" old_chain=direct FAIL($WRITE_ERR)"; return 0; fi
+    if ! fresh_output "$out"; then DIRECT_DETAIL=" old_chain=direct FAIL(output not written by this run: $out)"; return 0; fi
+    if ! why_not=$(lines_up "$out" "$master"); then DIRECT_DETAIL=" old_chain=direct FAIL($why_not)"; return 0; fi
+    d=$(xpsnr_delta "$out" "$bic" "$master") || rc=$?
+    if [[ "$rc" != 0 ]]; then DIRECT_DETAIL=" old_chain=direct FAIL($(why "$rc" "xpsnr failed"))"; return 0; fi
+    DIRECT_DELTA="$d"
+    DIRECT_DETAIL=" old_chain=direct fps=$f xpsnr_delta=${d}dB"
+}
+
+# lowres_route_check <source height>: the plugin's own record of a stream of the source clip with sr=fsrcnnx must carry
+# lowres_route_text in its summary (UpscaleEngine DecideLowResRoute). Sets ROUTE_STATE (ok, FAIL or unverified) and ROUTE_DETAIL
+# (` lowres_route=...`). A record it cannot read, or no server, is unverified: the caller keeps its ffmpeg result and never raises
+# it. A token the server rejects is FAIL, as on every other API row. Call it directly.
+ROUTE_STATE=""
+ROUTE_DETAIL=""
+lowres_route_check() {
+    local rec sumry want
+    want="$(lowres_route_text)"
+    ROUTE_STATE=unverified
+    if ! have_api; then
+        if [[ "$API_WHY" == rejected ]]; then
+            ROUTE_STATE=FAIL; ROUTE_DETAIL=" lowres_route=FAIL(token rejected (HTTP $API_CODE) by $JF_URL/System/Info)"
+        else
+            ROUTE_DETAIL=" lowres_route=unverified(no Jellyfin API)"
+        fi
+        return 0
+    fi
+    if ! item_id "${TITLE}_${1}p.mkv"; then ROUTE_DETAIL=" lowres_route=unverified($ITEM_ERR)"; return 0; fi
+    if ! api_stream "$ITEM_ID" 1080 "sr=fsrcnnx"; then ROUTE_DETAIL=" lowres_route=unverified($STREAM_ERR)"; return 0; fi
+    if ! rec=$(api "/JellyfinPlus/Session/$STREAM_SID"); then ROUTE_DETAIL=" lowres_route=unverified(GET /JellyfinPlus/Session/$STREAM_SID failed)"; return 0; fi
+    if [[ "$(jq -r '.Known // false' <<<"$rec" 2>/dev/null || true)" != true ]]; then
+        ROUTE_DETAIL=" lowres_route=unverified(no session record for $STREAM_SID)"
+        return 0
+    fi
+    sumry=$(jq -r '.Record.Summary // empty' <<<"$rec" 2>/dev/null || true)
+    if [[ "$sumry" == *"$want"* ]]; then
+        ROUTE_STATE=ok; ROUTE_DETAIL=" lowres_route=ok"
+    else
+        ROUTE_STATE=FAIL; ROUTE_DETAIL=" lowres_route=FAIL(plugin did not take the low-res route for a ${1}p source: session_summary=${sumry:0:300})"
+    fi
+}
+
+shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e] [alts] [routed]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size; alts=1 also scores the ROW2_ALTS paths; routed=1 decides on the plugin's low-res route (FSRCNNX to the source x ALT_LOW, then bicubic), prints the direct chain beside it and checks the session record
+    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" alts="${8:-0}" routed="${9:-0}" fps d cu status=PASS detail="" src ow oh rc=0 xrc=0
+    local shader_out="$RUN_OUT/r$row-shader.mkv" bicubic_out="$RUN_OUT/r$row-bicubic.mkv" fn=chain_shader label="" fd
     read -r ow oh <<<"$(master_dims "$(clip "$h")" "$w" "$h")"
-    fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$ow" "$oh")") || { rc=$?; record "$row" FAIL "$(why "$rc" "ffmpeg failed")"; return; }
-    pair_cmd write-candidate "$(clip "$sh")" chain_shader "$shader_out" "$bicubic_out" "$(clip "$h")" "$ow" "$oh"
+    if [[ "$routed" == 1 ]]; then
+        alt_setup lowtarget "$(clip "$sh")"
+        fn="$ALT_FN"
+        label="new_chain=lowres-${ALT_LOW}x "
+    fi
+    fps=$(run_fps "$(clip "$sh")" "$("$fn" "$ow" "$oh")") || { rc=$?; record "$row" FAIL "$(why "$rc" "ffmpeg failed")"; return; }
+    pair_cmd write-candidate "$(clip "$sh")" "$fn" "$shader_out" "$bicubic_out" "$(clip "$h")" "$ow" "$oh"
     write_run "$shader_out" || { record "$row" FAIL "$WRITE_ERR"; return; }
-    pair_cmd write-bicubic "$(clip "$sh")" chain_shader "$shader_out" "$bicubic_out" "$(clip "$h")" "$ow" "$oh"
+    pair_cmd write-bicubic "$(clip "$sh")" "$fn" "$shader_out" "$bicubic_out" "$(clip "$h")" "$ow" "$oh"
     write_run "$bicubic_out" || { record "$row" FAIL "$WRITE_ERR"; return; }
     require_fresh "$row" "$shader_out" "$bicubic_out" || return 0
     score_inputs "$row" "$shader_out" "$bicubic_out" "$(clip "$h")" || return 0
-    detail="fps=$fps"
+    detail="${label}fps=$fps"
     d=$(xpsnr_delta "$shader_out" "$bicubic_out" "$(clip "$h")") || xrc=$?
     if [[ "$xrc" == 0 ]]; then
         detail+=" xpsnr_delta=${d}dB"
@@ -843,8 +920,14 @@ shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e] [alts]; dst-
         detail+=" xpsnr failed ($(why "$xrc" "ffmpeg xpsnr of the ${ow}x${oh} outputs against $(clip "$h")"))"
         status=FAIL
     fi
+    fd="${d:-}"
+    if [[ "$routed" == 1 && "$xrc" == 0 ]]; then
+        row_direct "$row" "$sh" "$h" "$ow" "$oh" "$bicubic_out"
+        detail+="$DIRECT_DETAIL"
+        fd="$DIRECT_DELTA"
+    fi
     if [[ "$alts" == 1 && "$xrc" == 0 ]]; then
-        row_alts "$row" "$sh" "$h" "$ow" "$oh" "$d" "$bicubic_out"
+        row_alts "$row" "$sh" "$h" "$ow" "$oh" "$fd" "$bicubic_out"
         detail+="$ALT_DETAIL"
     fi
     if [[ "$fmin" != 0 ]]; then ge "$fps" "$fmin" || status=FAIL; fi
@@ -869,10 +952,15 @@ shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e] [alts]; dst-
             [[ "$status" == PASS ]] && status=SKIP
         fi
     fi
+    if [[ "$routed" == 1 ]]; then
+        lowres_route_check "$sh"
+        detail+="$ROUTE_DETAIL"
+        [[ "$ROUTE_STATE" != FAIL ]] || status=FAIL
+    fi
     record "$row" "$status" "$detail"
 }
 
-row_2() { shader_row 2 360 1920 1080 "$FPS_R2" "$XPSNR_R2" 0 1; }
+row_2() { shader_row 2 360 1920 1080 "$FPS_R2" "$XPSNR_R2" 0 1 1; }
 row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1; }
 row_4() { shader_row 4 1080 3840 2160 "$FPS_R4" "$XPSNR_R4" 1; }
 
