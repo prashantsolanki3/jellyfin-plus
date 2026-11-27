@@ -1023,7 +1023,10 @@ never `PASS`.
 other transcodes: the caller must), outside the blocked windows (default 01:00 to 07:00 and 16:30 to
 18:30 Australia/Melbourne: drain, trivy, backups; set `BENCH_BLOCK_WINDOWS` to a comma list of
 `HHMM-HHMM`, start included and end not, and `BENCH_TZ` to the zone; a malformed value exits 2),
-and with memory PSI `some avg60` under 1%. `--no-gates` skips them only
+and with memory PSI `some avg60` under 1%. The clock window and PSI are checked again before each of
+rows 2 to 11: a row that would start inside a window, or with PSI high, waits in 60 s steps (`bench: row N
+waiting: ...`) for up to `BENCH_BLOCK_WAIT_MAX_MIN` minutes (default 240), then is recorded `SKIP` and
+the run carries on. `--no-gates` skips them only
 with `BENCH_CONFIRM_NO_GATES=1` as well. Rows 1 and 12 read only the shim-log lines appended during
 the run. The admin token reaches curl on stdin, never on a command line. A failed API call, or a
 stream that returns no segment, is a `FAIL` of that row, not a figure. Exit codes: 0, 1 if any row

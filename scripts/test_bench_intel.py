@@ -598,7 +598,17 @@ esac
 
 # `date +%H%M` is the only thing it fakes (FAKE_HM); everything else is the real date. With FAKE_TZ_LOG set
 # it appends the TZ the script called it with, so a test can see which zone the gate asked for.
-DATE_STUB = ('#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${FAKE_HM:-}" ]; then\n'
+# FAKE_HM_SEQ (a file of `HHMM [hot]` lines) is a clock that moves: each call pops the first line, the last line sticks, and
+# FAKE_PSI_FILE is rewritten with memory PSI high (hot) or low for that reading.
+DATE_STUB = ('#!/bin/sh\nfor a in "$@"; do\n'
+             '  if [ "$a" = "+%H%M" ] && [ -n "${FAKE_HM_SEQ:-}" ]; then\n'
+             '    [ -z "${FAKE_TZ_LOG:-}" ] || echo "${TZ:-}" >> "$FAKE_TZ_LOG"\n'
+             '    set -- $(head -n 1 "$FAKE_HM_SEQ")\n'
+             '    [ "$(wc -l < "$FAKE_HM_SEQ")" -le 1 ] || { tail -n +2 "$FAKE_HM_SEQ" > "$FAKE_HM_SEQ.n"; mv "$FAKE_HM_SEQ.n" "$FAKE_HM_SEQ"; }\n'
+             '    if [ -n "${FAKE_PSI_FILE:-}" ]; then\n      v=0.00; [ "${2:-}" != hot ] || v=5.00\n'
+             '      printf "some avg10=0.00 avg60=%s avg300=0.00 total=0\\n" "$v" > "$FAKE_PSI_FILE"\n    fi\n'
+             '    echo "$1"; exit 0\n  fi\n'
+             '  if [ "$a" = "+%H%M" ] && [ -n "${FAKE_HM:-}" ]; then\n'
              '    [ -z "${FAKE_TZ_LOG:-}" ] || echo "${TZ:-}" >> "$FAKE_TZ_LOG"\n    echo "$FAKE_HM"; exit 0\n  fi\n'
              'done\nexec "$REAL_DATE" "$@"\n')
 
@@ -609,7 +619,7 @@ SLEEP_STUB = ('#!/bin/sh\n[ -z "${FAKE_SLEEP_LOG:-}" ] || echo "$1" >>"$FAKE_SLE
               'if [ -n "${FAKE_VANISH:-}" ] && [ "$1" = 5 ]; then\n'
               '  mkdir "$FAKE_VANISH_LOCK" 2>/dev/null || rm -rf "$FAKE_VANISH"\nfi\n'
               # row 10's 1/2/5 s waits run at a tenth of their length; the fake plugin's 5 s cache window shrinks with them
-              'if [ -n "${FAKE_FAST_WAIT:-}" ]; then\n  case "$1" in 1) set -- 0.1;; 2) set -- 0.2;; 5) set -- 0.5;; esac\nfi\n'
+              'if [ -n "${FAKE_FAST_WAIT:-}" ]; then\n  case "$1" in 1) set -- 0.1;; 2) set -- 0.2;; 5) set -- 0.5;; 60) set -- 0.05;; esac\nfi\n'
               'exec @SLEEP@ "$@"\n')
 
 # A fake Jellyfin: serves JSON by URL path from $FAKE_DIR/scenario.json, logs every call (argv, stdin,
@@ -914,7 +924,16 @@ def test_mutants(tmp):
         ("octal-window-start", "lo=$((10#${item%-*}))", "lo=$((${item%-*}))", gate_failures),
         ("octal-window-end", "hi=$((10#${item#*-}))", "hi=$((${item#*-}))", gate_failures),
         ("window-end-inclusive", "hm < BLOCK_HI[i]", "hm <= BLOCK_HI[i]", gate_failures),
-        ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
+        ("row-gate-dropped", 'row_gated "$r" ||', ': ||', row_gate_failures),
+        ("row-gate-after-row",
+         '    row_gated "$r" || { record "$r" SKIP "$HOLD_WHY"; continue; }\n    say "row $r: $(row_title "$r")"\n    CUR_ROW="$r"\n    FF_BIN="$(row_ffmpeg "$r")"\n    "row_$r"\n',
+         '    say "row $r: $(row_title "$r")"\n    CUR_ROW="$r"\n    FF_BIN="$(row_ffmpeg "$r")"\n    "row_$r"\n    row_gated "$r" || { record "$r" SKIP "$HOLD_WHY"; continue; }\n',
+         row_gate_failures),
+        ("row-gate-window-end-inclusive", "hm < BLOCK_HI[i]", "hm <= BLOCK_HI[i]", row_gate_failures),
+        ("row-gate-cap-off-by-one", "waited >= BLOCK_WAIT_MAX_MIN", "waited > BLOCK_WAIT_MAX_MIN", row_gate_failures),
+        ("row-gate-psi-ignored", "elif psi_hot; then", "elif false; then", row_gate_failures),
+        ("row-gate-no-skip", 'record "$r" SKIP "$HOLD_WHY"; continue;', ':;', row_gate_failures),
+        ("tz-hard-coded",'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
         ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
         ("run-fps-lost-failure", '|| { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
@@ -1464,6 +1483,82 @@ def gate_failures(script, tmp, tag):
     rc, out, err = run(script, ["--rows", "13"], dict(w.env, BENCH_ASSERT_QUIET="1", FAKE_HM="1200", BENCH_PSI_FILE=hot))
     if not (rc == 2 and "PSI" in err):
         bad.append(f"psi:rc{rc}")
+    return bad
+
+
+ROW_GATE_SCENARIO = {"stream_logs": "libplacebo=w=1920"}
+
+
+def row_gate_run(script, w, tag, seq, rows, cap=5, windows="0100-0415,1630-1830"):
+    """One gated run on a clock that follows `seq` (lines of `HHMM [hot]`, the first read by the start gate): (rc, out, err, 60 s sleeps)."""
+    p = lambda n: os.path.join(w.root, f"{n}-{tag}")
+    open(p("seq"), "w").write("\n".join(seq) + "\n")
+    open(p("sleeps"), "w").close()
+    open(p("psi"), "w").write(PSI_OK)
+    env = dict(w.env, BENCH_ASSERT_QUIET="1", BENCH_RUN_ID=f"rg-{tag}", FAKE_HM_SEQ=p("seq"), FAKE_PSI_FILE=p("psi"),
+               BENCH_PSI_FILE=p("psi"), FAKE_SLEEP_LOG=p("sleeps"), BENCH_BLOCK_WINDOWS=windows,
+               BENCH_BLOCK_WAIT_MAX_MIN=str(cap))
+    rc, out, err = run(script, ["--rows", rows], env)
+    return rc, out, err, open(p("sleeps")).read().split().count("60")
+
+
+def row_gate_failures(script, tmp, tag):
+    """What the between-rows clock-window and PSI wait gets wrong (empty = right). The clock is a faked sequence, the 60 s
+    sleep a 0.05 s one; the cap is 5 steps so a gate that never lets go ends the run instead of the harness."""
+    bad = []
+    w = World(tmp, tag, ROW_GATE_SCENARIO)
+
+    # 1. the clock enters a block after the start gate: row 2 is held until it leaves, row 3 then runs at once
+    rc, out, err, n = row_gate_run(script, w, "enter", ["1200", "0100", "0100", "0415"], "2,3")
+    res = results(out)
+    held = out.find("bench: row 2 waiting: 0100 inside blocked window 01:00-04:15")
+    started = out.find("bench: row 2: ")
+    if out.count("bench: row 2 waiting:") != 2 or not 0 <= held < started:
+        bad.append(f"enter:wait-lines:{out.count('bench: row 2 waiting:')}:{held}:{started}")
+    if n != 2:
+        bad.append(f"enter:sleeps{n}")
+    if 2 not in res or res[2][0] == "SKIP" or 3 not in res or "waiting" in out.split("bench: row 3:")[-1]:
+        bad.append(f"enter:rows:{res}")
+    if rc == 2:
+        bad.append(f"enter:rc{rc}:{err[:100]}")
+
+    # 2. a block that outlasts the cap: row 2 is SKIP 'blocked window' after exactly `cap` waits, row 3 still runs
+    rc, out, err, n = row_gate_run(script, w, "cap", ["1200", "0100", "0100", "0100", "1200"], "2,3", cap=2)
+    res = results(out)
+    if n != 2:
+        bad.append(f"cap:sleeps{n}")
+    if res.get(2, ("", ""))[0] != "SKIP" or "blocked window" not in res.get(2, ("", ""))[1] or "bench: row 2: " in out:
+        bad.append(f"cap:row2:{res.get(2)}")
+    if 3 not in res or res[3][0] == "SKIP" or "bench: row 3: " not in out:
+        bad.append(f"cap:row3:{res.get(3)}")
+
+    # 3. no block anywhere: no wait, the same statuses as the ungated run
+    rc, out, err, n = row_gate_run(script, w, "open", ["1200"], "2,3,12")
+    rc0, out0, err0 = w.run(["--rows", "2,3,12"])
+    if "waiting" in out or n != 0 or rc != rc0 or {r: s for r, (s, _) in results(out).items()} != {r: s for r, (s, _) in results(out0).items()} or len(results(out)) != 3:
+        bad.append(f"open:{rc}/{rc0}:{n}:{results(out)}:{results(out0)}")
+
+    # 4. the start gate still refuses inside a block
+    rc, out, err, n = row_gate_run(script, w, "start", ["0200"], "2")
+    if rc != 2 or "gate:" not in err or "blocked window" not in err or results(out) or "waiting" in out or n != 0:
+        bad.append(f"start:rc{rc}:{n}:{err[:100]}")
+
+    # 5. memory PSI: held until it cools; skipped 'memory pressure' past the cap
+    rc, out, err, n = row_gate_run(script, w, "psi-cool", ["1200", "1200 hot", "1200"], "2")
+    res = results(out)
+    held = out.find("bench: row 2 waiting: memory PSI")
+    if n != 1 or out.count("bench: row 2 waiting:") != 1 or not 0 <= held < out.find("bench: row 2: ") or res.get(2, ("SKIP",))[0] == "SKIP":
+        bad.append(f"psi-cool:{n}:{held}:{res}")
+    rc, out, err, n = row_gate_run(script, w, "psi-hot", ["1200", "1200 hot"], "2", cap=2)
+    res = results(out)
+    if n != 2 or res.get(2, ("", ""))[0] != "SKIP" or "memory pressure" not in res.get(2, ("", ""))[1] or "bench: row 2: " in out:
+        bad.append(f"psi-hot:{n}:{res}")
+
+    # 6. rows 1, 12 and 13 are not re-checked
+    rc, out, err, n = row_gate_run(script, w, "edges", ["1200", "0100"], "1,12,13", cap=2)
+    res = results(out)
+    if "waiting" in out or n != 0 or sorted(res) != [1, 12, 13] or any("blocked window" in d for _, d in res.values()):
+        bad.append(f"edges:{n}:{res}")
     return bad
 
 
@@ -2426,6 +2521,8 @@ def test_gates_and_confirmation(tmp):
     check("the window and PSI gates read HHMM as decimal", not bad, str(bad))
     bad = window_failures(BENCH, tmp, "windows")
     check("BENCH_BLOCK_WINDOWS and BENCH_TZ: plan line, zone, malformed values refused", not bad, str(bad))
+    bad = row_gate_failures(BENCH, tmp, "rowgate")
+    check("a gated run waits before each row 2-11 while a window or PSI blocks, SKIPs past the cap, and leaves the start gate and other rows alone", not bad, str(bad))
 
     w = World(tmp, "nogates")
     rc, out, err = w.run(["--no-gates", "--rows", "13"], BENCH_CONFIRM_NO_GATES="")
@@ -2435,6 +2532,12 @@ def test_gates_and_confirmation(tmp):
     rc, out, err = w.run(["--help"])
     check("--help names --no-gates and its confirmation", rc == 0 and "--no-gates" in out and "BENCH_CONFIRM_NO_GATES" in out, out)
     check("--help names BENCH_BLOCK_WINDOWS and BENCH_TZ", "BENCH_BLOCK_WINDOWS" in out and "BENCH_TZ" in out, out)
+    check("--help names BENCH_BLOCK_WAIT_MAX_MIN", "BENCH_BLOCK_WAIT_MAX_MIN" in out, out)
+    for bogus in ("abc", "-1", "1.5"):
+        rc, out, err = w.run(["--rows", "13"], BENCH_BLOCK_WAIT_MAX_MIN=bogus)
+        check(f"BENCH_BLOCK_WAIT_MAX_MIN={bogus!r} is refused", rc == 2 and "BENCH_BLOCK_WAIT_MAX_MIN" in err, f"rc={rc} {err}")
+    rc, out, err = w.run(["--rows", "13"], BENCH_BLOCK_WAIT_MAX_MIN="0")
+    check("BENCH_BLOCK_WAIT_MAX_MIN=0 is accepted", rc == 0 and "MANUAL" in out, f"rc={rc} {err}")
 
 
 def test_hermetic_api(tmp):

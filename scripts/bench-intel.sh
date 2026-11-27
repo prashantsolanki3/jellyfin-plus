@@ -46,6 +46,7 @@
 #   BENCH_NEURAL_LEVEL    the neural level row 6 asks for      realesr-anime-x2 (realesr-anime-x2|realesr-anime-x4|realesr-general-x4)
 #   BENCH_BLOCK_WINDOWS   the gate's blocked clock windows, HHMM-HHMM comma list, start included, end not   0100-0700,1630-1830
 #   BENCH_TZ              the zone those windows are read in    Australia/Melbourne
+#   BENCH_BLOCK_WAIT_MAX_MIN  minutes a gated row 2-11 waits (60 s steps) for a blocked window or memory PSI to clear, then it is SKIP   240
 #   BENCH_PROC            the /proc row 10 looks for the transcode in (the Jellyfin pod's is not this pod's)   /proc
 #
 # Clips: <title>_{360,720,1080,2160}p.mkv lossless masters (the 360/720/1080 are `scale=flags=area`
@@ -111,6 +112,7 @@ NEURAL_LEVEL="${BENCH_NEURAL_LEVEL:-realesr-anime-x2}"
 BLOCK_TZ="${BENCH_TZ:-Australia/Melbourne}"
 BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"
 PROC="${BENCH_PROC:-/proc}"
+BLOCK_WAIT_MAX_MIN="${BENCH_BLOCK_WAIT_MAX_MIN:-240}"
 
 ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)
 DRY=0
@@ -483,21 +485,59 @@ parse_block_windows() {
     done
 }
 
-check_gates() {
-    local hm psi i
-    [[ "${BENCH_ASSERT_QUIET:-}" == 1 ]] \
-        || die "gate: set BENCH_ASSERT_QUIET=1 once you have checked there is no vzdump, no Plex transcode and no production Jellyfin transcode"
+# Returns 0 when the clock is inside a blocked window, setting BLOCK_NOW (HHMM) and BLOCK_HIT (that window, HH:MM-HH:MM).
+in_block_window() {
+    local hm i
     # 10#: HHMM has a leading zero, which bash reads as octal (0830 and 0900 are then errors)
     hm=$((10#$(TZ="$BLOCK_TZ" date +%H%M)))
     for i in "${!BLOCK_LO[@]}"; do
         if (( hm >= BLOCK_LO[i] && hm < BLOCK_HI[i] )); then
-            die "gate: $(printf '%04d' "$hm") $BLOCK_TZ is inside a blocked window ($BLOCK_TEXT), drain, trivy or backup time"
+            BLOCK_NOW=$(printf '%04d' "$hm")
+            BLOCK_HIT=$(printf '%02d:%02d-%02d:%02d' $((BLOCK_LO[i] / 100)) $((BLOCK_LO[i] % 100)) $((BLOCK_HI[i] / 100)) $((BLOCK_HI[i] % 100)))
+            return 0
         fi
     done
-    if [[ -r "$PSI_FILE" ]]; then
-        psi=$(awk '/^some/ { split($3, a, "="); print a[2] }' "$PSI_FILE")
-        le "${psi:-0}" 1 || die "gate: memory PSI some avg60=$psi >= 1%"
+    return 1
+}
+
+# Returns 0 when memory PSI some avg60 is over 1%, setting PSI_AVG60.
+psi_hot() {
+    PSI_AVG60=""
+    [[ -r "$PSI_FILE" ]] || return 1
+    PSI_AVG60=$(awk '/^some/ { split($3, a, "="); print a[2] }' "$PSI_FILE")
+    if le "${PSI_AVG60:-0}" 1; then return 1; fi
+    return 0
+}
+
+check_gates() {
+    [[ "${BENCH_ASSERT_QUIET:-}" == 1 ]] \
+        || die "gate: set BENCH_ASSERT_QUIET=1 once you have checked there is no vzdump, no Plex transcode and no production Jellyfin transcode"
+    if in_block_window; then
+        die "gate: $BLOCK_NOW $BLOCK_TZ is inside a blocked window ($BLOCK_TEXT), drain, trivy or backup time"
     fi
+    if psi_hot; then die "gate: memory PSI some avg60=$PSI_AVG60 >= 1%"; fi
+}
+
+# Before a heavy row (2-11) of a gated run: waits in 60 s steps while the clock is in a blocked window or memory PSI is high,
+# at most BLOCK_WAIT_MAX_MIN steps. Returns 1 with HOLD_WHY set when the cap is reached; the caller records the row SKIP.
+row_gated() {
+    local row="$1" waited=0 msg
+    [[ $GATES == 1 ]] && (( row >= 2 && row <= 11 )) || return 0
+    while :; do
+        if in_block_window; then
+            msg="$BLOCK_NOW inside blocked window $BLOCK_HIT"
+            HOLD_WHY="blocked window $BLOCK_HIT $BLOCK_TZ still open after waiting ${waited} min (BENCH_BLOCK_WAIT_MAX_MIN=$BLOCK_WAIT_MAX_MIN)"
+        elif psi_hot; then
+            msg="memory PSI some avg60=$PSI_AVG60 >= 1%"
+            HOLD_WHY="memory pressure some avg60=$PSI_AVG60 >= 1% still high after waiting ${waited} min (BENCH_BLOCK_WAIT_MAX_MIN=$BLOCK_WAIT_MAX_MIN)"
+        else
+            return 0
+        fi
+        if (( waited >= BLOCK_WAIT_MAX_MIN )); then return 1; fi
+        say "row $row waiting: $msg"
+        sleep 60
+        waited=$((waited + 1))
+    done
 }
 
 # fdinfo busy percent of one pid's DRM clients over a window: "<class> <percent>" per engine class.
@@ -1452,7 +1492,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,13p;21,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p;21,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1470,6 +1510,7 @@ done
 for r in "${ROWS[@]}"; do row_title "$r" >/dev/null || die "no such row: $r (rows are 1 to 13)"; done
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "BENCH_RUNS must be a positive integer, got: $RUNS"
 [[ "$RUN_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "BENCH_RUN_TIMEOUT must be a positive integer (seconds), got: $RUN_TIMEOUT"
+[[ "$BLOCK_WAIT_MAX_MIN" =~ ^[0-9]+$ ]] || die "BENCH_BLOCK_WAIT_MAX_MIN must be a non-negative integer (minutes), got: $BLOCK_WAIT_MAX_MIN"
 case "$NEURAL_LEVEL" in
     realesr-anime-x2 | realesr-anime-x4 | realesr-general-x4) ;;
     *) die "BENCH_NEURAL_LEVEL must be realesr-anime-x2, realesr-anime-x4 or realesr-general-x4, got: $NEURAL_LEVEL" ;;
@@ -1513,6 +1554,7 @@ trap 'exit 130' INT TERM
 
 if [[ "${BENCH_TRACE:-}" == 1 ]]; then exec 9>&2; fi
 for r in "${ROWS[@]}"; do
+    row_gated "$r" || { record "$r" SKIP "$HOLD_WHY"; continue; }
     say "row $r: $(row_title "$r")"
     CUR_ROW="$r"
     FF_BIN="$(row_ffmpeg "$r")"
