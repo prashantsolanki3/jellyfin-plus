@@ -132,7 +132,7 @@ TITLES = {
 # A fragment each row's must-pass line has to carry (the figures the owner's decision names).
 MUST = {
     1: ["vendor=intel", "Vulkan vk:0", "no nvenc/cuda string"],
-    2: ["fps>=100", "bicubic+0.5dB", "chroma xpsnr>=25dB"],
+    2: ["fps>=100", "bicubic+0.5dB", "chroma xpsnr>=25dB", "low-res route"],
     3: ["fps>=1.2x source fps", "bicubic+0.3dB", "chroma xpsnr>=25dB"],
     4: ["scaler-only fps>=34", "QSV encode >=1.2x", "bicubic+0.3dB", "chroma xpsnr>=25dB"],
     5: ["device=openvino", "slower than real time is a valid result"],
@@ -161,11 +161,17 @@ THRESHOLD = {
 EXACT = [
     "plan: bench-intel: rows=1 2 3 4 5 6 7 8 9 10 11 12 13 runs=3 mode=dry-run",
     "plan: required filters: oidn ort",
-    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), ff=STOCK),
-    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), f"{RUN}/r2-shader.mkv", ff=STOCK),
+    # the deciding chain is the plugin's Intel low-res route: FSRCNNX to the 640x360 source x 1.5 = 960x540, then bicubic
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader_bicubic(960, 540, 1920, 1080), ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader_bicubic(960, 540, 1920, 1080), f"{RUN}/r2-shader.mkv", ff=STOCK),
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", bicubic(1920, 1080), f"{RUN}/r2-bicubic.mkv", ff=STOCK),
     "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-shader.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
     "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-bicubic.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    # the old direct chain, informational: FSRCNNX straight to the target
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), ff=STOCK),
+    "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader(1920, 1080), f"{RUN}/r2-direct.mkv", ff=STOCK),
+    "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-direct.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
+    "plan: row 2 route check: a 360p stream with sr=fsrcnnx, then Session/<its PlaySessionId> Record.Summary must carry 'low-res route: fsrcnnx to 1.5x then bicubic'",
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", ewa(1920, 1080), f"{RUN}/r2-alt-ewa.mkv", ff=STOCK),
     "plan: row 2 cmd: " + xpsnr_cmd(f"{RUN}/r2-alt-ewa.mkv", "/clips/tears_1080p.mkv", ff=STOCK),
     "plan: row 2 cmd: " + run_cmd("/clips/tears_360p.mkv", shader_bicubic(1280, 720, 1920, 1080), f"{RUN}/r2-alt-x2-bicubic.mkv", ff=STOCK),
@@ -438,9 +444,12 @@ case "$*" in
     y=30
     case "$*" in
     *hwdec-on.mkv*) y=55;;
-    *shader.mkv* | *pan-fsr2.mkv*) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=30 || y=40;;
+    *shader.mkv* | *pan-fsr2.mkv* | *r2-direct.mkv*) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=30 || y=40;;
     *) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=40 || y=30;;
     esac
+    # FAKE_XPSNR_ROUTED / FAKE_XPSNR_DIRECT: the luma score of row 2's deciding (r2-shader.mkv) and informational (r2-direct.mkv) chain
+    [ -z "${FAKE_XPSNR_ROUTED:-}" ] || case "$*" in *r2-shader.mkv*) y=$FAKE_XPSNR_ROUTED;; esac
+    [ -z "${FAKE_XPSNR_DIRECT:-}" ] || case "$*" in *r2-direct.mkv*) y=$FAKE_XPSNR_DIRECT;; esac
     # FAKE_XPSNR_ALT="ewa=34 lowtarget=36": the luma score of a row 2 alternative (r2-alt-<name>.mkv), whole dB
     for kv in ${FAKE_XPSNR_ALT:-}; do
         case "$*" in *"r2-alt-${kv%%=*}.mkv"*) y=${kv#*=};; esac
@@ -705,7 +714,9 @@ if path.startswith("/JellyfinPlus/Session/"):
     sid = path.rsplit("/", 1)[1]
     if sid == "bench-probe":
         shimlog(sc.get("probe_logs"))
-    s = st["sessions"].get(sid)
+    if sc.get("session_fail") and sid != "bench-probe":
+        fail(500)
+    s = None if sc.get("no_record") else st["sessions"].get(sid)
     if s is None:
         levels = {"Denoise": ["off", "nlmeans"], "Neural": ["off", "realesr-anime-x2"], "Game": sc.get("game_levels", ["off", "fsr2"])}
         if cfg_max > 0 and sc.get("config_applies", True):
@@ -721,12 +732,23 @@ if path.startswith("/JellyfinPlus/Session/"):
         rec["NeuralRequested"] = sc["requested"]
     if "withheld" in sc:
         rec["Record"] = {"GpuWithheldUnmeasured": sc["withheld"]}
+    # the plugin's summary carries the low-res route part when the stream asked for fsrcnnx on a source under 480p;
+    # scenario `summary` replaces it (null: no summary at all)
+    if "summary" in sc:
+        summary = sc["summary"]
+    elif s["sr"] == "fsrcnnx" and s["src_height"] < 480:
+        summary = "Intel Arc, 360p to 1080p, low-res route: fsrcnnx to 1.5x then bicubic"
+    else:
+        summary = None
+    if summary is not None:
+        rec.setdefault("Record", {})["Summary"] = summary
     out(rec)
 if path.endswith("/master.m3u8"):
     if sc.get("fail_master"):
         fail()
     sid = q["PlaySessionId"][0]
-    st["sessions"][sid] = {"src_height": int(path.split("/")[2][2:]), "neural": q.get("neural", [""])[0]}
+    st["sessions"][sid] = {"src_height": int(path.split("/")[2][2:]), "neural": q.get("neural", [""])[0],
+                          "sr": q.get("sr", [""])[0]}
     save()
     shimlog(sc.get("stream_logs"))
     out("#EXTM3U\nmain.m3u8?PlaySessionId=" + sid + "\n", raw=True)
@@ -962,6 +984,16 @@ def test_mutants(tmp):
         ("alt-not-lined-up", 'if ! why_not=$(lines_up "$out" "$master"); then', 'if ! why_not=$(:); then', alt_failures),
         ("alts-after-failed-score", 'if [[ "$alts" == 1 && "$xrc" == 0 ]]; then', 'if [[ "$alts" == 1 ]]; then', alt_failures),
         ("alts-on-row-3", 'row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1; }', 'row_3() { shader_row 3 720 1920 1080 0 "$XPSNR_R3" 1 1; }', alt_failures),
+        ("primary-reverts-to-direct", 'row_2() { shader_row 2 360 1920 1080 "$FPS_R2" "$XPSNR_R2" 0 1 1; }',
+         'row_2() { shader_row 2 360 1920 1080 "$FPS_R2" "$XPSNR_R2" 0 1 0; }', lowres_failures),
+        ("route-check-dropped", 'if [[ "$routed" == 1 ]]; then\n        lowres_route_check', 'if false; then\n        lowres_route_check', lowres_failures),
+        ("route-part-unchecked", '[[ "$sumry" == *"$want"* ]]', '[[ -n "$sumry" ]]', lowres_failures),
+        ("route-low-is-x2", "ALT_LOW=1.5", "ALT_LOW=2", lowres_failures),
+        ("unverified-counts-as-pass", '[[ "$ROUTE_STATE" != FAIL ]] || status=FAIL',
+         '[[ "$ROUTE_STATE" != FAIL ]] || status=FAIL; [[ "$ROUTE_STATE" != unverified ]] || status=PASS', lowres_failures),
+        ("unverified-is-fail", 'ROUTE_DETAIL=" lowres_route=unverified(no Jellyfin API)"', 'ROUTE_STATE=FAIL; ROUTE_DETAIL=" lowres_route=unverified(no Jellyfin API)"', lowres_failures),
+        ("direct-decides-the-row", 'detail+="$DIRECT_DETAIL"', 'detail+="$DIRECT_DETAIL"; [[ "$DIRECT_DETAIL" != *FAIL* ]] || status=FAIL', lowres_failures),
+        ("direct-not-printed", 'detail+="$DIRECT_DETAIL"', ':', lowres_failures),
         ("trace-silent","""printf 'trace: row %s: %s\\n' "${CUR_ROW:-?}" "${CMD[*]}" >&9;""", ":;", trace_failures),
         ("row10-no-prime",'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
         ("row10-short-wait", "LOAD_WAIT=5", "LOAD_WAIT=1", row10_prime_failures),
@@ -1560,8 +1592,8 @@ def size_failures(script, tmp, tag):
             bad.append(f"row{row}-{title}:no ffmpeg run")
         for l in lines:
             sizes = re.findall(r"(?:w=(\d+):h=(\d+)|scale=(\d+):(\d+):)", l)
-            if "r2-alt-" in l:
-                # a shader-then-bicubic alternative runs its shader at an intermediate size; the file it writes is the master's
+            if "r2-alt-" in l or (row == 2 and "custom_shader_path" in l and "scale=" in l):
+                # a shader-then-bicubic chain (row 2's routed chain, or an alternative) runs its shader at an intermediate size; the file it writes is the master's
                 if not sizes or (sizes[-1][0] or sizes[-1][2], sizes[-1][1] or sizes[-1][3]) != (str(ow), str(oh)):
                     bad.append(f"row{row}-{title}-alt:{l[-90:]}")
             elif not want.search(l) or any((a or c, b or d) != (str(ow), str(oh)) for a, b, c, d in sizes):
@@ -1876,7 +1908,7 @@ def row9_failures(script, tmp, tag):
     return bad
 
 
-RUN_FILES = ["r2-shader.mkv", "r2-bicubic.mkv", "r2-alt-ewa.mkv", "r2-alt-x2-bicubic.mkv", "r2-alt-lowtarget.mkv", "r3-shader.mkv", "r3-bicubic.mkv", "r4-shader.mkv", "r4-bicubic.mkv",
+RUN_FILES = ["r2-shader.mkv", "r2-bicubic.mkv", "r2-direct.mkv", "r2-alt-ewa.mkv", "r2-alt-x2-bicubic.mkv", "r2-alt-lowtarget.mkv", "r3-shader.mkv", "r3-bicubic.mkv", "r4-shader.mkv", "r4-bicubic.mkv",
              "pan-fsr2.mkv", "pan-bicubic.mkv", "hwdec-on.mkv", "hwdec-off.mkv"]
 SHARED = ("results.jsonl", "tears_1080p_h264.mkv")
 
@@ -1995,7 +2027,8 @@ def argv_failures(script, tmp, tag):
     xp = [l for l in r2 if "xpsnr=" in l]
     pairs = [re.search(r" -i (\S+) -i (\S+) -lavfi ", l).groups() for l in xp]
     alt = {n: f"{run_dir}/r2-alt-{n}.mkv" for n in ALTS}
-    want_pairs = [(sh, master), (bi, master), (sh, master)]
+    dr = f"{run_dir}/r2-direct.mkv"
+    want_pairs = [(sh, master), (bi, master), (sh, master), (dr, master), (bi, master)]
     for n in ALTS:  # each alternative is scored against the master, then the same bicubic control again
         want_pairs += [(alt[n], master), (bi, master)]
     if pairs != want_pairs:
@@ -2004,14 +2037,15 @@ def argv_failures(script, tmp, tag):
         bad.append("row2-xpsnr-pairing-not-by-index")
     writes = [l for l in r2 if "-c:v ffv1" in l]
     # the source is 640x286, so 2x is 1280x572 and 1.5x is 960x430 (even); every alternative ends at the master's 1920x858
-    want_writes = [run_cmd(src, shader(1920, 858), sh), run_cmd(src, bicubic(1920, 858), bi),
+    want_writes = [run_cmd(src, shader_bicubic(960, 430, 1920, 858), sh), run_cmd(src, bicubic(1920, 858), bi),
+                   run_cmd(src, shader(1920, 858), dr),
                    run_cmd(src, ewa(1920, 858), alt["ewa"]),
                    run_cmd(src, shader_bicubic(1280, 572, 1920, 858), alt["x2-bicubic"]),
                    run_cmd(src, shader_bicubic(960, 430, 1920, 858), alt["lowtarget"])]
     if writes != [l.replace(FF, ff, 1) for l in want_writes]:
         bad.append(f"row2-writes:{writes}")
     fps = [l for l in r2 if "-f null -" in l and "xpsnr=" not in l]
-    if fps != [run_cmd(src, shader(1920, 858)).replace(FF, ff, 1)]:
+    if fps != [run_cmd(src, shader_bicubic(960, 430, 1920, 858)).replace(FF, ff, 1), run_cmd(src, shader(1920, 858)).replace(FF, ff, 1)]:
         bad.append(f"row2-run_fps:{fps}")
 
     # the scored files, the bicubic control and the master have the same size and frame count
@@ -2073,8 +2107,9 @@ def trace_failures(script, tmp, tag):
     bad = []
     w = World(tmp, tag)
     rc, out, err = w.run(["--rows", "2"], script=script, BENCH_TRACE="1")
-    # fps, 2 writes, 3 scores and a chroma score, then 3 alternatives of a write and 2 scores each
-    if len([l for l in err.splitlines() if l.startswith("trace: row 2: ")]) != 15:
+    # routed chain: fps, 2 writes, 3 scores (candidate, bicubic, chroma); direct chain: fps, a write, 2 scores;
+    # then 3 alternatives of a write and 2 scores each
+    if len([l for l in err.splitlines() if l.startswith("trace: row 2: ")]) != 19:
         bad.append(f"trace:{err[:120]}")
     rc, out, err = w.run(["--rows", "2"], script=script)
     if "trace:" in err or "trace:" in out:
@@ -2155,8 +2190,113 @@ def alt_failures(script, tmp, tag):
     return bad
 
 
+ROUTE_TEXT = "low-res route: fsrcnnx to 1.5x then bicubic"
+
+
+def lowres_failures(script, tmp, tag):
+    """rev-zlqhh: on Intel a source under 480p runs FSRCNNX to round_even(source x 1.5) and then bicubic to the target, and the
+    session record says so. Row 2 decides on that routed chain (the same thresholds), prints the old direct chain beside it
+    without letting it decide, and FAILs when the plugin's session record for a 360p stream lacks the route part. A record the
+    bench cannot read is `lowres_route=unverified`: the ffmpeg result stays and is never raised to PASS."""
+    bad = []
+
+    def row2(label, scenario=None, extra=None, **env):
+        w = World(tmp, f"{tag}-{label}", scenario, extra)
+        rc, out, err = w.run(["--rows", "2"], script=script, BENCH_RUN_ID="lr", **env)
+        st, detail = results(out).get(2, ("", ""))
+        return w, st, detail
+
+    def argv(cmd):
+        return cmd[len(FF) + 1:]
+
+    # the routed chain is what is measured and written as r2-shader.mkv; the direct one goes to r2-direct.mkv
+    w, st, detail = row2("good")
+    run_dir = f"{w.out}/run-lr"
+    src = f"{w.clips}/tears_360p.mkv"
+    runs = ffmpeg_log(w)
+    routed = argv(run_cmd(src, shader_bicubic(960, 430, 1920, 858), f"{run_dir}/r2-shader.mkv"))
+    direct = argv(run_cmd(src, shader(1920, 858), f"{run_dir}/r2-direct.mkv"))
+    if routed not in runs:
+        bad.append(f"good:r2-shader.mkv is not the routed chain:{[l[-110:] for l in runs if 'r2-shader' in l]}")
+    if direct not in runs:
+        bad.append(f"good:r2-direct.mkv is not the direct chain:{[l[-110:] for l in runs if 'r2-direct' in l]}")
+    nulls = [l for l in runs if " -f null -" in l and "xpsnr=" not in l]
+    if len(nulls) != 2 or "scale=1920:858:" not in nulls[0] or "scale=" in nulls[1] or "libplacebo=w=960:h=430:" not in nulls[0]:
+        bad.append(f"good:fps runs:{[l[-90:] for l in nulls]}")
+    if st != "PASS" or not detail.startswith("new_chain=lowres-1.5x fps=120.00 xpsnr_delta=+10.00dB chroma_xpsnr=40dB"):
+        bad.append(f"good:{st}:{detail[:140]}")
+    if "old_chain=direct fps=120.00 xpsnr_delta=+10.00dB" not in detail or "lowres_route=ok" not in detail:
+        bad.append(f"good:direct or route missing:{detail[:300]}")
+    if not any("sr=fsrcnnx" in u and "MaxHeight=1080" in u and "/Videos/id360/" in u for u in w.urls()):
+        bad.append("good:the route check did not stream the 360p clip with sr=fsrcnnx at 1080")
+    if direct == routed:
+        bad.append("good:test cannot tell the chains apart")
+
+    # the routed chain decides: a good direct chain does not save a bad routed one, a bad direct one does not sink a good routed one
+    w, st, detail = row2("routed-bad", FAKE_XPSNR_ROUTED="30", FAKE_XPSNR_DIRECT="45")
+    if st != "FAIL" or "xpsnr_delta=+0.00dB" not in detail or "old_chain=direct fps=120.00 xpsnr_delta=+15.00dB" not in detail:
+        bad.append(f"routed-bad:{st}:{detail[:200]}")
+    w, st, detail = row2("direct-bad", FAKE_XPSNR_DIRECT="20")
+    if st != "PASS" or not detail.startswith("new_chain=lowres-1.5x") or "old_chain=direct fps=120.00 xpsnr_delta=-10.00dB" not in detail:
+        bad.append(f"direct-bad:{st}:{detail[:200]}")
+    # the direct chain is evidence only: a write or a score that fails is named, and the row keeps the routed result
+    for label, env in (("direct-write", {"FAKE_FFV1_FAIL": "r2-direct"}), ("direct-score", {"FAKE_XPSNR_FAIL_ON": "r2-direct.mkv"})):
+        w, st, detail = row2(label, **env)
+        if st != "PASS" or "old_chain=direct FAIL(" not in detail or "old_chain=direct fps=" in detail or "lowres_route=ok" not in detail:
+            bad.append(f"{label}:{st}:{detail[:240]}")
+    # a routed chain that cannot be written or scored fails the row, and the direct chain and the route check do not run
+    w, st, detail = row2("routed-write", FAKE_FFV1_FAIL="r2-shader")
+    if st != "FAIL" or "old_chain" in detail or "lowres_route" in detail or any("/Videos/" in u for u in w.urls()):
+        bad.append(f"routed-write:{st}:{detail[:160]}")
+    w, st, detail = row2("routed-noscore", FAKE_XPSNR_FAIL="1")
+    if st != "FAIL" or "old_chain" in detail:
+        bad.append(f"routed-noscore:{st}:{detail[:160]}")
+
+    # a session record without the route part is the row's FAIL, with the reason, whatever ffmpeg measured
+    for label, scenario in (("no-part", {"summary": "Intel Arc, fsrcnnx 360p to 1080p"}), ("no-summary", {"summary": None})):
+        w, st, detail = row2(label, scenario)
+        if st != "FAIL" or "plugin did not take the low-res route for a 360p source" not in detail or "lowres_route=FAIL(" not in detail \
+                or "xpsnr_delta=+10.00dB" not in detail:
+            bad.append(f"{label}:{st}:{detail[:240]}")
+    w, st, detail = row2("other-scale", {"summary": "low-res route: fsrcnnx to 2x then bicubic"})
+    if st != "FAIL" or "plugin did not take the low-res route" not in detail:
+        bad.append(f"other-scale:{st}:{detail[:200]}")
+
+    # a record the bench cannot read is unverified: the ffmpeg result stays, a pass stays a pass and a fail stays a fail
+    for label, scenario, extra in (
+            ("session-error", {"session_fail": True}, None),
+            ("unknown-session", {"no_record": True}, None),
+            ("stream-fails", {"fail_master": True}, None),
+            ("no-token", None, {"BENCH_JELLYFIN_TOKEN": ""}),
+            ("api-down", {"info_status": 503}, None),
+            ("clip-missing", {"items_empty": True}, None)):
+        w, st, detail = row2(label, scenario, extra)
+        if st != "PASS" or "lowres_route=unverified(" not in detail or "lowres_route=ok" in detail or "lowres_route=FAIL" in detail:
+            bad.append(f"{label}:{st}:{detail[:240]}")
+        w, st, detail = row2(label + "-bad", scenario, extra, FAKE_XPSNR_ROUTED="30")
+        if st != "FAIL" or "lowres_route=unverified(" not in detail:
+            bad.append(f"{label}-bad:unverified raised a fail:{st}:{detail[:200]}")
+    # no token, no call: nothing is asked of a server that was not named
+    w, st, detail = row2("no-token-calls", None, {"BENCH_JELLYFIN_TOKEN": ""})
+    if w.log():
+        bad.append("no-token-calls:a request was made")
+    # a token the server rejects is a FAIL, as on every other API row
+    w, st, detail = row2("rejected", None, {"BENCH_JELLYFIN_TOKEN": "wrong-token"})
+    if st != "FAIL" or "lowres_route=FAIL(token rejected" not in detail or "wrong-token" in detail:
+        bad.append(f"rejected:{st}:{detail[:200]}")
+
+    # a 640x360 source goes to 960x540 (the 360p clip of a 16:9 title), then bicubic to the master's 1920x1080
+    w, st, detail = row2("wide", extra={"BENCH_TITLE": "wide"})
+    runs = [l for l in ffmpeg_log(w) if "/wide_360p.mkv" in l and " -vf " in l]
+    want = argv(run_cmd(f"{w.clips}/wide_360p.mkv", shader_bicubic(960, 540, 1920, 1080), f"{w.out}/run-lr/r2-shader.mkv"))
+    if want not in runs or not all("libplacebo=w=960:h=540:" in l for l in runs if "r2-alt-lowtarget" in l or l.endswith("r2-shader.mkv")):
+        bad.append(f"wide:{[l[-130:] for l in runs]}")
+    return bad
+
+
 def test_scored_inputs(tmp):
-    for name, fn in (("argv", argv_failures), ("inputs", inputs_failures), ("trace", trace_failures), ("alts", alt_failures)):
+    for name, fn in (("argv", argv_failures), ("inputs", inputs_failures), ("trace", trace_failures), ("alts", alt_failures),
+                     ("lowres", lowres_failures)):
         got = fn(BENCH, tmp, name)
         check(f"scored inputs: {name}", not got, str(got))
 
@@ -2306,7 +2446,7 @@ def test_hermetic_api(tmp):
     check("happy run exits 0 with a summary", rc == 0 and "summary:" in out, f"rc={rc} {err} {out[-300:]}")
     check("rows 2, 3, 4 and 12 PASS against the fake API", all(res.get(r, ("",))[0] == "PASS" for r in (2, 3, 4, 12)), str(res))
     segs = [u for u in w.urls() if "/hls1/main/" in u]
-    check("each of the 6 streams fetches its 5 segments (the loop keeps its token)", len(segs) == 6 * 5, str(len(segs)))
+    check("each of the 7 streams (row 2's route check, rows 3 and 4, row 12's four) fetches its 5 segments (the loop keeps its token)", len(segs) == 7 * 5, str(len(segs)))
     check("a dying stream is not what passes: row 12 saw each height", all(f"{h}p:" in res.get(12, ("", ""))[1] for h in (480, 720, 1080, 2160)), str(res.get(12)))
 
     # item 2: an API that answers only /System/Info/Public
