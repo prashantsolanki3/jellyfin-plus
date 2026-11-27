@@ -24,6 +24,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
             Configure(settingsJson);
             GpuDetector.Start();
             UpscalePatches.Apply(logger as ILogger);
+
+            // Off this thread: the encoder list and the AV1 test encode are ffmpeg runs, and the
+            // capability record and the transcode path only read what they leave behind.
+            UpscaleEngine.WarmProbes();
             return UpscalePatches.Status;
         }
 
@@ -202,9 +206,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["Upscalers"] = ShaderLibrary.Upscalers,
 
                 // The GPU capability record: what vendor this server has and what that vendor's
-                // chain could use. Report only, so the panel can say what it is running on; no
-                // level list above is filtered by it yet. The summary only: this is served to every
-                // authenticated user, and the full record (device paths, PCI ids) is for Status.
+                // The GPU capability record: what vendor this server has and what that vendor's
+                // chain can use. No level list above is filtered by it yet. The summary only: this
+                // is served to every authenticated user, and the full record (device paths, PCI
+                // ids) is for Status.
                 ["Gpu"] = GpuPublic(),
             };
         }
@@ -212,16 +217,18 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>The full GPU capability record under the current GpuVendor setting, for the administrator-only status route. Never throws.</summary>
         private static GpuCapability Gpu()
         {
-            var cfg = UpscaleEngine.Settings;
-            return GpuDetector.Current(cfg?.GpuVendor, cfg?.NeuralModelDirectory);
+            return UpscaleEngine.Capability();
         }
 
+        /// <summary>
+        /// The GPU capability record as JSON, for the plugin side (the load route tells NVIDIA from
+        /// Intel by it; only the vendor leaves that route). Primitives only across the load-context
+        /// boundary, like everything here.
+        /// </summary>
+        public static string GpuJson() => JsonSerializer.Serialize(Gpu());
+
         /// <summary>The non-sensitive subset of the GPU record, for routes any authenticated user can reach. Never throws.</summary>
-        private static GpuSummary GpuPublic()
-        {
-            var cfg = UpscaleEngine.Settings;
-            return GpuDetector.CurrentSummary(cfg?.GpuVendor, cfg?.NeuralModelDirectory);
-        }
+        private static GpuSummary GpuPublic() => UpscaleEngine.CapabilitySummary();
 
         /// <summary>Status plus recent sessions, as JSON.</summary>
         public static string StatusJson()
@@ -344,6 +351,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["Encoder"] = record.Encoder,
                 ["EncoderReason"] = record.EncoderReason,
                 ["Gpu"] = record.Gpu,
+                ["GpuResidentEncode"] = record.GpuResidentEncode,
                 ["Status"] = record.Status,
                 ["Summary"] = record.Summary,
             });

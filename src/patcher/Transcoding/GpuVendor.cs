@@ -85,11 +85,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
     }
 
     /// <summary>
-    /// What this server's GPU is and what the vendor-specific parts of the chain could use, as
-    /// the plugin sees it. REPORT ONLY: nothing in the engine reads it to make a decision yet, so
-    /// a command line is the same whatever it says (docs/architecture/GPU_VENDORS.md, PR 1).
-    /// Every flag is about what was seen, not what the setting wishes: a vendor that was chosen
-    /// and not found reports <see cref="Detected"/> false and no capability.
+    /// What this server's GPU is and what the vendor-specific parts of the chain can use, as the
+    /// plugin sees it. The encoder choice and the end of the chain read <see cref="Vendor"/> and
+    /// <see cref="Detected"/> (docs/architecture/GPU_VENDORS.md, PR 2); the rest is still reported
+    /// only. Every flag is about what was seen, not what the setting wishes: a vendor that was
+    /// chosen and not found reports <see cref="Detected"/> false and no capability, and then the
+    /// engine takes the NVIDIA path it always took.
     /// </summary>
     public sealed class GpuCapability
     {
@@ -105,7 +106,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>The render node of the chosen vendor, or null: an NVIDIA GPU without nvidia_drm has none.</summary>
         public string RenderNode { get; set; }
 
-        /// <summary>The encoder family the vendor's chain would end in: nvenc, vaapi (qsv is the alternative PR 2 measures), or software.</summary>
+        /// <summary>
+        /// The encoder family the vendor's chain ends in: nvenc, qsv (Intel; the chain hands the
+        /// encoder system-memory frames, which QSV accepts and VA-API does not), or software. The
+        /// detector reports qsv for Intel; the engine downgrades it to software on a server whose
+        /// ffmpeg lists no qsv encoder, because only the engine can ask ffmpeg.
+        /// </summary>
         public string EncoderFamily { get; set; } = "software";
 
         /// <summary>
@@ -313,16 +319,41 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public static readonly TimeSpan RetryAfter = TimeSpan.FromSeconds(60);
 
         private static readonly object _lock = new object();
+        private static IGpuEnvironment _environment;
 
-        private static readonly CachedProbe<Inventory> _probe = new CachedProbe<Inventory>(
-            () => Inventory.Gather(new SystemGpuEnvironment()),
-            inv => inv.AnySupportedGpu,
-            RetryAfter);
+        private static volatile CachedProbe<Inventory> _probe = NewProbe(null);
 
         private static Built _built;
 
+        private static CachedProbe<Inventory> NewProbe(IGpuEnvironment environment)
+            => new CachedProbe<Inventory>(
+                () => Inventory.Gather(environment ?? new SystemGpuEnvironment()),
+                inv => inv.AnySupportedGpu,
+                RetryAfter,
+                schedule: environment == null ? null : (Action<Action>)(work => work()));
+
         /// <summary>Begins the background probe. Called when the patches are applied, so the first session finds an answer.</summary>
         public static void Start() => _probe.Start();
+
+        /// <summary>
+        /// Points detection at another machine (a fake in the tests) and forgets what was probed.
+        /// A fake is probed on the calling thread so the next read already has its answer; null
+        /// goes back to the real machine and its background probe. Nothing in production calls this.
+        /// </summary>
+        public static void UseEnvironment(IGpuEnvironment environment)
+        {
+            lock (_lock)
+            {
+                _environment = environment;
+                _probe = NewProbe(environment);
+                _built = null;
+            }
+
+            if (environment != null)
+            {
+                _probe.Start();
+            }
+        }
 
         /// <summary>
         /// The full record for this server under the given setting: render-node paths, PCI ids, the
@@ -371,7 +402,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // Expires so an OpenVINO provider installed while running is seen without a restart.
                 GpuCapability cap = inv == null
                     ? Failed(setting, "GPU detection has not finished; reported as none")
-                    : Build(setting, neuralModelDirectory, inv, new SystemGpuEnvironment());
+                    : Build(setting, neuralModelDirectory, inv, _environment ?? new SystemGpuEnvironment());
                 var built = new Built
                 {
                     Inventory = inv,
@@ -495,7 +526,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 cap.Detected = intelSeen;
                 cap.RenderNode = intelNode?.RenderNode;
-                cap.EncoderFamily = "vaapi";
+                cap.EncoderFamily = "qsv";
                 cap.DecodeType = "vaapi";
                 cap.OpenVinoAvailable = intelSeen && OpenVinoProvider(neuralModelDirectory, env);
             }
