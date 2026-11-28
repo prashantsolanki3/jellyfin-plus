@@ -240,9 +240,9 @@ keeps the code path that existed before the setting did:
   level ran) says what the command **asked for** (whether ONNX Runtime loaded the provider is only in
   ffmpeg's log), `NeuralDeviceNote` says why it is the CPU on Intel, and both are flat on the session
   route and in the Recent sessions summary. The OpenVINO runtime is built in by
-  `scripts/build-ffmpeg.sh` with `ORT_EP=openvino` (NEURAL.md; the build needs no OptiX or other NVIDIA SDK,
-  but still installs FFmpeg's nvcodec headers and the CUDA hwmap patches until the Intel build of
-  GPU_VENDORS.md PR 8). Unmeasured on an Intel GPU.
+  `scripts/build-ffmpeg.sh` with `GPU_VENDOR=intel` (which defaults `ORT_EP=openvino`; NEURAL.md and
+  GPU_VENDORS.md section 5.7: no OptiX, no other NVIDIA SDK, no nvcodec headers, no CUDA patches). Unmeasured
+  on an Intel GPU; no Intel build has been run.
 - **Source-height routing, `NeuralMaxSourceHeight`** (dashboard, Neural and game upscalers; 0, the default,
   does nothing and every string and the probe stay as they were). Above 0, for the ONNX levels only
   (not `dlpp-*` or `vsr-rtcuda`): a source whose upright height is at or below it gets the neural level,
@@ -258,15 +258,16 @@ keeps the code path that existed before the setting did:
 
 **fsr2 without CUDA (PR 6).** `gu_inputs.h` builds with `-DGU_NO_NVOF` (no CUDA, no NVOFA: zero motion
 vectors, empty reactive mask, jitter still measured); the default build keeps the hard error when CUDA will not
-start and degrades only a failed NVOFA init. `ORT_EP=openvino WITH_FSR2=1 scripts/build-ffmpeg.sh` builds it
-(patch `ffmpeg/0016`) and leaves `<prefix>/fsr2-nocuda` (any other build removes it); with that file and a
-detected Intel GPU `GpuCapability.NoCudaGameAvailable` is true, and the probe offers `fsr2` (not `dlss`/`dlaa`)
-only once a one-frame fsr2 run of the patched ffmpeg has passed, started at plugin load and never on a request
-(`CachedProbe`: a pass is kept, a failure is retried every 5 minutes). Until then fsr2 is withheld with its own
-reason. `SessionRecord.GameMotionNote` says the vectors are zero. Without the file everything is as before.
-NVIDIA is unchanged. Not compiled or run on an Intel GPU; `scripts/test-gu-inputs.sh` is the compile-and-run
-check of the CUDA-free variant and of the default variant's CUDA call order and hard error against a fake CUDA
-(stub headers; not the real SDK headers or NVOFA), and it applies patches 0001, 0015 and 0016 in order.
+start and degrades only a failed NVOFA init. `GPU_VENDOR=intel WITH_FSR2=1 scripts/build-ffmpeg.sh` (or
+`ORT_EP=openvino WITH_FSR2=1`) builds it (patch `ffmpeg/0016`) and leaves `<prefix>/fsr2-nocuda` (any other build
+removes it); with that file and a detected Intel GPU `GpuCapability.NoCudaGameAvailable` is true, and the probe
+offers `fsr2` (not `dlss`/`dlaa`) only once a one-frame fsr2 run of the patched ffmpeg has passed, started at
+plugin load and never on a request (`CachedProbe`: a pass is kept, a failure is retried every 5 minutes). Until
+then fsr2 is withheld with its own reason. `SessionRecord.GameMotionNote` says the vectors are zero. Without the
+file everything is as before. NVIDIA is unchanged. Not compiled or run on an Intel GPU; `scripts/test-gu-inputs.sh`
+is the compile-and-run check of the CUDA-free variant and of the default variant's CUDA call order and hard error
+against a fake CUDA (stub headers; not the real SDK headers or NVOFA), and it applies patches 0001, 0015 and 0016 in
+order.
 
 **Intel hardware decode, `IntelHardwareDecode` (PR 7; dashboard checkbox, off by default).** Off, or on
 without a detected Intel GPU, the command line, the probe and the session JSON are those of the setting off
