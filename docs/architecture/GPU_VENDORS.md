@@ -929,6 +929,223 @@ applied is NOT VERIFIED; an end-to-end run on an Arc server settles it. The `lib
 against a stub `apt-cache`, and the `${arr[@]+...}` expansion only as a text check (no bash older than
 4.4 was available).
 
+### 5.8 The Intel image, and the 13-row end-to-end matrix
+
+The Intel Arc end-to-end series needs a container the cluster can run: `docker/intel/Dockerfile`
+(image) and `scripts/bench-intel.sh` (the matrix). Neither has run: no image was built and no Arc card
+was touched when this section was written.
+
+**Image.** Three stages, all `FROM` the image production runs, so `ldd` resolves against the Debian
+the binary will meet:
+
+- `base-pkgs`: the package list the base already has.
+- `build`: the unmodified `scripts/build-ffmpeg.sh` with `GPU_VENDOR=intel WITH_ORT=1 ORT_EP=openvino`
+  and `PREFIX=/usr/lib/jellyfin-ffmpeg-oidn` (no fsr2: it gets zero motion vectors without CUDA and loses
+  to bicubic on moving content, `docs/intel-patched-ffmpeg-libplacebo.md`, so there is no `fsr2-nocuda`
+  marker and the plugin withholds the level on Intel); `docker/intel/stage-plugin.sh` publishes the plugin and
+  patcher against the base's own Jellyfin assemblies; the web client is built and injected into
+  `/jellyfin/jellyfin-web`; `scripts/install-shaders.sh` fetches the shaders; the runtime package list
+  is derived (below).
+- final: the base plus those outputs. The stock `/usr/lib/jellyfin-ffmpeg` is untouched; the patched
+  binary sits beside it and `/usr/local/bin/jellyfin-ffmpeg-upscale` (the shim) routes per session.
+
+The root filesystem of the pod is read-only, so the runtime install steps become build-time ones: the
+web inject runs at build time, and `/etc/jellyfin-upscale.json` and `/var/log/jellyfin-upscale.log`
+are symlinks into `/var/cache/jellyfin`. The Deployment must mount emptyDirs at `/var/cache/jellyfin`
+and `/run/jellyfin-upscale` (the shim's slot directory). No initContainer is needed for the plugin: the
+image's ENTRYPOINT is `/usr/local/bin/jellyfin-plus-entrypoint` (`docker/intel/entrypoint.py`), which
+seeds `/usr/lib/jellyfin-plus-dist/JellyfinPlus_<ver>` into `$JELLYFIN_DATA_DIR/plugins/` and then execs
+`/jellyfin/jellyfin` with the original arguments. It is idempotent, an upgrade replaces only our files
+(Jellyfin's `meta.json` keys, other files in the plugin dir and `plugins/configurations/` are kept) and a
+seed failure never stops the server. The patcher and `0Harmony.dll` are read from `/usr/lib/jellyfin-plus`. `JELLYFIN_FFMPEG` defaults to the shim and the
+Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API and QSV driver.
+
+**Pins.**
+
+| What | Pinned to |
+|---|---|
+| Base image | `docker.io/jellyfin/jellyfin:12.4.20261026-211555@sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771` |
+| .NET 10 SDK | `10.0.404` tarball, checked against its published sha512 (`DOTNET_SDK_SHA512`) |
+| Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage; a library the build puts under `/usr/local` (shaderc, which has no package) is copied to `/usr/local/lib` and `ldconfig` runs before the acceptance check |
+| RUNPATH | the patched binary's first RUNPATH entry is `/usr/lib/jellyfin-ffmpeg/lib` (`STOCK_FFMPEG_LIB` in `build-ffmpeg.sh`, read back with `readelf -d`), and the acceptance requires `ldd` to resolve `libvulkan.so.1` and `libshaderc_shared.so.1` from there when the base ships them: the system loader and the `/usr/local` shaderc scored 4.73 dB against 25.70 dB (`docs/intel-patched-ffmpeg-libplacebo.md`) |
+
+**Drivers libvulkan and libva `dlopen`.** The derived package list is `ldd`-based, so it cannot see a
+driver the loader opens at run time. The first Arc bench (rows 2, 3, 4 and 9 failed: no Vulkan device
+for libplacebo, `Failed to initialise VAAPI connection`) had none. The final stage therefore installs
+`mesa-vulkan-drivers` (the `anv` ICD), `intel-media-va-driver-non-free` (iHD; the free build lacks the
+HuC-based Arc encode that row 10 needs) and `libigdgmm12` from Debian by name. The `non-free`
+component is enabled for that one RUN only: the source file is written, used and removed in it. The
+build then requires an Intel ICD JSON in `/usr/share/vulkan/icd.d` and no `not found` in `ldd` of the
+ICD's library and of `iHD_drv_video.so`. `vainfo` and `vulkaninfo` need a GPU, so they are not
+build checks: the Arc bench is the proof that the drivers open the device. Which of these was the
+cause of each failure is not established until that bench runs.
+
+**Acceptance, enforced by the build.** `ldd` of the patched ffmpeg shows no `not found`; `-filters`
+lists `oidn ort libplacebo xpsnr` and no `fsr2`; the `fsr2-nocuda` marker does not exist; `-hwaccels` lists `vaapi`;
+`-encoders` lists `h264_qsv`; the stock ffmpeg is byte-identical to the base's (`cmp`); the shim
+answers `-version` with an `ffmpeg version` line, the exact call Jellyfin makes at start-up (the shim
+is a `python3` script and the base has no python3, so the final stage installs it); the web
+inject, patcher and plugin files are in place; a last RUN (`docker/intel/accept-plugin.sh`) starts
+Jellyfin headless through the entrypoint against temp directories and requires `plugins/JellyfinPlus_*`
+to be seeded and the log to say `Loaded plugin: Jellyfin Plus`. A failed check fails the build.
+
+**Known gaps (not pinned).** The shared scripts fetch FFmpeg, OIDN, ONNX Runtime, shaderc and
+libplacebo sources, the unpinned shader files (`install-shaders.sh`: FSR, SSimSuperRes,
+KrigBilateral, ravu, CuNNy; the FSRCNNX, Anime4K and NIS files are pinned and hashed), apt packages
+and NuGet packages from mutable URLs without a hash; this image inherits that and does not edit those scripts. The in-image
+checks above are what stands in for a pin. FFmpeg 8.1.2's sha256 exists only in
+`scripts/test-vf-ort.sh`. Reusing it in `build-ffmpeg.sh` is a separate change. The binary links
+GPL components: it stays in the owner's registry and is never published.
+
+**The matrix.** `scripts/bench-intel.sh --dry-run` prints the plan with no GPU, ffmpeg or network;
+the plan test proves the plan, not the run. Every figure is the median of `BENCH_RUNS` (3) runs, and
+the thresholds are the starting points of the owner's decision, recorded alongside the measured
+value either way. A row that lacks an input (no API token, no clip, no ONNX model) is `SKIP` and is
+never `PASS`.
+
+| Row | What | Must pass |
+|---|---|---|
+| 1 | Vendor record | vendor=intel; render node (picked at run time: vendor 0x8086 in `/dev/dri`, else the only node); Vulkan `vk:0` (index; name match `vk:Intel` when several GPU nodes are visible); no NVIDIA-only level; fsr2 offered; no nvenc/cuda in any command |
+| 2 | FSRCNNX 360p to 1080p, software decode | fps >= 100; xpsnr >= bicubic + 0.5 dB (the detail also lists `alt_<path>` deltas and `best=`, see "Row 2, sources under 480p"; they never change the status) |
+| 3 | FSRCNNX 720p to 1080p | end-to-end fps >= 1.2x source; xpsnr >= bicubic + 0.3 dB |
+| 4 | FSRCNNX 1080p to 2160p | scaler-only fps >= 34; end-to-end with QSV >= 1.2x; xpsnr >= bicubic + 0.3 dB |
+| 5 | Neural (ORT on OpenVINO) | a 360p neural stream's session record says `openvino`, not CPU (`FAIL` otherwise); fps measured at 360p and 720p; slower than real time is a valid result (`MANUAL`) |
+| 6 | Routing by source height | `NeuralMaxSourceHeight=480` sends a 720p source to the shader path, and the record says why. The row sets it through the plugin configuration API (`/Plugins`, `/Plugins/{id}/Configuration`), checks the probe shows 480, streams `BENCH_NEURAL_LEVEL`, and puts the configuration back as found, on any exit |
+| 7 | fsr2 without CUDA, still pixels | after the first ceil(8*scale^2) frames (72 at 3x, 32 at 2x, 18 at 1.5x): mean consecutive-frame luma difference <= 0.5, per-frame max <= 16 in 99% of frames; FSRCNNX control exactly 0 |
+| 8 | fsr2 without CUDA, moving content | xpsnr on the panning cut >= bicubic (a miss is a result, not a blocker) |
+| 9 | Hardware decode off/on | on: `-hwaccel vaapi`, `hwmap=derive_device=vulkan`, no `Conversion failed!`, cpu time per frame >= 30% lower, xpsnr(on,off) >= 50 dB |
+| 10 | QSV encode | `h264_qsv`/`hevc_qsv` chosen; served segment codec matches; `/Gpu/Load` within 10 points of the fdinfo figure |
+| 11 | Contention with another hardware transcode on the same GPU | fps >= 36 while it runs (the caller asserts the other transcode with `BENCH_CONTENTION=1`; `BENCH_PLEX_TRANSCODING=1` is an alias) |
+| 12 | Client, headless | forced transcode at 480p, 720p, 1080p and 2160p: target height, a QSV codec, the expected filter in the log |
+| 13 | Client, human | always `MANUAL`: browser, hard reload, `window.__jellyfinPlus.installed===true`, 5 min at two levels plus one 2160p output, two seeks, no stall over 2 s |
+
+**Gates.** A real run refuses to start unless `BENCH_ASSERT_QUIET=1` (the bench cannot see other
+transcodes or heavy host jobs: the caller must), outside the blocked windows (none by default; set
+`BENCH_BLOCK_WINDOWS` to a comma list of `HHMM-HHMM`, start included and end not, and `BENCH_TZ` to
+the zone, `UTC` by default; an empty list means no window and a malformed non-empty value exits 2),
+and with memory PSI `some avg60` under 1%. The clock window and PSI are checked again before each of
+rows 2 to 11: a row that would start inside a window, or with PSI high, waits in 60 s steps (`bench: row N
+waiting: ...`) for up to `BENCH_BLOCK_WAIT_MAX_MIN` minutes (default 240), then is recorded `SKIP` and
+the run carries on. All such waits share `BENCH_BLOCK_WAIT_TOTAL_MAX_MIN` (default 480); once it is spent
+a row that would wait is `SKIP` "blocked window (wait budget spent)". Keep it under the run Job's
+`activeDeadlineSeconds` of 36000 s. `--no-gates` skips them only
+with `BENCH_CONFIRM_NO_GATES=1` as well. Rows 1 and 12 read only the shim-log lines appended during
+the run. The admin token reaches curl on stdin, never on a command line. A failed API call, or a
+stream that returns no segment, is a `FAIL` of that row, not a figure. Exit codes: 0, 1 if any row
+`FAIL`, 2 for a refusal.
+
+**What a score compares.** Every measured ffmpeg argv is appended to `$BENCH_OUT/run-<id>/commands.log`
+(`row N: argv`; `BENCH_TRACE=1` also echoes it as `trace:` on stderr), and `--dry-run` prints the same
+sequence for rows 2, 3, 4 and 8 at the master's own size: the `run_fps` run, the candidate and bicubic writes
+and the xpsnr calls. Before xpsnr runs, rows 2, 3, 4 and 8 write `r<row>-inputs.txt` (size, pix_fmt, range,
+start_time, frame count and first pts of the candidate, the bicubic and the master) and FAIL, with both
+numbers, when a scored file's size or frame count differs from the master's. xpsnr then pairs frame k with
+frame k (both inputs renumbered with `setpts=N`), not by pts, and an infinite score (an identical pair) is
+999 dB, not 0. Scores from before this change paired by pts and are not comparable (one run scored -27 dB
+where a hand run of the same chains scored -0.47 dB).
+
+**Row 2, sources under 480p.** A bench run scored FSRCNNX 360p to 1080p at -0.69 dB against
+bicubic (3.0x), while 720p to 1080p (1.5x) scored +0.80 dB and 1080p to 2160p (2x) +0.73 dB. Figures
+from the run's notes, not from a record in the repo. The 2x network meets a 3x target by scaling its output
+up again, and the engine has no guard for that high ratio: the `SrMinScaleFactor` bypass in
+`UpscaleEngine.cs` only covers the low end. Row 2 therefore scores, on the same 360p fixture, against
+the same bicubic control and master and by frame index (frame k against frame k), after the FSRCNNX
+verdict, whose `+0.5 dB` threshold is unchanged:
+
+| Path | Chain |
+|---|---|
+| `fsrcnnx` | the row's candidate: FSRCNNX straight to 1080p |
+| `bicubic` | the control itself, 0 dB by definition |
+| `ewa` | libplacebo `ewa_lanczos`, no shader |
+| `x2-bicubic` | FSRCNNX to 2x the source (720p), then `scale=...:flags=bicubic` to the master's size |
+| `lowtarget` | FSRCNNX to 1.5x the source (540p), then `scale=...:flags=bicubic` to the master's size |
+
+The detail reads `alt_ewa=<d>dB alt_x2-bicubic=<d>dB alt_lowtarget=<d>dB best=<path>`. `best` is the
+highest delta of all five, the simpler path on a tie. It ranks quality only, not fps: the detail
+prints `best=<path> (quality only, not fps)`, and the fps floor is judged on FSRCNNX alone. An alternative that fails to write, does not
+line up with the master (size or frame count) or has no score reads `alt_<path>=FAIL(<why>)` and is
+never the best. The alternatives never change the row's status and do not run when the FSRCNNX
+score itself failed. `--dry-run` lists their commands.
+
+Status: row 2 still FAILs on FSRCNNX until routing exists. The break-even source height is not
+measured: the fixtures are 360, 720, 1080 and 2160p, so two ratios (3.0x and 1.5x) bracket it, and
+`lowtarget` at 1.5x shows only whether a 2x network shrunk back down holds at this source. Routing
+sources under the break-even to the best path in the Intel upscaler selection, and a threshold set
+from the evidence, wait for an Arc run of row 2 (`jellyfin-plus-bench`, suspended): record the
+`alt_` figures below from `results.jsonl`, add a 480p or 540p fixture if `best` is not clear-cut,
+then add an Intel-only source-height guard beside the `SrMinScaleFactor` bypass.
+
+| Run | `fsrcnnx` | `ewa` | `x2-bicubic` | `lowtarget` | `best` |
+|---|---|---|---|---|---|
+| first run | -0.69 dB | not measured | not measured | not measured | not measured |
+
+**The low-res route (settings, Intel only).** The `lowtarget` path is now an engine route, set on the
+dashboard (Intel settings beside "Super-resolution minimum ratio"):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `IntelLowResMaxSourceHeight` | 480 | a source shorter than this takes the route; 0 turns it off |
+| `IntelLowResIntermediateScale` | 1.5 | the multiple of the source the network runs to; 1.0 to 2.0 on the page, clamped to that range when read |
+
+The route is set only when the GPU is a detected Intel one, the source is shorter than the max, the target
+upscale applies, the resolved SR level is `fsrcnnx`, `fsrcnnx-heavy` or `fsrcnnx-max` (after the
+`SrMinScaleFactor` bypass), no neural or game pass ran, and `round_even(source * scale)` is below the
+target height. Then libplacebo is built with `w=`/`h=` at `round_even(source * scale)` and the Intel tail
+adds `,scale=<W>:<H>:flags=bicubic,format=<yuv420p or the decode surface format>` after the download, the
+shape of `chain_shader_bicubic` in `scripts/bench-intel.sh`. The session record carries `LowResRoute`
+("low-res route: fsrcnnx to 1.5x then bicubic"), the summary repeats it and the flat session JSON gains the
+key; none of the three appears for a session that did not take the route, on any GPU. NVIDIA and no-GPU
+chains are byte-identical to before. A later bench run, not a record in this
+repo, scored this path at +1.08 dB over plain scaling at 360p; the `alt_lowtarget` figure above is still the
+measurement to record from an Arc run, and the live 1.5x behaviour of FSRCNNX's own 1.3x guard on a real
+Arc is not verified here.
+
+**Inputs the owner supplies.** The lossless clips (`<title>_{360,720,1080,2160}p.mkv`, `still_720p.png`,
+`pan_720p.mkv`, `pan_1080p.mkv`), an admin API token for the test Jellyfin, and an ONNX model for
+row 5. No library content is committed (AGENTS.md invariant 18).
+
+**Test.** `python3 scripts/test_bench_intel.py` checks the plan goldens (13 rows, must-pass lines,
+thresholds, command shapes), the refusals, a hermetic stub run, a run against a fake Jellyfin
+(a stub curl serving JSON by path) for the API rows, mutants of the script, and the Dockerfile's pins
+and checks (including this section's digest). It needs no GPU, network or docker. The Jellyfin
+plugin-configuration calls of row 6 are checked against the fake only, not a live server.
+
+**Not verified.** An image build; any run on an Arc card (so the real execution of every row,
+the jq parsing of the plugin's API, the stream URL parameters and the fsr2 filter options are
+untested); the entrypoint wrapper and the headless plugin acceptance inside a real build (the wrapper
+is unit-tested by `scripts/test_entrypoint.py`; that the base's ENTRYPOINT is `/jellyfin/jellyfin` with no
+arguments is matched to upstream, not to the pinned digest) and the symlinks; the base image's layout
+(`/jellyfin`, `/jellyfin/jellyfin-web`); the derived runtime package names. The OpenCL compute runtime that
+OpenVINO's GPU device needs is not installed by the image and whether the base carries it is unchecked:
+row 5's detail carries the fallback reason (below).
+
+### 5.9 Why row 5 reads `device=none` (diagnosis only, no fix)
+
+Checked in this order against the repository and the live test pod (image
+`jellyfin-plus-intel:9e306b8`). No shell in the pod was available, so the in-pod answers are the ones row 5 now
+prints; the rest is read from files and the Deployment.
+
+| # | Question | Answer | Evidence |
+|---|---|---|---|
+| 1 | Is the OpenVINO EP in the ORT build? | Yes, by construction: the pinned `onnxruntime_openvino` 1.24.1 wheel carries it and the build stages and checks it. Not executed in the image. | `scripts/build-ffmpeg.sh:271-277` (wheel pin), `:679-680` (stages `libonnxruntime_providers_openvino.so`, `libopenvino_intel_gpu_plugin.so`), `:1056-1064` (build dies without `device=openvino` or the provider); `ffmpeg/vf_ort.c:244` calls `SessionOptionsAppendExecutionProvider_OpenVINO_V2` |
+| 2 | Are the GPU plugin and the OpenCL / Level Zero runtime in the image? | The GPU plugin yes. **No OpenCL ICD loader or compute runtime, no Level Zero loader**: nothing installs `ocl-icd-libopencl1`, `intel-opencl-icd` or `libze*` (`grep -ri 'intel-opencl-icd\|ocl-icd\|libOpenCL' docker/` finds nothing), and the ldd-derived list cannot see them because it skips the ORT libraries under the ffmpeg prefix and the plugin loads `libOpenCL.so.1` itself. Whether the Jellyfin base carries them is unchecked. | `docker/intel/Dockerfile:85-91` (the `continue` for `$P/*`), `:133-135` and `:140-145` (the only installs), `scripts/build-ffmpeg.sh:63-64` and `:1065` (say the OpenCL stack is the host's job); this file at the OpenCL bullet near line 669 and `docs/filters/NEURAL.md:272` (the plugin needs it) |
+| 3 | Which device does the session ask for? | `device=openvino` on the node, which the provider gets as `device_type=GPU` (`GPU.n` only when `device_id>0`, and the chain passes none). **But a stream never reaches that: on Intel the ONNX levels are withheld while the `IntelNeuralAllowed` setting is false (its default)**, the level becomes `off`, `NeuralApplied` is false and `NeuralDevice` stays null, which row 5 printed as `device=none`. `none` is a session that never ran ORT, not an ORT fallback (that reads `cpu`). | `src/patcher/Transcoding/UpscaleEngine.cs` `IntelWithholdReason` (withheld unless `Settings.IntelNeuralAllowed`), `:1553` (`Withhold` sets the level `off`), `:1640-1644` (`NeuralDevice` only when applied), `:693`; `ffmpeg/vf_ort.c:240-244`; `scripts/bench-intel.sh` `chain_ort` |
+| 4 | Can the process open `/dev/dri/renderD129`? | Unknown here. The pod runs as a non-root user with one supplemental group and one Intel GPU resource; the host has `renderD128` and `renderD129`. Whether that group owns the node the plugin handed out is not checked. | the test deployment (`kubectl get deployment`) and a host probe of `/dev/dri/by-path` (`card0 card1 card2 renderD128 renderD129`) |
+
+Row 5 now ends with the evidence instead of the fps alone, in the result detail and in `$BENCH_OUT/run-<id>/`:
+
+- `ffmpeg_ort_360p=` / `ffmpeg_ort_720p=`: `CPU_FALLBACK[...]` with the filter's own `OpenVINO execution provider unavailable (...), using CPU`
+  (or `OpenVINO session could not be created (...)`) when ORT fell back or the filter's `device=cpu` line shows it ran on the CPU,
+  `no_ort_line_in_log` when it printed neither, else the matched lines (`using CPU` lines are read first). The full stderr of each chain is `row5-<h>p.ffmpeg.log`. `vf_ort.c` now logs its `device=` line at INFO, so
+  an image built from this change shows the device it really ran on without `-v verbose`.
+- `ort_env:` `ep_libs_missing`, `gpu_plugin_unresolved` (`ldd` of `libopenvino_intel_gpu_plugin.so`), `opencl_icd`, `libOpenCL`
+  (from that same `ldd`; `UNKNOWN` when the plugin or `ldd` is absent), `level_zero_loader` (`/sbin/ldconfig` or
+  `/usr/sbin/ldconfig`; `UNKNOWN(no ldconfig)` when neither exists), `render_node`/`open` (the process opens the node read-write; `FAIL(Permission denied)` is the group),
+  `node_gid` and `process_gids`.
+- when `device` is not `openvino`: `session_neural_requested`, `session_withheld`, `session_routing`, `session_summary`.
+
+Row 6 prints `neural_requested` and `session_withheld` when it fails. The fix is a separate task.
+
 ## 6. A380 measurements
 
 Reported by the owner from runs on an Intel Arc A380. **The method (source clips, frame counts,
