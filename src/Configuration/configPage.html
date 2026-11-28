@@ -93,6 +93,20 @@
                     </div>
 
                     <div class="inputContainer">
+                        <input is="emby-input" type="number" id="IntelLowResMaxSourceHeight" data-config="IntelLowResMaxSourceHeight" data-kind="int" data-default="480" label="Intel low-res route: sources shorter than (px, 0 = off)" min="0" max="4320" required />
+                        <div class="fieldDescription">
+                        Intel GPU only; no other server is affected. A source shorter than this, upscaled with an FSRCNNX level, runs the network to a small intermediate size and finishes with a bicubic scale to the target, instead of handing the fixed-2x network's output to libplacebo to shrink. Measured +1.08 dB over plain scaling at 360p on an Arc A380. 0 turns the route off. Default 480.
+                    </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <input is="emby-input" type="number" id="IntelLowResIntermediateScale" data-config="IntelLowResIntermediateScale" data-kind="float" data-default="1.5" label="Intel low-res route: intermediate scale" step="0.05" min="1" max="2" required />
+                        <div class="fieldDescription">
+                        The size the network runs to, as a multiple of the source height (rounded to an even number of pixels). Between 1.0 and 2.0; the route is skipped when the intermediate size would not be below the target. Default 1.5.
+                    </div>
+                    </div>
+
+                    <div class="inputContainer">
                         <input is="emby-input" type="number" id="MaxSourceHeight" data-config="MaxSourceHeight" data-kind="int" data-default="1440" label="Maximum source height (px)" min="240" max="4320" required />
                         <div class="fieldDescription">
                         Sources taller than this are not upscaled (other enhancements still apply). Portrait video is judged on its long edge instead. Default 1440.
@@ -296,7 +310,7 @@
                             <div class="jpBody">
                         <div class="checkboxContainer checkboxContainer-withDescription">
                             <label class="emby-checkbox-label">
-                                <input is="emby-checkbox" type="checkbox" id="NeuralAllowed" data-config="NeuralAllowed" data-gates="NeuralLevel NeuralMaxSourceHeight" data-kind="bool" data-default="true" />
+                                <input is="emby-checkbox" type="checkbox" id="NeuralAllowed" data-config="NeuralAllowed" data-gates="NeuralLevel NeuralMaxSourceHeight IntelNeuralAllowed" data-kind="bool" data-default="true" />
                                 <span>Allow neural super-resolution</span>
                             </label>
                             <div class="fieldDescription checkboxFieldDescription">
@@ -320,6 +334,16 @@
                             <input is="emby-input" type="number" id="NeuralMaxSourceHeight" data-config="NeuralMaxSourceHeight" data-kind="int" data-default="0" label="Neural only for sources up to (px, 0 = off)" min="0" max="4320" required />
                             <div class="fieldDescription">
                             Use the Real-ESRGAN levels only for small sources. 0, the default, changes nothing. Above 0, a source at or below this height gets the neural level: the session's, or the default above, or, when neither names one, the cheapest installed weight (on an Intel server only when the OpenVINO provider is installed and the patched ffmpeg's ort filter lists the openvino device, never on the CPU by choice). A source taller than this does not run a neural level and takes the shader path instead, and Recent sessions says so. Applies to the Real-ESRGAN levels, not to the RTX ones, and on every GPU vendor, NVIDIA included. When the server picks the level itself, Recent sessions still shows the requested level as off although a network ran; the routing note on that session says why. 480 is the recommended value on an Intel GPU, and it is not measured: at 480p only the x2 weight can be near real time even on the NVIDIA card these were timed on, and nothing has been timed on an Intel GPU (docs/architecture/GPU_VENDORS.md, 5.4). Start with realesr-anime-x2 as the default above, and watch the GPU before raising it.
+                        </div>
+                        </div>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label class="emby-checkbox-label">
+                                <input is="emby-checkbox" type="checkbox" id="IntelNeuralAllowed" data-config="IntelNeuralAllowed" data-kind="bool" data-default="false" />
+                                <span>Allow the Real-ESRGAN levels on an Intel GPU</span>
+                            </label>
+                            <div class="fieldDescription checkboxFieldDescription">
+                            Intel GPU only; no other server is affected. Off by default: the networks run through OpenVINO and measured about 1.4 fps at 360p and 0.5 fps at 720p on an Arc A380, so playback will stutter. While off they are withheld and the session says so. On, they are offered once the OpenVINO provider, the weights and the patched ffmpeg's openvino device are present. Needs the master switch above.
                         </div>
                         </div>
 

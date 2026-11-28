@@ -266,6 +266,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public string HardwareDecodeReason { get; set; }
 
         /// <summary>
+        /// "low-res route: fsrcnnx to 1.5x then bicubic" when the Intel low-res route built this
+        /// session's chain. Null otherwise, so no other server's session record gains a key.
+        /// </summary>
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        public string LowResRoute { get; set; }
+
+        /// <summary>
         /// The levels asked for and not run because their speed is not measured on Intel (the ONNX
         /// neural levels), for example "neural realesr-anime-x2". Null when none, and off Intel.
         /// </summary>
@@ -514,6 +521,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
             public string GpuWithheldUnmeasured { get; set; }
 
             /// <summary>
+            /// The Intel low-res route's intermediate size (FSRCNNX runs to this, a bicubic scale takes it to
+            /// Width x Height). Zero when the route is not in use, which leaves every other chain as it was.
+            /// </summary>
+            public int LowResMidWidth { get; set; }
+
+            public int LowResMidHeight { get; set; }
+
+            /// <summary>The text the session record and summary carry when the route ran. Null otherwise.</summary>
+            public string LowResRoute { get; set; }
+
+            /// <summary>
             /// The device arguments this plan was decided with, so the command and the record read one
             /// answer even if the render-node test finishes in between. Null until the plan acts.
             /// </summary>
@@ -723,6 +741,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 GpuWithheld = plan.Act ? plan.GpuWithheld : null,
                 HardwareDecode = plan.Act && plan.HardwareDecodeReason != null ? plan.HardwareDecode : (bool?)null,
                 HardwareDecodeReason = plan.Act ? plan.HardwareDecodeReason : null,
+                LowResRoute = plan.Act ? plan.LowResRoute : null,
                 GpuWithheldUnmeasured = plan.Act ? plan.GpuWithheldUnmeasured : null,
                 Status = status,
                 Reason = reason,
@@ -1049,6 +1068,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
             if (!string.IsNullOrEmpty(r.HardwareDecodeReason))
             {
                 parts.Add(r.HardwareDecodeReason);
+            }
+
+            // Only present when the Intel low-res route ran, so every other summary is unchanged.
+            if (!string.IsNullOrEmpty(r.LowResRoute))
+            {
+                parts.Add(r.LowResRoute);
             }
 
             if (r.UpscaleApplied)
@@ -1818,6 +1843,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     return Plan.No("not-requested", "requested shaders unavailable" + WithheldNote(plan));
                 }
 
+                DecideLowResRoute(plan, cfg, sw, sh, onIntel);
+
                 plan.Devices = planDevices;
                 DecideHardwareDecode(plan, cfg, vs, onIntel);
 
@@ -1829,6 +1856,52 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 return Plan.No("ineligible", "error: " + ex.Message);
             }
+        }
+
+        /// <summary>The route's intermediate scale, clamped to 1.0 to 2.0 because the settings API accepts anything.</summary>
+        internal static double LowResScale(UpscaleSettings cfg)
+        {
+            double scale = cfg?.IntelLowResIntermediateScale ?? 1.5;
+            return double.IsNaN(scale) ? 1.5 : Math.Max(1.0, Math.Min(2.0, scale));
+        }
+
+        private static int RoundEven(double value) => (int)Math.Round(value / 2.0, MidpointRounding.AwayFromZero) * 2;
+
+        /// <summary>
+        /// Intel only. A short source (below IntelLowResMaxSourceHeight) with an FSRCNNX level runs the
+        /// network to round_even(source * scale) and a bicubic scale finishes the job, because the
+        /// network's fixed 2x output shrunk to a far larger target by libplacebo measured worse than
+        /// this (measured +1.08 dB at 360p). Sets nothing, and so changes no chain, when the GPU is not
+        /// a detected Intel one, a neural or game pass ran (fsr2 and dlss hand libplacebo a target-size
+        /// frame), the SR level is not an FSRCNNX one or the intermediate size would not be below the target.
+        /// </summary>
+        private static void DecideLowResRoute(Plan plan, UpscaleSettings cfg, int sw, int sh, bool onIntel)
+        {
+            if (!onIntel || cfg == null || cfg.IntelLowResMaxSourceHeight <= 0 || sh >= cfg.IntelLowResMaxSourceHeight
+                || !plan.UpscaleApplied || plan.NeuralApplied || plan.GameApplied)
+            {
+                return;
+            }
+
+            string sr = plan.SrLevel ?? "off";
+            if (!string.Equals(sr, "fsrcnnx", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(sr, "fsrcnnx-heavy", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(sr, "fsrcnnx-max", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            double scale = LowResScale(cfg);
+            int midHeight = RoundEven(sh * scale);
+            int midWidth = RoundEven(sw * scale);
+            if (midWidth <= 0 || midHeight <= 0 || midHeight >= plan.Height)
+            {
+                return;
+            }
+
+            plan.LowResMidWidth = midWidth;
+            plan.LowResMidHeight = midHeight;
+            plan.LowResRoute = "low-res route: fsrcnnx to " + scale.ToString("0.##", CultureInfo.InvariantCulture) + "x then bicubic";
         }
 
         /// <summary>
@@ -3128,16 +3201,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
         }
 
         /// <summary>
-        /// Whether the ONNX levels' OpenVINO path has been MEASURED on a real Intel GPU. False: they stay
-        /// withheld on Intel as <see cref="NotMeasuredOnIntel"/> even though PR 5's path is present. A
-        /// measured bench result on an Arc will lift this (set it true, or delete it with the clause below).
-        /// The tests flip it to exercise the path.
-        /// </summary>
-        internal static bool IntelOnnxMeasured = false;
-
-        /// <summary>
         /// The reason a level is not run on a detected Intel GPU ("needs NVIDIA", or for fsr2 on a build made for
-        /// Intel, its start-up check; "not measured on Intel" for the ONNX levels), or null when it is.
+        /// Intel, its start-up check; "not measured on Intel" for the ONNX levels), or null when it is. The ONNX
+        /// levels stay withheld until the admin sets IntelNeuralAllowed (off by default): the bench measured
+        /// about 1.4 fps at 360p and 0.5 fps at 720p on an A380, even though PR 5's OpenVINO path is present.
         /// </summary>
         internal static string IntelWithholdReason(string axis, string level)
         {
@@ -3146,7 +3213,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return WithheldReason(axis, level);
             }
 
-            return axis == "Neural" && !IntelOnnxMeasured && ShaderLibrary.IsOnnxNeural(level) ? NotMeasuredOnIntel : null;
+            return axis == "Neural" && Settings?.IntelNeuralAllowed != true && ShaderLibrary.IsOnnxNeural(level) ? NotMeasuredOnIntel : null;
         }
 
         /// <summary>
@@ -4943,7 +5010,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 }
 
                 AppendLibplaceboSegment(hw, plan, cfg);
-                hw.Append(",hwdownload,format=").Append(plan.HardwareDecodeFormat ?? throw new InvalidOperationException("hardware decode without a surface format"));
+                string hwFormat = plan.HardwareDecodeFormat ?? throw new InvalidOperationException("hardware decode without a surface format");
+                hw.Append(",hwdownload,format=").Append(hwFormat);
+                AppendLowResScale(hw, plan, hwFormat);
                 return hw.ToString();
             }
 
@@ -5028,6 +5097,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             if (IsIntelPath())
             {
                 sb.Append(":format=yuv420p,hwdownload,format=yuv420p");
+                AppendLowResScale(sb, plan, "yuv420p");
                 return sb.ToString();
             }
 
@@ -5039,6 +5109,20 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ? ",hwmap=derive_device=cuda"
                 : ",hwdownload,format=yuv420p");
             return sb.ToString();
+        }
+
+        /// <summary>The low-res route's last node: a CPU bicubic scale from the intermediate size to the target. Nothing when the route is not in use.</summary>
+        private static void AppendLowResScale(StringBuilder sb, Plan plan, string format)
+        {
+            if (plan.LowResMidHeight > 0)
+            {
+                sb.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    ",scale={0}:{1}:flags=bicubic,format={2}",
+                    plan.Width,
+                    plan.Height,
+                    format);
+            }
         }
 
         /// <summary>
@@ -5060,11 +5144,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
             // keepInputSize: a neural session lets dlpp_rtcuda and vsr_rtcuda own the resize, so
             // libplacebo only runs its shaders at the size it is handed. Giving it the final target
             // as well upscaled the picture first, then dlpp doubled that, then vsr shrank it back.
+            //
+            // The Intel low-res route stops at its intermediate size; the tail's bicubic scale does the rest.
+            bool lowRes = !keepInputSize && plan.LowResMidHeight > 0;
             sb.AppendFormat(
                 CultureInfo.InvariantCulture,
                 ",libplacebo=w={0}:h={1}:upscaler={2}",
-                keepInputSize ? "iw" : plan.Width.ToString(CultureInfo.InvariantCulture),
-                keepInputSize ? "ih" : plan.Height.ToString(CultureInfo.InvariantCulture),
+                keepInputSize ? "iw" : (lowRes ? plan.LowResMidWidth : plan.Width).ToString(CultureInfo.InvariantCulture),
+                keepInputSize ? "ih" : (lowRes ? plan.LowResMidHeight : plan.Height).ToString(CultureInfo.InvariantCulture),
                 string.IsNullOrWhiteSpace(plan.Upscaler) ? "ewa_lanczos" : plan.Upscaler);
 
             // Debanding. grain=0 is not a detail: libplacebo defaults it to 6, which dithers

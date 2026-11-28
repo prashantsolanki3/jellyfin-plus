@@ -516,11 +516,13 @@ and status are unchanged, and the dashboard's GPU line prints each as `Axis leve
 
 The ONNX neural levels (`realesr-anime-x2`, `realesr-anime-x4`, `realesr-general-x4`) are withheld on
 Intel as well, but with a different reason, "not measured on Intel" (`GpuWithheldUnmeasured`): they do not
-need CUDA, and PR 5 gives them an OpenVINO device, but nobody has measured that path on a real Arc. The
-maintainer's condition is that they stay withheld until it is in place **and measured**, so PR 5's path is
-present and unreachable on Intel until `UpscaleEngine.IntelOnnxMeasured` is set (a measured bench result
-lifts it; the tests set it to exercise the path). The Intel `Neural` list is `off`, and the session
-summary names the reason per group.
+need CUDA, and PR 5 gives them an OpenVINO device, but on an A380 the bench measured about 1.4 fps at 360p
+and 0.5 fps at 720p, so playback stutters. They stay withheld until the admin sets `IntelNeuralAllowed`
+(dashboard checkbox, default off, gated by the neural master switch; it replaces the hardcoded
+`UpscaleEngine.IntelOnnxMeasured`). Off, nothing changes: the same reason, `GpuWithheldUnmeasured` and
+`Withheld` list. On, PR 5's path is offered once the OpenVINO provider, the weights and the ffmpeg's
+openvino device are present. The Intel `Neural` list is `off` while it is off, and the session summary
+names the reason per group.
 
 **Recommended in documentation only: `MaxConcurrent` 1 for 4K output on a small Intel GPU.** The one
 measurement there is (section 6) is a single session, 1080p to 2160p at 38 to 40 fps on an A380.
