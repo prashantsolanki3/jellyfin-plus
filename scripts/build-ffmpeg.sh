@@ -481,7 +481,7 @@ if [[ "$GPU_VENDOR" == "intel" ]]; then
     # bench-intel.sh row 7 decodes still_720p.png with this binary.
     HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-libdrm --enable-zlib)
     # The patched binary must load jellyfin-ffmpeg's bundled libvulkan/shaderc, not the system loader and the
-    # /usr/local shaderc it links: same binary, same chain, 4.73 dB against 25.70 dB (rev-hxlit).
+    # /usr/local shaderc it links: same binary, same chain, 4.73 dB against 25.70 dB.
     STOCK_FFMPEG_LIB="${STOCK_FFMPEG_LIB:-/usr/lib/jellyfin-ffmpeg/lib}"
 else
     VENDOR_PATCHES=(

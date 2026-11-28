@@ -356,7 +356,7 @@ def suite_wiring(s, scripts):
             and re.search(r'(-hwaccels|-encoders)[^\n]*\|\s*grep', b) is None)
 
     # The patched binary must load jellyfin-ffmpeg's bundled libvulkan/shaderc, not the system loader and the
-    # /usr/local shaderc (rev-hxlit: 4.73 dB against 25.70 dB on the same binary). Each LDFLAGS export prepends,
+    # /usr/local shaderc (4.73 dB against 25.70 dB on the same binary). Each LDFLAGS export prepends,
     # so the rpath is first in RUNPATH only if it is the last export before ./configure.
     rp = 'export LDFLAGS="-Wl,-rpath,$STOCK_FFMPEG_LIB ${LDFLAGS:-}"'
     cfg = b.find('say "configure"')

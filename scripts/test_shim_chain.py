@@ -5,7 +5,7 @@
 
 On Intel (the render node's sysfs vendor is 0x8086) libplacebo names yuv420p as its output and the
 frame is downloaded as is: the RGBA download tail that ANV's earlier green YUV output called for lost
-~18 dB of luma XPSNR (rev-8j46u). Every other case (no render node, an invalid one, NVIDIA, unreadable sysfs) keeps the chain string it had
+~18 dB of luma XPSNR. Every other case (no render node, an invalid one, NVIDIA, unreadable sysfs) keeps the chain string it had
 before, byte for byte. Exit status 0 when every check passed.
 """
 import importlib.machinery
@@ -105,7 +105,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("Intel with shaders: still libplacebo with the shader", ":custom_shader_path=" in intel_shader, intel_shader)
     check("Intel with shaders: ends in the named yuv420p output, the download and yuv420p",
           intel_shader.endswith(INTEL_TAIL), intel_shader)
-    # The RGBA download tail lost ~18 dB of luma XPSNR on the same input even with no shader (rev-8j46u).
+    # The RGBA download tail lost ~18 dB of luma XPSNR on the same input even with no shader.
     check("Intel: no rgba anywhere, plain or with shaders",
           "rgba" not in intel_shader and "rgba" not in chain(cfg_for("/dev/dri/renderD128"))
           and "out_color_matrix" not in intel_shader, intel_shader)

@@ -136,7 +136,7 @@ RUN set -eu; \
     rm -rf /var/lib/apt/lists/*
 
 # The Level Zero loader (libze1, Debian trixie main) and the Level Zero GPU driver deb the OpenVINO GPU plugin
-# loads through it, at the version of the base's intel-opencl-icd. Bench run22 printed level_zero_loader=MISSING.
+# loads through it, at the version of the base's intel-opencl-icd. An earlier image printed level_zero_loader=MISSING.
 # apt resolves the deb's Depends (the base already carries libigdgmm12 and the IGC).
 COPY --from=build /out/libze-intel-gpu1.deb /tmp/libze-intel-gpu1.deb
 RUN set -eu; \
@@ -215,7 +215,7 @@ RUN --mount=type=bind,from=base-pkgs,source=/usr/lib/jellyfin-ffmpeg/ffmpeg,targ
         [ -e "$S/$so" ] || continue; \
         got=$(ldd "$F" | awk -v n="$so" '$1 == n { print $3 }'); \
         [ -n "$got" ] || continue; \
-        [ "$(dirname "$got")" = "$S" ] || { echo "$F loads $so from $got, not $S (rev-hxlit)" >&2; exit 1; }; \
+        [ "$(dirname "$got")" = "$S" ] || { echo "$F loads $so from $got, not $S" >&2; exit 1; }; \
     done; \
     filters=$("$F" -hide_banner -filters); \
     for f in $(ffmpeg_required_filters intel) libplacebo xpsnr; do \

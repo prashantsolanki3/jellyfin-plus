@@ -3,7 +3,7 @@
 
     python3 -I scripts/test_intel_level_zero.py
 
-Bench run22 printed level_zero_loader=MISSING on the Arc image. Needs no docker, GPU or network: it reads
+An earlier bench run printed level_zero_loader=MISSING on the Arc image. Needs no docker, GPU or network: it reads
 the Dockerfile text and proves each rule with a mutant that must be caught. It does not build the image
 and does not run OpenVINO's GPU device query (that needs the Arc card). Exit status: 0 every check
 passed, 1 a check failed.
