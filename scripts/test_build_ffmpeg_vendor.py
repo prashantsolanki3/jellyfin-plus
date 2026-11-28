@@ -42,6 +42,7 @@ BASH = shutil.which("bash")
 
 BASE_APT = ("build-essential git curl ca-certificates pkg-config nasm yasm meson ninja-build cmake "
             "python3 libx264-dev libxcb1-dev libvulkan-dev glslang-tools")
+STOCK_LIB = "/usr/lib/jellyfin-ffmpeg/lib"
 NV_HWACCEL = "--enable-ffnvcodec --enable-cuda --enable-cuvid --enable-nvdec --enable-nvenc"
 
 GOLDEN_NVIDIA = [
@@ -63,13 +64,14 @@ GOLDEN_NVIDIA_OPENVINO = [
 GOLDEN_INTEL = [
     "plan: vendor: intel",
     "plan: build: oidn=1 optix=0 ort=1 ort_ep=openvino fsr2=0 dlss=0 maxine_vsr=0 rtxdlpp=0 rtxvsr=0 crashlog=1",
-    "plan: apt: " + BASE_APT + " libva-dev libvpl-dev libdrm-dev",
+    "plan: apt: " + BASE_APT + " libva-dev libvpl-dev libdrm-dev zlib1g-dev",
     "plan: nv-codec-headers: no",
     "plan: patches: 0008 0009",
-    "plan: hwaccel: --enable-vaapi --enable-libvpl --enable-libdrm",
+    "plan: hwaccel: --enable-vaapi --enable-libvpl --enable-libdrm --enable-zlib",
     "plan: cuda-llvm: none",
     "plan: required filters: oidn ort",
     "plan: bridge test default: 0",
+    "plan: rpath: first " + STOCK_LIB,
 ]
 
 
@@ -353,6 +355,28 @@ def suite_wiring(s, scripts):
             'hwaccels_out=$(' in b and 'encoders_out=$(' in b
             and re.search(r'(-hwaccels|-encoders)[^\n]*\|\s*grep', b) is None)
 
+    # The patched binary must load jellyfin-ffmpeg's bundled libvulkan/shaderc, not the system loader and the
+    # /usr/local shaderc (4.73 dB against 25.70 dB on the same binary). Each LDFLAGS export prepends,
+    # so the rpath is first in RUNPATH only if it is the last export before ./configure.
+    rp = 'export LDFLAGS="-Wl,-rpath,$STOCK_FFMPEG_LIB ${LDFLAGS:-}"'
+    cfg = b.find('say "configure"')
+    last_other = b.rfind('export LDFLAGS="', 0, cfg if cfg != -1 else len(b))
+    rp_at = b.find(rp)
+    s.check("the stock-lib rpath is exported once, after every other LDFLAGS export and before configure",
+            b.count(rp) == 1 and cfg != -1 and rp_at == last_other and rp_at < cfg,
+            "rpath %d, last LDFLAGS export %d, configure %d" % (rp_at, last_other, cfg))
+    s.check("the stock-lib rpath is Intel-only and its directory is named once",
+            b.count('STOCK_FFMPEG_LIB="${STOCK_FFMPEG_LIB:-%s}"' % STOCK_LIB) == 1 and b.count(STOCK_LIB) == 1
+            and re.search(r'if \[\[ "\$GPU_VENDOR" == "intel" \]\]; then\n(?:(?!\nelse\n|\nfi\n).)*?STOCK_FFMPEG_LIB="\$\{', b, re.S)
+            and re.search(r'\nelse\n(?:(?!\nfi\n).)*?STOCK_FFMPEG_LIB=""\n', b, re.S)
+            and re.search(r'if \[\[ -n "\$STOCK_FFMPEG_LIB" \]\]; then\n\s+export LDFLAGS=', b) is not None)
+    # The verify reads the built binary's own dynamic section: a flag that never reached the link is silent otherwise.
+    s.check("the verify reads the binary's RUNPATH or RPATH, captured before grepping, and dies when it is not first",
+            'dyn_out=$(readelf -d "$PREFIX/ffmpeg"' in b
+            and re.search(r'\(RUNPATH\|RPATH\)', b) is not None
+            and 'die "the built ffmpeg\'s first RUNPATH entry is not $STOCK_FFMPEG_LIB' in b
+            and re.search(r'readelf[^\n]*\|\s*grep', b) is None)
+
     # The fsr2 plan line and the real run share one patch name, one flag and one marker path.
     s.check("the no-CUDA fsr2 patch name is spelled once, in a variable",
             b.count("0016-add-fsr2-filter-to-build-standalone.patch") == 1
@@ -606,7 +630,16 @@ MUTANTS = [
     ("the default vendor becomes intel", "build-ffmpeg.sh",
      'GPU_VENDOR="${GPU_VENDOR:-nvidia}"', 'GPU_VENDOR="${GPU_VENDOR:-intel}"'),
     ("intel loses --enable-libdrm", "build-ffmpeg.sh",
-     "HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-libdrm)", "HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl)"),
+     "HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-libdrm --enable-zlib)",
+     "HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-zlib)"),
+    ("the stock-lib rpath is dropped from the link", "build-ffmpeg.sh",
+     'export LDFLAGS="-Wl,-rpath,$STOCK_FFMPEG_LIB ${LDFLAGS:-}"', ':'),
+    ("the stock-lib rpath is appended, so it is last in RUNPATH", "build-ffmpeg.sh",
+     'export LDFLAGS="-Wl,-rpath,$STOCK_FFMPEG_LIB ${LDFLAGS:-}"', 'export LDFLAGS="${LDFLAGS:-} -Wl,-rpath,$STOCK_FFMPEG_LIB"'),
+    ("the RUNPATH verify no longer dies", "build-ffmpeg.sh",
+     '|| die "the built ffmpeg\'s first RUNPATH entry', '|| echo "the built ffmpeg\'s first RUNPATH entry'),
+    ("nvidia gets the stock-lib rpath", "build-ffmpeg.sh",
+     '    STOCK_FFMPEG_LIB=""\n', '    STOCK_FFMPEG_LIB="/usr/lib/jellyfin-ffmpeg/lib"\n'),
     ("NVIDIA loses --enable-cuvid", "build-ffmpeg.sh", "--enable-cuda --enable-cuvid ", "--enable-cuda "),
     ("proxmox-build.sh ignores the vendor's filter set", "proxmox-build.sh",
      'required_filters="$(ffmpeg_required_filters "$GPU_VENDOR")"', 'required_filters="oidn optix ort fsr2 dlss"'),

@@ -276,7 +276,9 @@ ORT_OPENVINO_SHA256="d617fac2f59a6ab5ea59a788c3e1592240a129642519aaeaa774761dfe3
 ORT_C_API_SHA256="7f03541b0233c53b8c91855910c9382c4fb4a26b8fe099965c7c3cad1af2ced6"
 ORT_EP_C_API_SHA256="7de0ebae527f18b39fbeb3129d5781a995e76f685842c2e16aa0468230e6368b"
 OIDN_VER="${OIDN_VER:-2.5.1}"
-LIBPLACEBO_TAG="${LIBPLACEBO_TAG:-v7.351.0}"
+# jellyfin-ffmpeg's own pin (builder/scripts.d/50-libplacebo.sh), not a tag: its libplacebo patch in
+# builder/patches/libplacebo/ does not apply to v7.351.0.
+LIBPLACEBO_REF="${LIBPLACEBO_REF:-cee9b076f2c63104ccfd497fa79c39a867293ec4}"
 # Pinned, like every other source build here. 2026.4 knows GL_EXT_expect_assume; the distro 2023.8
 # does not, which is the whole reason this is built rather than installed.
 SHADERC_TAG="${SHADERC_TAG:-v2026.4}"
@@ -476,6 +478,9 @@ if [[ "$GPU_VENDOR" == "intel" ]]; then
     VENDOR_PATCHES=(0008-hwmap-chain-format.patch 0009-hwmap-query-formats.patch)
     # libdrm: the Vulkan device taken from the render node (drm=dr:<node>, vulkan=vk@dr) needs it.
     HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-libdrm)
+    # The patched binary must load jellyfin-ffmpeg's bundled libvulkan/shaderc, not the system loader and the
+    # /usr/local shaderc it links: same binary, same chain, 4.73 dB against 25.70 dB.
+    STOCK_FFMPEG_LIB="${STOCK_FFMPEG_LIB:-/usr/lib/jellyfin-ffmpeg/lib}"
 else
     VENDOR_PATCHES=(
         0006-vulkan-to-cuda-hwmap.patch
@@ -490,6 +495,7 @@ else
     )
     HWACCEL_FLAGS=(--enable-ffnvcodec --enable-cuda --enable-cuvid --enable-nvdec --enable-nvenc)
     [[ -z "$CLANG_CUDA" ]] || CUDA_LLVM_FLAGS=(--enable-cuda-llvm --nvcc="$CLANG_CUDA")
+    STOCK_FFMPEG_LIB=""
 fi
 # ORT_EP=openvino builds on a box without CUDA too, so its bridge test is off whichever vendor asked.
 [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]] && BRIDGE_TEST_DEFAULT=0
@@ -509,6 +515,7 @@ if [[ "$PLAN_ONLY" == "1" ]]; then
     echo "plan: cuda-llvm: ${CUDA_LLVM_FLAGS[*]:-none}"
     echo "plan: required filters: $(ffmpeg_required_filters "$GPU_VENDOR")"
     echo "plan: bridge test default: $BRIDGE_TEST_DEFAULT"
+    [[ -z "$STOCK_FFMPEG_LIB" ]] || echo "plan: rpath: first $STOCK_FFMPEG_LIB"
     if [[ "$WITH_FSR2" == "1" && "$ORT_EP" == "openvino" ]]; then
         echo "plan: fsr2: no CUDA: patch ${FSR2_NOCUDA_PATCH%%-*}, cflag $FSR2_NOCUDA_CFLAG, marker $FSR2_NOCUDA_MARKER"
     fi
@@ -590,17 +597,34 @@ say "shaderc in use: ${shaderc_ver}"
 
 # --- libplacebo -----------------------------------------------------------------------------------
 # FFmpeg 8.x needs PL_ALPHA_NONE, absent from libplacebo 6.x (which is what distros ship).
-say "libplacebo ${LIBPLACEBO_TAG} (static)"
-if [[ "$(cat "$STAMP_DIR/libplacebo.tag" 2>/dev/null)" == "$LIBPLACEBO_TAG" ]] \
+# Without jellyfin-ffmpeg's patch (libplacebo issue 349) and flags the static libplacebo chain scored
+# 4.7 dB against 25.7 dB on stock on an Arc (docs/intel-patched-ffmpeg-libplacebo.md).
+LIBPLACEBO_PATCHES=("$HERE"/builder/patches/libplacebo/*.patch)
+[[ -f "${LIBPLACEBO_PATCHES[0]}" ]] || die "no libplacebo patches under $HERE/builder/patches/libplacebo"
+LIBPLACEBO_MESON=(
+    --prefix=/usr/local --libdir=lib/x86_64-linux-gnu --default-library=static
+    --buildtype=release -Dvulkan=enabled -Dvk-proc-addr=enabled -Dshaderc=enabled -Dglslang=disabled
+    -Ddemos=false -Dtests=false -Dbench=false -Dfuzz=false
+)
+# The stamp covers the patches and flags too, or a host with the old build would skip the rebuild.
+LIBPLACEBO_STAMP="$LIBPLACEBO_REF $({ cat "${LIBPLACEBO_PATCHES[@]}"; printf '%s\n' "${LIBPLACEBO_MESON[@]}"; } | sha256sum | cut -c1-16)"
+say "libplacebo ${LIBPLACEBO_REF} (static)"
+if [[ "$(cat "$STAMP_DIR/libplacebo.tag" 2>/dev/null)" == "$LIBPLACEBO_STAMP" ]] \
         && [[ -f /usr/local/lib/x86_64-linux-gnu/libplacebo.a ]]; then
-    say "libplacebo ${LIBPLACEBO_TAG} already installed at /usr/local, skipping rebuild"
+    say "libplacebo ${LIBPLACEBO_REF} already installed at /usr/local, skipping rebuild"
 else
-    git clone --recursive --depth 1 -b "$LIBPLACEBO_TAG" \
-        https://code.videolan.org/videolan/libplacebo.git >/dev/null 2>&1
-    meson setup libplacebo/build libplacebo --prefix=/usr/local --libdir=lib/x86_64-linux-gnu \
-        --default-library=static -Dvulkan=enabled -Dshaderc=enabled -Ddemos=false >/dev/null
+    git init -q libplacebo
+    git -C libplacebo remote add origin https://code.videolan.org/videolan/libplacebo.git
+    git -C libplacebo fetch -q --depth 1 origin "$LIBPLACEBO_REF"
+    git -C libplacebo checkout -q FETCH_HEAD
+    git -C libplacebo submodule update -q --init --recursive
+    for patch in "${LIBPLACEBO_PATCHES[@]}"; do
+        say "libplacebo: applying ${patch##*/}"
+        ( cd libplacebo && patch -p1 -i "$patch" )
+    done
+    meson setup libplacebo/build libplacebo "${LIBPLACEBO_MESON[@]}" >/dev/null
     ninja -C libplacebo/build install >/dev/null
-    echo "$LIBPLACEBO_TAG" > "$STAMP_DIR/libplacebo.tag"
+    echo "$LIBPLACEBO_STAMP" > "$STAMP_DIR/libplacebo.tag"
 fi
 
 # --- nv-codec-headers -----------------------------------------------------------------------------
@@ -923,6 +947,12 @@ if [[ "$GPU_VENDOR" == "nvidia" && -z "$CLANG_CUDA" ]]; then
     echo "!! no clang found: transpose_cuda and the other CUDA-kernel filters will be missing" >&2
 fi
 
+# Last LDFLAGS export on purpose: each one prepends, so this -rpath is first in the binary's RUNPATH,
+# ahead of the oidn and ort directories and of every system path.
+if [[ -n "$STOCK_FFMPEG_LIB" ]]; then
+    export LDFLAGS="-Wl,-rpath,$STOCK_FFMPEG_LIB ${LDFLAGS:-}"
+fi
+
 say "configure"
 PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}" ./configure \
     --prefix="$PREFIX" \
@@ -1069,6 +1099,16 @@ if [[ ${#CUDA_LLVM_FLAGS[@]} -gt 0 ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\btranspose_cuda\b" \
         && echo "  transpose_cuda: present" \
         || die "transpose_cuda filter missing from the build (--enable-cuda-llvm did not take effect)"
+fi
+
+if [[ -n "$STOCK_FFMPEG_LIB" ]]; then
+    # Captured before grepping, as below. The first entry decides: it is what beats the system loader.
+    dyn_out=$(readelf -d "$PREFIX/ffmpeg" 2>/dev/null) || true
+    first_rp=$(grep -E '\((RUNPATH|RPATH)\)' <<<"$dyn_out" | sed -n '1s/.*\[\(.*\)\].*/\1/p') || true
+    first_rp=${first_rp%%:*}
+    [[ "$first_rp" == "$STOCK_FFMPEG_LIB" ]] \
+        && echo "  rpath: first entry is $STOCK_FFMPEG_LIB" \
+        || die "the built ffmpeg's first RUNPATH entry is not $STOCK_FFMPEG_LIB (got '${first_rp:-none}'): it would load the system libvulkan and /usr/local shaderc"
 fi
 
 if [[ "$GPU_VENDOR" == "intel" ]]; then
