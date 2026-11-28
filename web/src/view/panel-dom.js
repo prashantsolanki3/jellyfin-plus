@@ -2,7 +2,9 @@ import { el } from '../lib/dom.js';
 import { log } from '../lib/log.js';
 import { openSheet, closeSheet, isBottomSheet } from './sheet.js';
 import { state } from '../model/state.js';
-import { CONTROLS, DEFAULT_PREFS } from '../model/controls-data.js';
+import { CONTROLS, CONNECTION, DEFAULT_PREFS } from '../model/controls-data.js';
+import { readLinkPref, writeLinkPref, linkNote } from '../model/link-profile.js';
+import { linkProfile } from '../controller/link-probe.js';
 import {
     axisConflict, optionInert, costSuffix, shortName, neuralIsCudaNative, neuralCudaDisables
 } from '../model/conflicts.js';
@@ -477,6 +479,37 @@ function cudaSuppressedLabels() {
 }
 
 /*
+ * Connection: Auto / Fast / Slow, the viewer's override of the link measurement. Not an axis, so
+ * it never touches state.prefs or the stage; it is read again on the next PlaybackInfo or
+ * segment request, so it needs no restream of its own (Apply now re-plays at once).
+ */
+function connectionSection(rerender) {
+    var wrap = el('div');
+    wrap.appendChild(el('h3', null, CONNECTION.label));
+    var cur = readLinkPref(window.localStorage);
+    var box = el('div', 'gpuup-chips');
+    box.setAttribute('role', 'radiogroup');
+    box.setAttribute('aria-label', CONNECTION.label);
+    CONNECTION.options.forEach(function (o) {
+        var b = el('button', 'gpuup-chip' + (o.id === cur ? ' on' : ''), o.name);
+        b.title = o.title;
+        b.type = 'button';
+        b.setAttribute('role', 'radio');
+        b.setAttribute('aria-checked', o.id === cur ? 'true' : 'false');
+        b.onclick = function () {
+            writeLinkPref(window.localStorage, o.id);
+            log('connection', o.id);
+            rerender();
+        };
+        box.appendChild(b);
+    });
+    wrap.appendChild(box);
+    wrap.appendChild(el('div', 'gpuup-note', linkNote(linkProfile())
+        || 'Applies from the next request. Use Apply now to re-play at once.'));
+    return wrap;
+}
+
+/*
  * The quality stage, as a slider over the ladder that is already generated for this source.
  * The ladder itself is untouched: same stages, same order, same cost sort - only the way it is
  * presented changed, from a list of sheet rows to one control.
@@ -921,6 +954,7 @@ export function renderPanel(panel, caps) {
     }
 
     body.appendChild(qualitySection(rerender));
+    body.appendChild(connectionSection(rerender));
 
     // What this render shows, BEFORE axisControls reads the game value for showWhen -
     // otherwise jitter/depth/reactive render against a stale game value on first paint and only

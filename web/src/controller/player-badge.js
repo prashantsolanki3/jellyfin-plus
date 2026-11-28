@@ -6,6 +6,7 @@ import { fetchServerState } from './live-block.js';
 import { activeState } from './live-apply.js';
 import { openEnhancePanel } from './playback-hooks.js';
 import { clientStatus, onClientStatus } from './client-upscale.js';
+import { linkProfile } from './link-probe.js';
 import { el } from '../lib/dom.js';
 
 /*
@@ -106,32 +107,31 @@ function ensureChip() {
 
 function render() {
     if (!chip) { return; }
-    var model = badgeModel(caps, state.lastServerState, activeState());
+    var model = badgeModel(caps, state.lastServerState, activeState(), linkProfile());
     // Client-side upscaling (controller/client-upscale.js) is its own line, always worded
     // "This device: ...", so it can never be read as something the server did. It does not need
-    // the server plugin, so it can be the chip's only line.
-    var device = clientStatus().line;
-    if (!model.show && !device) {
+    // the server plugin, so it can be the chip's only line. The slow-link reason is the same
+    // kind of line: the client's own decision, named as such (model.note).
+    var lines = [clientStatus().line, model.note].filter(Boolean);
+    if (!model.show && !lines.length) {
         chip.classList.remove('show');
         return;
     }
 
     if (model.show) {
         chip.textContent = model.text;
-        chip.title = model.title;
-        chip.setAttribute('aria-label', 'Enhance: ' + model.text);
+        chip.title = [model.title].concat(lines).join('\n');
+        chip.setAttribute('aria-label', 'Enhance: ' + [model.text].concat(lines).join('. '));
         chip.setAttribute('data-key', model.key);
-        if (device) {
-            chip.appendChild(el('span', 'jp-device-line', device));
-            chip.title = model.title + '\n' + device;
-            chip.setAttribute('aria-label', 'Enhance: ' + model.text + '. ' + device);
-        }
     } else {
-        chip.textContent = device;
-        chip.title = device;
-        chip.setAttribute('aria-label', 'Enhance: ' + device);
+        chip.title = lines.join('\n');
+        chip.setAttribute('aria-label', 'Enhance: ' + lines.join('. '));
         chip.setAttribute('data-key', 'device');
+        // The first extra line is the chip's own text here, so it is not repeated as a sub-line.
+        chip.textContent = lines.shift();
     }
+
+    lines.forEach(function (line) { chip.appendChild(el('span', 'jp-device-line', line)); });
     chip.classList.add('show');
 }
 

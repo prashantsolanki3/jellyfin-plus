@@ -5,6 +5,21 @@
  *
  * Pure data, no imports: every other module reads this one, nothing here reads them.
  */
+
+/*
+ * THE CONNECTION CONTROL. Not an axis: nothing here reaches the ffmpeg command or state.prefs. It
+ * is the viewer's override of the link measurement (model/link-profile.js), stored under its own
+ * localStorage key as '' (auto), 'fast' or 'slow'.
+ */
+export var CONNECTION = {
+    key: 'connection', label: 'Connection', fallback: 'auto',
+    options: [
+        { id: 'auto', name: 'Auto', title: 'Measure this link and limit it only when it is slow.' },
+        { id: 'fast', name: 'Fast (never limit)', title: 'Never treat this link as slow: no bitrate cap, direct play allowed.' },
+        { id: 'slow', name: 'Slow (always limit)', title: 'Always treat this link as slow: no direct play and a bitrate cap.' }
+    ]
+};
+
 export var CONTROLS = [
     {
         // `basic` is the tier: a numbered basic control is always visible, in that number's
