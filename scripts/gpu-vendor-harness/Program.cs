@@ -86,6 +86,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             NeuralDevice();
             NeuralRouting();
             AutoNeuralCache();
+            IntelHardwareDecode();
+            AccessHardwareDecode();
             Fdinfo();
             IdleResidency();
             LoadRoute();
@@ -1461,6 +1463,547 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             GpuDetector.UseEnvironment(null);
             UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe();
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.DrmVulkanProbeSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+        }
+
+        // ---- PR 7: IntelHardwareDecode ------------------------------------------------------------
+
+        // The QSV device is pinned to the detected render node in every Intel command (PR 3's review: the
+        // encoder's own search is not trusted to pick the detector's node), software or hardware decode.
+        private const string QsvPin = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128";
+
+        private const string SoftwareIntelArgs = " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr" + QsvPin + " -filter_hw_device vk";
+
+        // The decode and map devices alone: what HardwareDecodeDeviceArgs and the start-up test command carry.
+        private const string HardwareIntelDeviceArgs = " -init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device vulkan=vk@va -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk";
+
+        // What a session's command carries: the same, with the pinned QSV device after the Vulkan one.
+        private const string HardwareIntelArgs = " -init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device vulkan=vk@va" + QsvPin + " -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk";
+
+        private const string Vk0Args = " -init_hw_device vulkan=vk:0 -filter_hw_device vk";
+
+        private const string HardwareSourceReason = "software decode: the source is not upright 8-bit SDR progressive 4:2:0 h264 (Main or High) or hevc (Main)";
+
+        private const string PatchedBinary = "/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg";
+
+        // A 1280x720 session asking for 1080, whose video stream says what codec, depth and scan it is.
+        // The profile and pixel format are the ones the gate admits for that codec.
+        private static EncodingJobInfo HwJob(string codec, int? bitDepth, bool interlaced, string transfer, int? rotation, params string[] options) =>
+            HwJobFull(codec, bitDepth, interlaced, transfer, rotation, string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase) ? "Main" : "High", "yuv420p", options);
+
+        private static EncodingJobInfo HwJobFull(string codec, int? bitDepth, bool interlaced, string transfer, int? rotation, string profile, string pixelFormat, params string[] options)
+        {
+            var streamOptions = new Dictionary<string, string>();
+            for (int i = 0; i < options.Length; i += 2)
+            {
+                streamOptions[options[i]] = options[i + 1];
+            }
+
+            return new FakeJob
+            {
+                IsVideoRequest = true,
+                VideoStream = new MediaBrowser.Model.Entities.MediaStream
+                {
+                    Type = MediaBrowser.Model.Entities.MediaStreamType.Video,
+                    Width = 1280,
+                    Height = 720,
+                    Rotation = rotation,
+                    Codec = codec,
+                    Profile = profile,
+                    PixelFormat = pixelFormat,
+                    BitDepth = bitDepth,
+                    IsInterlaced = interlaced,
+                    ColorTransfer = transfer,
+                    ColorRange = "tv",
+                },
+                BaseRequest = new MediaBrowser.Controller.MediaEncoding.BaseEncodingJobOptions { StreamOptions = streamOptions },
+            };
+        }
+
+        private static EncodingJobInfo PlainHwJob(params string[] options) => HwJob("h264", 8, false, "bt709", null, options);
+
+        private static UpscaleSettings HwSettings(bool on, string vendor = "auto")
+        {
+            UpscaleSettings cfg = RigSettings(vendor);
+            cfg.IntelHardwareDecode = on;
+            return cfg;
+        }
+
+        private static UpscaleEngine.Plan HwDecide(FakeGpuEnvironment env, UpscaleSettings cfg, EncodingJobInfo job)
+        {
+            GpuDetector.UseEnvironment(env);
+            UpscaleEngine.Settings = cfg;
+            return UpscaleEngine.Decide(job);
+        }
+
+        // AGENTS.md invariant 13 again, with IntelHardwareDecode on: its reasons name the render node ("the startup
+        // test-decode of h264 on /dev/dri/renderD128 ..."), so the non-elevated session route must not carry them
+        // (Record, the flat fields or the Summary); the elevated Status route keeps them whole.
+        private static void AccessHardwareDecode()
+        {
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.DrmVulkanProbeSource = n => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
+            UpscaleEngine.PatchedFfmpegSource = () => PatchedBinary;
+            UpscaleEngine.IntelHwDecodeProbeSource = node => null;
+            UpscaleEngine.Plan hwPlan = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080"));
+            SessionRecord hwRecord = UpscaleEngine.Describe(null, hwPlan, hwPlan.Status, hwPlan.Reason);
+            hwRecord.PlaySessionId = "harness-access-hw-" + Guid.NewGuid().ToString("N");
+            Check("access (hardware decode) setup: the record's reason does name the render node", hwRecord.HardwareDecodeReason != null && hwRecord.HardwareDecodeReason.Contains("/dev/dri/renderD128"), hwRecord.HardwareDecodeReason);
+            UpscaleEngine.Record(hwRecord);
+            string body = PatcherHost.SessionJson(hwRecord.PlaySessionId);
+            Check("non-elevated recorded session, hardware decode on: no render node path anywhere in the body", !body.Contains("/dev/dri") && !body.Contains("renderD"), body);
+            Check("the elevated Status route keeps the hardware decode reason whole", PatcherHost.StatusJson().Contains("/dev/dri/renderD128"));
+            UpscaleEngine.IntelHwDecodeProbeSource = null;
+            UpscaleEngine.PatchedFfmpegSource = null;
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.DrmVulkanProbeSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.Settings = new UpscaleSettings();
+        }
+
+        private static void IntelHardwareDecode()
+        {
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.DrmVulkanProbeSource = n => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
+            SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan", "atadenoise", "deblock");
+            string marker = Path.Combine(Rig(), "fsr2-nocuda");
+            UpscaleEngine.PatchedFfmpegSource = () => PatchedBinary;
+            int calls = 0;
+            bool? answer = true;
+            UpscaleEngine.IntelHwDecodeProbeSource = node =>
+            {
+                calls++;
+                return answer;
+            };
+
+            // The default is off, in both copies of the setting, and survives the settings JSON.
+            Check("IntelHardwareDecode defaults to off", !new UpscaleSettings().IntelHardwareDecode);
+            var opts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            Check("settings JSON without IntelHardwareDecode keeps it off", !JsonSerializer.Deserialize<UpscaleSettings>("{\"Enabled\":true}", opts).IntelHardwareDecode);
+            Check("settings JSON carries IntelHardwareDecode across the boundary", JsonSerializer.Deserialize<UpscaleSettings>("{\"IntelHardwareDecode\":true}", opts).IntelHardwareDecode);
+
+            // The golden: setting on, an Intel GPU, a passing test, a plan with nothing CPU-side.
+            calls = 0;
+            UpscaleEngine.Plan hw = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080"));
+            Check("on, Intel, test passes: the session is enhanced", hw.Act, hw.Status + ": " + hw.Reason);
+            Check("on, Intel, test passes: hardware decode", hw.HardwareDecode, hw.HardwareDecodeReason);
+            Equal("on, Intel, test passes: the reason", "decoded on the Intel GPU (VA-API) and mapped to Vulkan", hw.HardwareDecodeReason);
+            Check("on, Intel, test passes: the test ran once", calls == 1, "calls " + calls);
+            Equal("hardware decode: the command's device arguments", HardwareIntelArgs, UpscaleEngine.HwaccelArgs(hw));
+            string chain = UpscaleEngine.BuildChain(hw);
+            Check("hardware decode: the chain maps the VA-API surfaces to Vulkan first",
+                chain.StartsWith("hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler="), chain);
+            Check("hardware decode: the chain downloads as nv12", chain.EndsWith(",hwdownload,format=nv12"), chain);
+            Check("hardware decode: no hwupload and no format=yuv420p", !chain.Contains("hwupload") && !chain.Contains("yuv420p"), chain);
+            Equal("hardware decode, literal plan: the chain",
+                "hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=nv12",
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
+            Equal("hardware decode, literal plan with deband: the chain",
+                "hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:deband=1:deband_threshold=3:deband_grain=0,hwdownload,format=nv12",
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, DebandApplied = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
+            Equal("hardware decode, untagged range: tagged before the map",
+                "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=nv12",
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, RangeUntagged = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
+            Equal("the surface format of 8-bit 4:2:0 is nv12", "nv12", UpscaleEngine.HardwareSurfaceFormat("yuv420p"));
+            foreach (string other in new[] { "yuv420p10le", "yuv422p", "yuv444p", "p010le", "nv12", string.Empty, null })
+            {
+                Check("no surface format, so no hardware decode, for " + (other ?? "null"), UpscaleEngine.HardwareSurfaceFormat(other) == null);
+            }
+
+            Equal("the decided plan carries the derived format", "nv12", hw.HardwareDecodeFormat);
+            Check("a software plan carries no format", HwDecide(Machine("renderD128", "0x8086"), HwSettings(false), PlainHwJob("upscale", "1080")).HardwareDecodeFormat == null);
+            Equal("the software chain with the same literal plan on an Intel host ends in a yuv420p download, not RGBA",
+                "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=yuv420p,hwdownload,format=yuv420p",
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
+
+            // The start-up test is the production command: same device arguments (decoder bound by name),
+            // a decode of a real clip, and the production chain with libplacebo on the mapped surfaces.
+            Equal("the device arguments, shared by the command and the test", HardwareIntelDeviceArgs, UpscaleEngine.HardwareDecodeDeviceArgs("/dev/dri/renderD128", string.Empty));
+            Equal("the device arguments carry the QSV device after the Vulkan one",
+                " -init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device vulkan=vk@va -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk",
+                UpscaleEngine.HardwareDecodeDeviceArgs("/dev/dri/renderD128", " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128"));
+            string testChain = UpscaleEngine.HardwareDecodeTestChain();
+            Equal("the test chain is the production hardware-decode chain",
+                "hwmap=derive_device=vulkan,libplacebo=w=512:h=288:upscaler=ewa_lanczos,hwdownload,format=nv12", testChain);
+            Equal("the test command", "-hide_banner -loglevel error" + HardwareIntelDeviceArgs + " -i \"/tmp/h264.mp4\" -vf \"" + testChain + "\" -frames:v 3 -f null -",
+                UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain));
+            Check("the test command decodes before it filters: no testsrc, no hwupload, no -filter_hw_device va",
+                !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("testsrc")
+                && !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("hwupload")
+                && !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("-filter_hw_device va"));
+            // The test command is the production device arguments, QSV pin included: both come from the one DeviceInit.
+            string productionDevices = UpscaleEngine.HwaccelArgs(hw);
+            string testCommand = UpscaleEngine.HardwareDecodeTestCommand("/dev/dri/renderD128", "/tmp/h264.mp4", testChain);
+            Check("the start-up test command carries the QSV pin", testCommand.Contains(QsvPin), testCommand);
+            Equal("the start-up test command's device arguments are the session command's own",
+                "-hide_banner -loglevel error" + productionDevices + " -i \"/tmp/h264.mp4\" -vf \"" + testChain + "\" -frames:v 3 -f null -", testCommand);
+            string h264Clip = UpscaleEngine.HardwareDecodeClipArgs("h264", "/tmp/h264.mp4");
+            string hevcClip = UpscaleEngine.HardwareDecodeClipArgs("hevc", "/tmp/hevc.mp4");
+            Check("the h264 clip is 8-bit 4:2:0 Main", h264Clip.Contains("-pix_fmt yuv420p") && h264Clip.Contains("-c:v libx264 -profile:v main") && h264Clip.EndsWith("-y \"/tmp/h264.mp4\""), h264Clip);
+            Check("the hevc clip is 8-bit 4:2:0 Main", hevcClip.Contains("-pix_fmt yuv420p") && hevcClip.Contains("-c:v libx265 -profile:v main") && hevcClip.EndsWith("-y \"/tmp/hevc.mp4\""), hevcClip);
+
+            SessionRecord on = UpscaleEngine.Describe(null, hw, hw.Status, hw.Reason);
+            Check("the record says hardware decode ran", on.HardwareDecode == true && on.HardwareDecodeReason == hw.HardwareDecodeReason);
+            Check("the record's JSON carries both", JsonSerializer.Serialize(on).Contains("\"HardwareDecode\":true") && JsonSerializer.Serialize(on).Contains("\"HardwareDecodeReason\":"));
+            Check("the summary says it", on.Summary.Contains("decoded on the Intel GPU"), on.Summary);
+
+            // hevc, any case of the codec name, and an untagged transfer all qualify.
+            Check("hevc qualifies", HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), HwJob("hevc", 8, false, null, null, "upscale", "1080")).HardwareDecode);
+            Check("H264 in capitals qualifies", HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), HwJob("H264", 8, false, string.Empty, null, "upscale", "1080")).HardwareDecode);
+
+            // A failed or inconclusive test keeps software decode, and says which.
+            foreach (bool? result in new bool?[] { false, null })
+            {
+                answer = result;
+                UpscaleEngine.Plan soft = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080"));
+                string tag = " [test " + (result == null ? "inconclusive" : "failed") + "]";
+                Check("software decode" + tag, soft.Act && !soft.HardwareDecode, soft.HardwareDecodeReason);
+                Check("the reason names the test" + tag, soft.HardwareDecodeReason.StartsWith("software decode: the startup test-decode of h264 on /dev/dri/renderD128 ") && soft.HardwareDecodeReason.EndsWith(result == null ? "could not be run" : "failed"), soft.HardwareDecodeReason);
+                Equal("the device arguments are the software ones" + tag, SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(soft));
+                Check("the chain is the software chain" + tag, UpscaleEngine.BuildChain(soft).StartsWith("format=yuv420p") && UpscaleEngine.BuildChain(soft).Contains("hwupload"));
+                SessionRecord softRecord = UpscaleEngine.Describe(null, soft, soft.Status, soft.Reason);
+                Check("the record says why" + tag, softRecord.HardwareDecode == false && softRecord.HardwareDecodeReason == soft.HardwareDecodeReason);
+            }
+
+            answer = true;
+            UpscaleEngine.IntelHwDecodeProbeSource = node => throw new InvalidOperationException("probe broke");
+            UpscaleEngine.Plan thrown = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080"));
+            Check("a test that throws keeps software decode and the session is still enhanced", thrown.Act && !thrown.HardwareDecode && thrown.HardwareDecodeReason.StartsWith("software decode: error"), thrown.HardwareDecodeReason);
+            UpscaleEngine.IntelHwDecodeProbeSource = node =>
+            {
+                calls++;
+                return answer;
+            };
+
+            // A plan with a step that cannot follow VA-API decode keeps software decode, without running the test.
+            FakeGpuEnvironment marked = WithFile(Machine("renderD128", "0x8086"), marker);
+            var blocked = new Dictionary<string, string[]>
+            {
+                ["deblock"] = new[] { "upscale", "1080", "deblock", "light" },
+                ["atadenoise"] = new[] { "upscale", "1080", "denoise", "light" },
+                ["neural"] = new[] { "upscale", "1080", "neural", "realesr-anime-x2" },
+                ["game"] = new[] { "upscale", "1080", "game", "fsr2" },
+            };
+            foreach (var pair in blocked)
+            {
+                calls = 0;
+                if (pair.Key == "game")
+                {
+                    // PR 6's review: fsr2 runs on Intel only once its start-up probe has passed, so it has to have.
+                    GpuDetector.UseEnvironment(marked);
+                    UpscaleEngine.Settings = HwSettings(true);
+                    UseFsr2Probe(Fsr2Passed);
+                    UpscaleEngine.StartFsr2Probe();
+                }
+
+                UpscaleEngine.Plan cpu = HwDecide(marked, HwSettings(true), PlainHwJob(pair.Value));
+                string tag = " [" + pair.Key + "]";
+                Check("a CPU-side step keeps software decode" + tag, cpu.Act && !cpu.HardwareDecode, cpu.Status + ": " + cpu.Reason + " / " + cpu.HardwareDecodeReason);
+                Check("the reason names the step" + tag, cpu.HardwareDecodeReason.StartsWith("software decode: the plan has a step that cannot follow VA-API decode (") && cpu.HardwareDecodeReason.Contains(pair.Key == "atadenoise" ? "denoise" : pair.Key), cpu.HardwareDecodeReason);
+                Check("the test did not run" + tag, calls == 0, "calls " + calls);
+                Equal("the device arguments are the software ones" + tag, SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(cpu));
+                Check("the chain is the software chain" + tag, UpscaleEngine.BuildChain(cpu).StartsWith("format=yuv420p"), UpscaleEngine.BuildChain(cpu));
+            }
+
+            UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe();
+
+            // A GPU-side Vulkan denoise rides along only when the patched binary can compile it.
+            UpscaleEngine.Plan vulkanDenoise = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080", "denoise", "strong"));
+            Check("a Vulkan denoise follows the patched-binary shader test", vulkanDenoise.HardwareDecode == UpscaleEngine.VulkanDenoiseRunsOnPatchedBinary(), vulkanDenoise.HardwareDecodeReason);
+
+            // Sources Jellyfin would tone-map, deinterlace or rotate, or the decoder may not take.
+            var sources = new Dictionary<string, EncodingJobInfo>
+            {
+                ["vp9"] = HwJob("vp9", 8, false, "bt709", null, "upscale", "1080"),
+                ["av1"] = HwJob("av1", 8, false, "bt709", null, "upscale", "1080"),
+                ["no codec"] = HwJob(null, 8, false, "bt709", null, "upscale", "1080"),
+                ["10-bit"] = HwJob("hevc", 10, false, "bt709", null, "upscale", "1080"),
+                ["unknown depth"] = HwJob("h264", null, false, "bt709", null, "upscale", "1080"),
+                ["interlaced"] = HwJob("h264", 8, true, "bt709", null, "upscale", "1080"),
+                ["HDR10"] = HwJob("hevc", 8, false, "smpte2084", null, "upscale", "1080"),
+                ["HLG"] = HwJob("hevc", 8, false, "arib-std-b67", null, "upscale", "1080"),
+                ["sideways"] = HwJob("h264", 8, false, "bt709", 90, "upscale", "1920"),
+            };
+            foreach (var pair in sources)
+            {
+                calls = 0;
+                UpscaleEngine.Plan source = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), pair.Value);
+                string tag = " [" + pair.Key + "]";
+                Check("source keeps software decode" + tag, source.Act && !source.HardwareDecode, source.Status + ": " + source.Reason + " / " + source.HardwareDecodeReason);
+                Equal("the reason names the source" + tag, HardwareSourceReason, source.HardwareDecodeReason);
+                Check("the test did not run" + tag, calls == 0, "calls " + calls);
+                Equal("the device arguments are the software ones" + tag, SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(source));
+            }
+
+            // No usable render node path: software decode, reason says so, no test.
+            calls = 0;
+            UpscaleEngine.Plan noNode = HwDecide(Machine("render X;rm", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080"));
+            Check("an odd render node name keeps software decode", noNode.Act && !noNode.HardwareDecode && noNode.HardwareDecodeReason == "software decode: the Intel render node has no usable path" && calls == 0, noNode.HardwareDecodeReason);
+            Equal("...and the command is the vk:0 one", Vk0Args, UpscaleEngine.HwaccelArgs(noNode));
+
+            // Setting off: an Intel box is exactly what PR 6 left it, the test never runs, the record has no new key.
+            calls = 0;
+            UpscaleEngine.Plan off = HwDecide(Machine("renderD128", "0x8086"), HwSettings(false), PlainHwJob("upscale", "1080"));
+            Check("off, Intel: no hardware decode, no reason", off.Act && !off.HardwareDecode && off.HardwareDecodeReason == null);
+            Equal("off, Intel: the device arguments", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(off));
+            Check("off, Intel: the chain is the software chain", UpscaleEngine.BuildChain(off).StartsWith("format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=") && UpscaleEngine.BuildChain(off).EndsWith(":format=yuv420p,hwdownload,format=yuv420p"), UpscaleEngine.BuildChain(off));
+            Check("off, Intel: the test never ran", calls == 0);
+            SessionRecord offRecord = UpscaleEngine.Describe(null, off, off.Status, off.Reason);
+            string offJson = JsonSerializer.Serialize(offRecord);
+            Check("off, Intel: the record has neither key", !offJson.Contains("HardwareDecode") && offRecord.HardwareDecode == null && offRecord.HardwareDecodeReason == null, offJson);
+            Check("off, Intel: the summary does not mention it", !offRecord.Summary.Contains("VA-API") && !offRecord.Summary.Contains("software decode"), offRecord.Summary);
+
+            // Setting on but no Intel GPU that was seen: nothing changes anywhere (null reason, no record keys,
+            // no probe key), so the command, the record and the probe are the setting-off ones.
+            var others = new Dictionary<string, FakeGpuEnvironment[]>
+            {
+                ["NVIDIA"] = new[] { Machine("renderD128", "0x10de") },
+                ["no GPU"] = new[] { Machine() },
+                ["mixed, auto"] = new[] { Machine("renderD128", "0x8086", "renderD129", "0x10de") },
+            };
+            foreach (var pair in others)
+            {
+                calls = 0;
+                string tag = " [" + pair.Key + "]";
+                UpscaleEngine.Plan noIntel = HwDecide(pair.Value[0], HwSettings(true), PlainHwJob("upscale", "1080"));
+                UpscaleEngine.Plan baseline = HwDecide(pair.Value[0], HwSettings(false), PlainHwJob("upscale", "1080"));
+                Check("on, no Intel path: still enhanced as with the setting off" + tag, noIntel.Act == baseline.Act, noIntel.Status + ": " + noIntel.Reason);
+                Check("on, no Intel path: software decode, and no reason" + tag, !noIntel.HardwareDecode && noIntel.HardwareDecodeReason == null, noIntel.HardwareDecodeReason);
+                Check("on, no Intel path: the test never ran" + tag, calls == 0);
+                SessionRecord baselineRecord = UpscaleEngine.Describe(null, baseline, baseline.Status, baseline.Reason);
+                SessionRecord noIntelRecord = UpscaleEngine.Describe(null, noIntel, noIntel.Status, noIntel.Reason);
+                baselineRecord.Timestamp = noIntelRecord.Timestamp = string.Empty;
+                Equal("on, no Intel path: the session record is the setting-off one" + tag, JsonSerializer.Serialize(baselineRecord), JsonSerializer.Serialize(noIntelRecord));
+                Check("on, no Intel path: the record has no HardwareDecode key" + tag, !JsonSerializer.Serialize(noIntelRecord).Contains("HardwareDecode"));
+                GpuDetector.UseEnvironment(pair.Value[0]);
+                UpscaleEngine.Settings = HwSettings(false);
+                string probeBaseline = Probe().GetRawText();
+                UpscaleEngine.Settings = HwSettings(true);
+                Equal("on, no Intel path: the probe is the setting-off one" + tag, probeBaseline, Probe().GetRawText());
+                Check("on, no Intel path: the probe has no IntelHardwareDecode key" + tag, !Keys(Probe()).Contains("IntelHardwareDecode"));
+                Equal("on, no Intel path: the device arguments are the setting-off ones" + tag, UpscaleEngine.HwaccelArgs(baseline), UpscaleEngine.HwaccelArgs(noIntel));
+                Equal("on, no Intel path: the chain is the setting-off one" + tag, UpscaleEngine.BuildChain(baseline), UpscaleEngine.BuildChain(noIntel));
+                Check("off, no Intel path: no reason" + tag, baseline.HardwareDecodeReason == null);
+                Check("off, no Intel path: the record has no new key" + tag, !JsonSerializer.Serialize(UpscaleEngine.Describe(null, baseline, baseline.Status, baseline.Reason)).Contains("HardwareDecode"));
+            }
+
+            // The source gate by profile and chroma format: only 8-bit 4:2:0 h264 Main/High and hevc Main reach the
+            // GPU decoder; the rest would come back as software frames and kill the stream at the hwmap.
+            answer = true;
+            var gate = new (string Codec, string Profile, string Pixel, bool Hardware)[]
+            {
+                ("h264", "Main", "yuv420p", true),
+                ("h264", "High", "yuv420p", true),
+                ("hevc", "Main", "yuv420p", true),
+                ("H264", " high ", "YUV420P", true),
+                ("hevc", "MAIN", "yuv420p", true),
+                ("h264", "Baseline", "yuv420p", false),
+                ("h264", "Constrained Baseline", "yuv420p", false),
+                ("h264", "Extended", "yuv420p", false),
+                ("h264", "High 10", "yuv420p", false),
+                ("h264", "High 10", "yuv420p10le", false),
+                ("h264", "High 4:2:2", "yuv422p", false),
+                ("h264", "High 4:2:2", "yuv420p", false),
+                ("h264", "High 4:4:4 Predictive", "yuv444p", false),
+                ("h264", "High 4:4:4 Predictive", "yuv420p", false),
+                ("h264", "High", "yuv422p", false),
+                ("h264", "High", "yuv444p", false),
+                ("h264", "High", "yuvj420p", false),
+                ("h264", "Main", "yuvj420p", false),
+                ("hevc", "Main 10", "yuv420p10le", false),
+                ("hevc", "Main 10", "yuv420p", false),
+                ("hevc", "Rext", "yuv420p", false),
+                ("hevc", "Rext", "yuv422p", false),
+                ("hevc", "Rext", "yuv444p", false),
+                ("hevc", "Main Still Picture", "yuv420p", false),
+                ("hevc", "Main", "yuv422p", false),
+                ("hevc", "Main", "yuv444p", false),
+                ("hevc", "Main", "yuvj420p", false),
+                ("hevc", "High", "yuv420p", false),
+                ("h264", null, "yuv420p", false),
+                ("h264", string.Empty, "yuv420p", false),
+                ("hevc", null, "yuv420p", false),
+                ("h264", "High", null, false),
+                ("h264", "High", string.Empty, false),
+                ("hevc", "Main", null, false),
+            };
+            foreach (var row in gate)
+            {
+                calls = 0;
+                string tag = " [" + row.Codec + " / " + (row.Profile ?? "no profile") + " / " + (row.Pixel ?? "no pixel format") + "]";
+                UpscaleEngine.Plan p = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), HwJobFull(row.Codec, 8, false, "bt709", null, row.Profile, row.Pixel, "upscale", "1080"));
+                Check("the session is enhanced" + tag, p.Act, p.Status + ": " + p.Reason);
+                if (row.Hardware)
+                {
+                    Check("hardware decode" + tag, p.HardwareDecode, p.HardwareDecodeReason);
+                    Equal("the device arguments are the hardware ones" + tag, HardwareIntelArgs, UpscaleEngine.HwaccelArgs(p));
+                }
+                else
+                {
+                    Check("software decode" + tag, !p.HardwareDecode, p.HardwareDecodeReason);
+                    Equal("the reason is the source one" + tag, HardwareSourceReason, p.HardwareDecodeReason);
+                    Check("the test did not run" + tag, calls == 0, "calls " + calls);
+                    Equal("the device arguments are the software ones" + tag, SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(p));
+                }
+            }
+
+            // The start-up test is read, never waited on, and a bad answer is not kept for the life of the process.
+            UpscaleEngine.IntelHwDecodeProbeSource = null;
+            var queued = new List<Action>();
+            DateTime clock = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            int runs = 0;
+            Func<UpscaleEngine.HwDecodeAnswer> next = () => new UpscaleEngine.HwDecodeAnswer(true, true);
+            UpscaleEngine.HardwareDecodeProbeFactory = n => new CachedProbe<UpscaleEngine.HwDecodeAnswer>(
+                () =>
+                {
+                    runs++;
+                    return next();
+                },
+                a => a.Conclusive,
+                UpscaleEngine.HardwareDecodeRetryAfter,
+                () => clock,
+                queued.Add);
+            Func<string, UpscaleEngine.Plan> decide = codec => HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), HwJob(codec, 8, false, "bt709", null, "upscale", "1080"));
+            Action drain = () =>
+            {
+                Action[] work = queued.ToArray();
+                queued.Clear();
+                foreach (Action w in work)
+                {
+                    w();
+                }
+            };
+            const string Test264 = "software decode: the startup test-decode of h264 on /dev/dri/renderD128";
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            UpscaleEngine.Plan cold = decide("h264");
+            Check("no answer yet: the session is enhanced in software", cold.Act && !cold.HardwareDecode, cold.HardwareDecodeReason);
+            Equal("no answer yet: the reason says so", Test264 + " has not finished", cold.HardwareDecodeReason);
+            Check("no answer yet: the probe was queued, not run, so the plan did not wait", queued.Count == 1 && runs == 0, "queued " + queued.Count + ", runs " + runs);
+            Equal("no answer yet: the command is the software one", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(cold));
+            decide("h264");
+            Check("a second session does not queue a second probe", queued.Count == 1 && runs == 0);
+            drain();
+            Check("the probe ran once", runs == 1, "runs " + runs);
+            Check("a passed test: both codecs decode on the GPU", decide("h264").HardwareDecode && decide("hevc").HardwareDecode);
+            clock = clock.AddDays(30);
+            Check("true is kept for life: no probe however late", decide("h264").HardwareDecode && queued.Count == 0 && runs == 1, "queued " + queued.Count + ", runs " + runs);
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            runs = 0;
+            next = () => new UpscaleEngine.HwDecodeAnswer(false, false);
+            decide("h264");
+            drain();
+            Equal("a failed test: the reason says failed", Test264 + " failed", decide("h264").HardwareDecodeReason);
+            clock = clock.AddSeconds(59);
+            decide("h264");
+            Check("a failed test is not asked again inside the delay", queued.Count == 0 && runs == 1, "queued " + queued.Count + ", runs " + runs);
+            clock = clock.AddSeconds(2);
+            UpscaleEngine.Plan standing = decide("h264");
+            Check("after the delay it is asked again in the background while the last answer stands", queued.Count == 1 && !standing.HardwareDecode && standing.HardwareDecodeReason == Test264 + " failed", standing.HardwareDecodeReason);
+            next = () => new UpscaleEngine.HwDecodeAnswer(true, true);
+            drain();
+            Check("a later pass turns hardware decode on without a restart", decide("h264").HardwareDecode && runs == 2, "runs " + runs);
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            next = () => throw new InvalidOperationException("probe broke");
+            decide("h264");
+            drain();
+            UpscaleEngine.Plan broke = decide("h264");
+            Check("a probe that throws is no answer: software decode, the session still enhanced", broke.Act && !broke.HardwareDecode && broke.HardwareDecodeReason == Test264 + " has not finished", broke.HardwareDecodeReason);
+            clock = clock.AddSeconds(61);
+            decide("h264");
+            next = () => new UpscaleEngine.HwDecodeAnswer(true, true);
+            drain();
+            Check("a throwing probe is retried and then passes", decide("h264").HardwareDecode);
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            next = () => new UpscaleEngine.HwDecodeAnswer(null, null);
+            decide("h264");
+            drain();
+            Equal("a test that could not be run: the reason says so", Test264 + " could not be run", decide("h264").HardwareDecodeReason);
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            next = () => new UpscaleEngine.HwDecodeAnswer(true, false);
+            decide("h264");
+            drain();
+            Check("the answer is per codec: h264 passed, so h264 decodes on the GPU", decide("h264").HardwareDecode);
+            UpscaleEngine.Plan hevcOnly = decide("hevc");
+            Check("the answer is per codec: hevc failed, so hevc stays in software", !hevcOnly.HardwareDecode && hevcOnly.HardwareDecodeReason == "software decode: the startup test-decode of hevc on /dev/dri/renderD128 failed", hevcOnly.HardwareDecodeReason);
+            Equal("...and its command is the software one", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(hevcOnly));
+
+            // The patched ffmpeg is looked up for every plan: a binary removed after start-up gives software decode.
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            queued.Clear();
+            UpscaleEngine.PatchedFfmpegSource = () => null;
+            UpscaleEngine.Plan nobin = decide("h264");
+            Check("no patched ffmpeg: software decode with the reason", nobin.Act && !nobin.HardwareDecode && nobin.HardwareDecodeReason.StartsWith("software decode: the patched ffmpeg is not installed"), nobin.HardwareDecodeReason);
+            Check("no patched ffmpeg: no test was started", queued.Count == 0);
+            Equal("no patched ffmpeg: the command is the software one", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(nobin));
+            UpscaleEngine.PatchedFfmpegSource = () => PatchedBinary;
+
+            // Start-up: the probe is started in the background for an Intel node with the setting on, and nowhere else.
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            queued.Clear();
+            runs = 0;
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.Settings = HwSettings(true);
+            UpscaleEngine.PrimeHardwareDecode();
+            Check("start-up: an Intel node with the setting on queues the probe without running it", queued.Count == 1 && runs == 0, "queued " + queued.Count + ", runs " + runs);
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            queued.Clear();
+            UpscaleEngine.Settings = HwSettings(false);
+            UpscaleEngine.PrimeHardwareDecode();
+            Check("start-up: the setting off starts nothing", queued.Count == 0);
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            UpscaleEngine.Settings = HwSettings(true);
+            UpscaleEngine.PrimeHardwareDecode();
+            Check("start-up: an NVIDIA server starts nothing", queued.Count == 0);
+            UpscaleEngine.HardwareDecodeProbeFactory = null;
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            answer = true;
+            UpscaleEngine.IntelHwDecodeProbeSource = node =>
+            {
+                calls++;
+                return answer;
+            };
+
+            // Jellyfin's own kept nodes: before the chain in software decode, after its download under hardware decode.
+            var keptNodes = new List<string> { "setparams=color_primaries=bt709", "setparams=color_trc=bt709" };
+            Equal("software decode: kept nodes lead", "setparams=color_primaries=bt709,setparams=color_trc=bt709,CHAIN", UpscaleEngine.JoinChain(new UpscaleEngine.Plan(), "CHAIN", keptNodes));
+            Equal("hardware decode: kept nodes follow the download", "CHAIN,setparams=color_primaries=bt709,setparams=color_trc=bt709", UpscaleEngine.JoinChain(new UpscaleEngine.Plan { HardwareDecode = true }, "CHAIN", keptNodes));
+            Equal("software decode, nothing kept: the chain alone", "CHAIN", UpscaleEngine.JoinChain(new UpscaleEngine.Plan(), "CHAIN", new List<string>()));
+            Equal("hardware decode, nothing kept: the chain alone", "CHAIN", UpscaleEngine.JoinChain(new UpscaleEngine.Plan { HardwareDecode = true }, "CHAIN", new List<string>()));
+
+            // Two GPUs with Intel chosen: the Intel node, not the first or the NVIDIA one.
+            UpscaleEngine.Plan chosen = HwDecide(Machine("renderD128", "0x10de", "renderD129", "0x8086"), HwSettings(true, "intel"), PlainHwJob("upscale", "1080"));
+            Check("two GPUs, intel chosen: hardware decode", chosen.HardwareDecode, chosen.HardwareDecodeReason);
+            Equal("two GPUs, intel chosen: the Intel node", " -init_hw_device vaapi=va:/dev/dri/renderD129 -init_hw_device vulkan=vk@va -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD129 -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk", UpscaleEngine.HwaccelArgs(chosen));
+
+            // The probe: no new key until the setting is on.
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.Settings = HwSettings(false);
+            JsonElement probeOff = Probe();
+            UpscaleEngine.Settings = HwSettings(true);
+            JsonElement probeOn = Probe();
+            Check("setting off: the probe has no IntelHardwareDecode key", !Keys(probeOff).Contains("IntelHardwareDecode"));
+            Check("setting on: the probe carries IntelHardwareDecode=true", probeOn.TryGetProperty("IntelHardwareDecode", out JsonElement flag) && flag.ValueKind == JsonValueKind.True);
+            Check("setting on: nothing else in the probe moved", Keys(probeOff).All(k => probeOff.GetProperty(k).GetRawText() == probeOn.GetProperty(k).GetRawText()) && Keys(probeOn).Count == Keys(probeOff).Count + 1);
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            UpscaleEngine.Settings = HwSettings(false);
+            Check("NVIDIA, setting off: the probe keys are the ones it always had", string.Join(",", Keys(Probe()).OrderBy(k => k, StringComparer.Ordinal)) == ProbeKeys, string.Join(",", Keys(Probe())));
+
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.Settings = new UpscaleSettings();
+            UpscaleEngine.IntelHwDecodeProbeSource = null;
+            UpscaleEngine.PatchedFfmpegSource = null;
+            UpscaleEngine.HardwareDecodeProbeFactory = null;
+            UpscaleEngine.ResetHardwareDecodeProbes();
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;

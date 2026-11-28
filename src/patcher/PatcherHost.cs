@@ -30,6 +30,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
             // Off this thread: the encoder list and the AV1 test encode are ffmpeg runs, and the
             // capability record and the transcode path only read what they leave behind.
             UpscaleEngine.WarmProbes();
+
+            // Off the start-up thread: the render-node lookup can run a test, and the hardware-decode
+            // test spawns ffmpeg. A session that arrives first finds no answer and decodes in software.
+            Task.Run(UpscaleEngine.PrimeHardwareDecode);
             return UpscalePatches.Status;
         }
 
@@ -235,6 +239,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 levels["NeuralMaxSourceHeight"] = cfg.NeuralMaxSourceHeight;
             }
 
+            // Present only while the operator has hardware decode on and an Intel GPU was found, so an
+            // NVIDIA or CPU-only server serves the probe it always did with the setting on too.
+            if (cfg != null && cfg.IntelHardwareDecode && UpscaleEngine.IsIntelPath())
+            {
+                levels["IntelHardwareDecode"] = true;
+            }
+
             return levels;
         }
 
@@ -253,6 +264,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         /// <summary>The non-sensitive subset of the GPU record, for routes any authenticated user can reach. Never throws.</summary>
         private static GpuSummary GpuPublic() => UpscaleEngine.CapabilitySummary();
+
+        private static readonly System.Text.RegularExpressions.Regex RenderNodePath =
+            new System.Text.RegularExpressions.Regex("/dev/dri/renderD[0-9]+", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+        /// <summary>
+        /// A reason or summary can name the render node in prose (the hardware-decode test says "on /dev/dri/renderD128"),
+        /// so the whole non-elevated body is scrubbed of the path, whichever field carries it.
+        /// </summary>
+        private static string WithoutRenderNodes(string json) => RenderNodePath.Replace(json, "the Intel render node");
 
         /// <summary>
         /// The session record as any authenticated user may read it: without the render-node paths
@@ -351,7 +371,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 });
             }
 
-            return JsonSerializer.Serialize(new Dictionary<string, object>
+            var session = new Dictionary<string, object>
             {
                 ["PatchActive"] = UpscalePatches.Active,
                 ["Known"] = true,
@@ -407,7 +427,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["GpuResidentEncode"] = record.GpuResidentEncode,
                 ["Status"] = record.Status,
                 ["Summary"] = record.Summary,
-            });
+            };
+
+            // Present only while IntelHardwareDecode is on and the server's GPU is a detected Intel
+            // one, so every other server's session JSON is exactly what it was.
+            if (record.HardwareDecodeReason != null)
+            {
+                session["HardwareDecode"] = record.HardwareDecode;
+                session["HardwareDecodeReason"] = record.HardwareDecodeReason;
+            }
+
+            return WithoutRenderNodes(JsonSerializer.Serialize(session));
         }
     }
 }

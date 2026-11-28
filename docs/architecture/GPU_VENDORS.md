@@ -6,8 +6,8 @@ small pull requests, each one landing on its own branch and verified before the 
 load, sections 5.1 and 5.2), PR 3 (the Vulkan device from the render node, and the NVIDIA-only
 levels withheld on Intel, section 5.3) and PR 5 (the ONNX neural level on OpenVINO, routing by source
 height, and the `ORT_EP` build, section 5.4) are built; the rest are the plan, with what is known, what
-was measured, and what is still a guess marked as such.** Nothing in PRs 7 and 8 is built (PR 4 was
-folded into PR 2). PR 6 (`gu_inputs` without CUDA, section 5.5) is written but was authored with no compiler available, so none of it has been built or run. The four build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies
+was measured, and what is still a guess marked as such.** Nothing in PR 8 is built (PR 4 was
+folded into PR 2). PR 6 (`gu_inputs` without CUDA, section 5.5) is written but was authored with no compiler available, so none of it has been built or run. PR 7 (opt-in Intel hardware decode, section 5.6) is written the same way: the C# was not compiled, `scripts/test-gpu-vendor.sh` and the shim test were not run on it, and nothing was run on an Arc card. The four build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies
 and `scripts/test-gpu-vendor.sh` passes (1082 checks, plus 11 in `scripts/test-shim-device.py`) in a .NET
 10 SDK container with no GPU; `scripts/test-vf-ort.sh` compiles `ffmpeg/vf_ort.c` against FFmpeg 8.1.2
 and checks its provider calls (28 checks). None has been run on an NVIDIA or an Intel box: the detection is untested
@@ -53,7 +53,7 @@ has to make vendor-aware, or consciously leave NVIDIA-only.
 | CUDA-only levels | `optix` denoise, `dlss` / `dlaa`, `dlpp-1..4`, `vsr-rtcuda` need CUDA (and, for DLSS, the NVIDIA runtime the operator fetches); `fsr2` is fed by NVOFA motion vectors through CUDA | Withheld from the probe on a detected Intel GPU, and reported as "needs NVIDIA" (PR 3, section 5.3) |
 | `vf_ort` | The ONNX Runtime filter creates a CUDA execution provider and falls back to the CPU one (`ffmpeg/vf_ort.c`, option `device` = `cuda` / `cpu`) | PR 5 |
 | `gu_inputs.h` (`vf_fsr2`, `vf_dlss`) | Motion vectors come from NVOFA optical flow (`libnvidia-opticalflow`), through CUDA; `GU_NO_NVOF` builds run with zero flow | PR 6 (section 5.5) |
-| Decode | The decoder patches drop `-hwaccel` and `-c:v *_cuvid` so frames reach `hwupload` in system memory; only the CUDA-native levels keep a CUDA hwaccel | PR 7 |
+| Decode | The decoder patches drop `-hwaccel` and `-c:v *_cuvid` so frames reach `hwupload` in system memory; only the CUDA-native levels keep a CUDA hwaccel | PR 7: on a detected Intel GPU the opt-in `IntelHardwareDecode` setting decodes with VA-API instead (section 5.6); every other session is unchanged |
 | `scripts/build-ffmpeg.sh`, `proxmox-build.sh` | The patched binary must carry all five of `oidn optix ort fsr2 dlss` or the deploy is refused (AGENTS.md invariant 10); four of them need NVIDIA SDKs | PR 8 |
 
 What is **not** NVIDIA-specific and so needs no work: the libplacebo chain itself (Vulkan), every
@@ -761,6 +761,74 @@ exact command and the FFmpeg error text, since the cause above is a guess. It st
 (a setting, default off) until it has been verified on a served segment, because an unverified
 hardware decode path is a dead stream for a viewer, not a worse picture.
 
+**What PR 7 ships. NOT VERIFIED ON HARDWARE: the C# was not compiled, the harness and the shim test were
+not run on it, and no Arc card was available.**
+
+The setting `IntelHardwareDecode` (dashboard checkbox, default off, in `PluginConfiguration`,
+`UpscaleSettings`, `configPage.html`, the probe and the session record). Hardware decode applies only
+when ALL of these hold; otherwise the command is the software one and the session record says which
+condition failed (`HardwareDecodeReason`):
+
+1. the setting is on;
+2. an Intel GPU is detected (`Devices().Intel`, with a render node that has a usable path);
+3. the source is upright 8-bit SDR progressive 4:2:0 and one of h264 Main, h264 High or hevc Main
+   (`HardwareDecodableSource`: profile and `PixelFormat` are read as well as the codec, so Baseline,
+   Extended, High 10, High 4:2:2, High 4:4:4, hevc Main 10, Rext and Still Picture, and the 4:2:2, 4:4:4
+   and full-range `yuvj` formats stay in software; those decode to software frames or fail on the
+   VA-API surface and would die at the `hwmap`). Anything Jellyfin would tone-map, deinterlace or rotate
+   adds a CPU-side node;
+4. the plan has no CPU-side node: no CUDA neural, CPU deblock, CPU denoise (`atadenoise`), neural or game
+   step, and a Vulkan denoise only if the patched binary can compile its shader;
+5. the patched ffmpeg is installed, checked again for every plan (`ShaderLibrary.PatchedFfmpegPath`, the
+   one definition of the path): stock ffmpeg cannot map VA-API frames to Vulkan;
+6. the start-up test has passed for the source's codec. It runs the production chain
+   (`HardwareDecodeTestChain`, built by `BuildChain` with `HardwareDecode` set) with the production device
+   arguments (`HardwareDecodeDeviceArgs`) on a tiny generated h264 and hevc clip, so the download format
+   (`HardwareSurfaceFormat`) is exercised and not assumed. It runs on a thread-pool thread (`CachedProbe`, started at plugin
+   load by `PrimeHardwareDecode` and by the first plan that finds nothing): a plan only reads the answer,
+   so a session that arrives first decodes in software ("has not finished") and none waits. A pass is kept
+   for the life of the process; a fail or a test that could not run is asked again after 60 s while the
+   last answer stands, so one bad run at boot does not pin the server to software.
+
+When all hold the command is
+`-init_hw_device vaapi=va:<node> -init_hw_device vulkan=vk@va [QSV device] -hwaccel vaapi -hwaccel_device va
+-hwaccel_output_format vaapi -filter_hw_device vk` and the chain is
+`[setparams=range=tv,]hwmap=derive_device=vulkan,[Vulkan deblock/denoise,]libplacebo...,hwdownload,format=nv12`:
+no `format=yuv420p`, no `hwupload`. Nodes Jellyfin keeps (`JoinChain`: the subtitle overlay and the like,
+all CPU nodes) run before the chain in software decode and after its `hwdownload` under hardware decode,
+so they follow the upscale on this path; the golden harness case pins both orders.
+
+Premises inferred from the source and not seen to work (P3 to P6): that `ffmpeg/0008` and `0009` make
+the VA-API to Vulkan `hwmap` negotiate; that `vk@va` derives a device the decoder's frames can be mapped
+into; and that VA-API frames cannot enter a CPU node (hence the plan condition). The downloaded
+format is derived from the gated source pixel format (`HardwareSurfaceFormat`: `yuv420p` gives `nv12`,
+anything else has no hardware decode) and stored on the plan as `HardwareDecodeFormat`.
+
+The shim: stock jellyfin-ffmpeg failed `hwmap=derive_device=vulkan` from VA-API ("Conversion failed!"
+on the A380), and `0008`/`0009` exist only in the patched binary, so `pick_binary` routes a command
+carrying `vulkan=vk@va` and `derive_device=vulkan` to the patched binary
+(`scripts/test-shim-device.py`). That is a routing change beyond the setting itself.
+
+One source for the binary path: the plugin plans hardware decode only after seeing the patched binary
+(`ShaderLibrary.PatchedFfmpegPath`), the shim routes to its own `PATCHED_FFMPEG`, and
+`proxmox-build.sh` installs to `FFMPEG_PREFIX`; `scripts/test_shim_patched_path.py` fails when the three
+disagree. The shim cannot read the plugin's answer, so if the binary has gone between the plan and the
+launch it logs a warning naming the path and falls back to stock ffmpeg, which fails that session with
+"Conversion failed". Not written to `/etc/jellyfin-upscale.json`: that is a maintainer's call. Residual
+risk: a session with no PlaySessionId is decided afresh on every request.
+
+Identical, by harness: with the setting off, or on without a detected Intel GPU (NVIDIA, no GPU, mixed
+auto), every command line, the probe JSON and the session JSON equal those of the setting off, and
+`HardwareDecodeReason` is null. The probe key `IntelHardwareDecode` is served only while the setting is on
+and an Intel GPU is detected, and the record keys `HardwareDecode` and `HardwareDecodeReason` exist only
+then. (The decision itself still runs `Devices()`, which may run the DRM Vulkan test once; that is
+existing behaviour, not byte-identical in cost.)
+
+Still open and not changed by this: `DrmVulkanStarts` blocks the caller and caches a null for the life of
+the process, and `PrimeHardwareDecode` calls `Devices()` on its background task and so waits on it there.
+NOT VERIFIED on an Arc: that the test-decode passes, that the gate's profiles are the ones the driver
+decodes, that `-hwaccel_device va` is accepted with `vk@va`, and that `nv12` is the format a real Arc downloads (the map is derived from the gated 4:2:0 source, not measured).
+
 ### 5.7 PR 8: a `GPU_VENDOR=intel` build, and the five-filter invariant
 
 `scripts/build-ffmpeg.sh` gains `GPU_VENDOR=nvidia|intel` (default `nvidia`, today's behaviour).
@@ -819,7 +887,8 @@ encode, the neural levels, or more than one session.
 1. ~~`vaapi` or `qsv` as the Intel encode family~~ Decided for `qsv` from the source (section 5.1); the CPU cost of the yuv420p to nv12 conversion is still unmeasured.
 2. ~~Whether the pinned jellyfin-ffmpeg can select the Vulkan device by DRM node~~ It can, by derivation from a DRM device, and the selection is by PCI device id, so two identical cards are not told apart (section 5.3). Unverified on a binary and a machine.
 3. The real cause of the VA-API to Vulkan failure; the derived-device explanation is a hypothesis
-   (PR 7).
+   (PR 7 ships the derived-device command behind the off-by-default `IntelHardwareDecode`, section
+   5.6, and has not been run on an Arc card, so the cause is still open).
 4. Neural throughput on the A380 through OpenVINO's GPU plugin, and so the default for `NeuralMaxSourceHeight` (PR 5 ships it at 0, section 5.4); also which `GPU.<n>` OpenVINO gives the Arc card on a box with an integrated GPU.
 5. Whether FSR2 with zero motion vectors is acceptable on Intel, by the still-pixel temporal
    measurement; and a real non-CUDA flow source for `gu_inputs` (PR 6 shipped the zero-flow variant,

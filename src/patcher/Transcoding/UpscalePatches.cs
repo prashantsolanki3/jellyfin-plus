@@ -829,7 +829,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
                 var kept = UpscaleEngine.KeepNonScalingNodes(ExtractVfBody(__result));
                 string chain = UpscaleEngine.BuildChain(plan);
-                __result = " -vf \"" + (kept.Count > 0 ? string.Join(",", kept) + "," + chain : chain) + "\"";
+                // Kept nodes lead the chain, or follow its download under hardware decode (JoinChain).
+                __result = " -vf \"" + UpscaleEngine.JoinChain(plan, chain, kept) + "\"";
 
                 var record = RecordFor(state, verdict, plan, "applied", "filter chain injected");
                 _logger?.LogInformation("JellyfinPlus: {Summary} for {Path}", record.Summary, state.MediaPath);

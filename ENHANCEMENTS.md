@@ -268,8 +268,21 @@ NVIDIA is unchanged. Not compiled or run on an Intel GPU; `scripts/test-gu-input
 check of the CUDA-free variant and of the default variant's CUDA call order and hard error against a fake CUDA
 (stub headers; not the real SDK headers or NVOFA), and it applies patches 0001, 0015 and 0016 in order.
 
+**Intel hardware decode, `IntelHardwareDecode` (PR 7; dashboard checkbox, off by default).** Off, or on
+without a detected Intel GPU, the command line, the probe and the session JSON are those of the setting off
+(the reason is null there). On, with an Intel GPU, a passing start-up test (the production chain run per
+codec on a generated h264 and hevc clip, in the background; a session never waits on it), an upright 8-bit
+SDR progressive 4:2:0 source that is h264 Main/High or hevc Main, an installed patched ffmpeg and a plan with
+no CPU-side step, the command decodes with VA-API and maps to Vulkan (`-hwaccel_device va`, `vk@va`,
+`hwmap=derive_device=vulkan`, tail `hwdownload,format=nv12`); every other session keeps software decode,
+with the reason in `SessionRecord.HardwareDecodeReason`. The probe gains `Levels.IntelHardwareDecode` and the
+session route `HardwareDecode` / `HardwareDecodeReason` only while the setting is on and an Intel GPU is
+detected. The shim routes a command carrying `vulkan=vk@va` and `derive_device=vulkan` to the patched
+binary, which alone carries `ffmpeg/0008` and `0009`, and logs a warning when it is missing. Not compiled,
+not run, and not verified on an Intel card: GPU_VENDORS.md 5.6.
+
 Not done by this: choosing between two Intel GPUs (OpenVINO's own GPU numbering is not mapped to the
-render node either), hardware decode, an Intel ffmpeg build, a client-panel hint when a chosen level
+render node either), hardware decode beyond the opt-in above, an Intel ffmpeg build, a client-panel hint when a chosen level
 will be dropped for a tall source. The plan for the rest is
 [GPU_VENDORS.md](docs/architecture/GPU_VENDORS.md). Tests: `scripts/test-gpu-vendor.sh <jfbin>`
 (compiles the real patcher sources, the DRM fdinfo reader and the load controller, and runs
@@ -295,7 +308,7 @@ Harmony. The plugin tells it to stand down while the patches are active, by writ
 1080, `MaxTargetHeight` 2160, `SrLevel` `fsrcnnx`, `MaxConcurrent` 4, `MaxConcurrentSwaps` 4,
 `RequireClientOptIn` false, `ForceTranscode` false, `ForceTranscodeForDirectPlay` false, `Encoder`
 `hevc_nvenc`, `GpuVendor` `auto`, `MinScaleFactor` 1.15, `SrMinScaleFactor` 1.60, `MaxSourceHeight` 1440,
-`NeuralMaxSourceHeight` 0. Deblur, denoise,
+`NeuralMaxSourceHeight` 0, `IntelHardwareDecode` false. Deblur, denoise,
 deblock, neural, game, refine and chroma defaults are all `off`. The README configuration table lists
 `MaxConcurrent` 2 and `RequireClientOptIn` true; the code says 4 and false.
 
