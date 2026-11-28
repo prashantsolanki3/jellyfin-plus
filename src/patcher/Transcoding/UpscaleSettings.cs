@@ -61,7 +61,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         /// <summary>
         /// Intel only: offer the ONNX neural levels, which run through OpenVINO. Off by default: bench
-        /// run22 measured about 1.4 fps at 360p and 0.5 fps at 720p on an A380. Off keeps them withheld
+        /// measured about 1.4 fps at 360p and 0.5 fps at 720p on an A380. Off keeps them withheld
         /// as UpscaleEngine.NotMeasuredOnIntel. No effect on any other GPU.
         /// </summary>
         public bool IntelNeuralAllowed { get; set; }
@@ -69,7 +69,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>
         /// Intel only: a source shorter than this, upscaled by an FSRCNNX level, runs the network to
         /// round_even(source * IntelLowResIntermediateScale) and finishes with a bicubic scale to the
-        /// target. Measured +1.08 dB over plain scaling at 360p (bench run22). 0 turns it off.
+        /// target. Measured +1.08 dB over plain scaling at 360p (bench). 0 turns it off.
         /// </summary>
         public int IntelLowResMaxSourceHeight { get; set; } = 480;
 
