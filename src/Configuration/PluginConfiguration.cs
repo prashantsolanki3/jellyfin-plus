@@ -65,6 +65,19 @@ namespace Jellyfin.Plugin.Plus.Configuration
         public bool NeuralAllowed { get; set; } = true;
 
         /// <summary>
+        /// Use the ONNX neural levels only for small sources. 0, the default, is no routing: nothing
+        /// changes. Above 0, a source whose (upright) height is at or below this gets the neural
+        /// level (the session's, the dashboard's NeuralLevel, or, when neither names one and the
+        /// OpenVINO provider is installed and the patched ffmpeg lists the openvino device, on an
+        /// Intel server, the cheapest installed weight); a source above it does not, and the shader
+        /// path runs. Applies to the realesr-* levels, not to dlpp-* or vsr-rtcuda, and on every GPU
+        /// vendor, NVIDIA included. When the engine picks the level itself, Recent sessions shows the
+        /// requested level as off although a network ran, and NeuralRouting says why. 480 is the recommended value on Intel, not measured: see
+        /// docs/architecture/GPU_VENDORS.md 5.4 for the cost arithmetic.
+        /// </summary>
+        public int NeuralMaxSourceHeight { get; set; }
+
+        /// <summary>
         /// Game temporal upscaler applied by default: off, fsr2, dlss, dlaa. OFF, and it stays
         /// off: these are renderer algorithms fed inputs recorded video cannot supply. See the
         /// block above ShaderLibrary._gameFilters.

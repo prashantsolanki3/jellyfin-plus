@@ -82,6 +82,9 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             DrmProbeCache();
             TwoGpuMachines();
             NvidiaOnlyLevels();
+            NeuralDevice();
+            NeuralRouting();
+            AutoNeuralCache();
             Fdinfo();
             IdleResidency();
             LoadRoute();
@@ -1240,6 +1243,19 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("Intel, only an ONNX level asked for: not enhanced", !plan.Act && plan.Status == "not-requested", plan.Status);
             Check("Intel, only an ONNX level asked for: the reason says why", plan.Reason.Contains("neural realesr-anime-x2 not run: not measured on Intel"), plan.Reason);
 
+            // The withhold is the maintainer's condition: it stays until the OpenVINO path is MEASURED on an Arc, even though
+            // PR 5's path is present (provider file there, ffmpeg lists the device). Lifting it (a bench result) is one flag.
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.Settings = rig;
+            plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
+            Check("Intel, not measured: the flag is off by default and the ONNX level is withheld", !UpscaleEngine.IntelOnnxMeasured && plan.GpuWithheldUnmeasured == "neural realesr-anime-x2" && !plan.NeuralApplied);
+            UpscaleEngine.IntelOnnxMeasured = true;
+            plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
+            record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
+            Check("Intel, measured (flag on): an ONNX neural level is not withheld", plan.GpuWithheld == null && plan.GpuWithheldUnmeasured == null && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
+            Check("Intel, measured (flag on): and its description does not claim CUDA", record.Summary.Contains("this server's GPU is Intel, so no CUDA and the CPU provider") && !record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            UpscaleEngine.IntelOnnxMeasured = false;
+
             GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
             UpscaleEngine.Settings = rig;
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
@@ -1265,6 +1281,481 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;
             UpscaleEngine.Settings = new UpscaleSettings();
+        }
+
+
+        // ---- PR 5: the ort device, and NeuralMaxSourceHeight --------------------------------------
+
+        // A session whose source is any size, optionally stored sideways.
+        private static EncodingJobInfo SessionJobAt(int width, int height, int? rotation, params string[] options)
+        {
+            var streamOptions = new Dictionary<string, string>();
+            for (int i = 0; i < options.Length; i += 2)
+            {
+                streamOptions[options[i]] = options[i + 1];
+            }
+
+            return new FakeJob
+            {
+                IsVideoRequest = true,
+                VideoStream = new MediaBrowser.Model.Entities.MediaStream
+                {
+                    Type = MediaBrowser.Model.Entities.MediaStreamType.Video,
+                    Width = width,
+                    Height = height,
+                    Rotation = rotation,
+                },
+                BaseRequest = new MediaBrowser.Controller.MediaEncoding.BaseEncodingJobOptions { StreamOptions = streamOptions },
+            };
+        }
+
+        private static string _neuralRig;
+
+        // A directory holding all three Real-ESRGAN weights (a stand-in file each) and, beside it, where the
+        // OpenVINO provider would sit. The fake machine decides whether that provider file "exists".
+        private static string NeuralRig()
+        {
+            if (_neuralRig != null)
+            {
+                return _neuralRig;
+            }
+
+            string root = Path.Combine(Path.GetTempPath(), "gpu-vendor-neural-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Path.Combine(root, "models"));
+            Directory.CreateDirectory(Path.Combine(root, "empty"));
+            foreach (string file in new[] { "realesr-animevideo-x2-fp16.onnx", "realesr-animevideov3-x4-fp16.onnx", "realesr-general-x4v3-fp16.onnx" })
+            {
+                File.WriteAllText(Path.Combine(root, "models", file), "x");
+            }
+
+            _neuralRig = root;
+            return root;
+        }
+
+        private static string NeuralProviderFile() => Path.Combine(NeuralRig(), "ort/lib/libonnxruntime_providers_openvino.so");
+
+        private static string X2() => Path.Combine(NeuralRig(), "models", "realesr-animevideo-x2-fp16.onnx");
+
+        private static UpscaleSettings NeuralSettings(string vendor, int maxHeight, bool weights = true) => new UpscaleSettings
+        {
+            Encoder = "auto",
+            GpuVendor = vendor,
+            NeuralMaxSourceHeight = maxHeight,
+            NeuralModelDirectory = Path.Combine(NeuralRig(), weights ? "models" : "empty"),
+        };
+
+        // A machine, with the OpenVINO provider file present when asked.
+        private static FakeGpuEnvironment NeuralMachine(bool provider, params string[] nodeAndId)
+        {
+            FakeGpuEnvironment env = Machine(nodeAndId);
+            if (provider)
+            {
+                // The detector looks beside the model directory of the settings in force, which is models/ or empty/.
+                env.Files.Add(NeuralProviderFile());
+            }
+
+            return env;
+        }
+
+        private static UpscaleEngine.Plan DecideOn(FakeGpuEnvironment env, UpscaleSettings cfg, int width, int height, params string[] options)
+        {
+            GpuDetector.UseEnvironment(env);
+            UpscaleEngine.Settings = cfg;
+            return UpscaleEngine.Decide(SessionJobAt(width, height, null, options));
+        }
+
+        // Which ort device the node asks for. Intel only changes anything; every other server's node is the one it always was.
+        private static void NeuralDevice()
+        {
+            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.DrmVulkanProbeSource = n => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
+            SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "libplacebo", "nlmeans_vulkan");
+
+            string golden = "format=gbrpf32le,ort=model=" + X2() + ",format=yuv420p";
+            string[] ask = { "upscale", "1080", "neural", "realesr-anime-x2" };
+
+            // NVIDIA, no GPU, a mixed box on auto, an Intel box that is told it is not Intel: the node is byte-identical,
+            // for every setting value, with and without the OpenVINO provider file on disk.
+            foreach (bool provider in new[] { false, true })
+            {
+                foreach (string vendor in new[] { "auto", "nvidia", "none", "banana", "intel" })
+                {
+                    string tag = " [GpuVendor=" + vendor + ", provider file " + (provider ? "present" : "absent") + "]";
+                    if (vendor != "intel")
+                    {
+                        UpscaleEngine.Plan nv = DecideOn(NeuralMachine(provider, "renderD128", "0x10de"), NeuralSettings(vendor, 0), 1280, 720, ask);
+                        Equal("NVIDIA box: the ort node is the one it always was" + tag, golden, nv.NeuralFilter);
+                        Check("NVIDIA box: the device is cuda, with no note" + tag, nv.NeuralDevice == "cuda" && nv.NeuralDeviceNote == null && nv.NeuralApplied);
+                        Check("NVIDIA box: the chain carries the node and no device option" + tag, UpscaleEngine.BuildChain(nv).Contains("ort=model=" + X2() + ",format=yuv420p") && !UpscaleEngine.BuildChain(nv).Contains("ort=model=" + X2() + ":device"));
+                    }
+
+                    UpscaleEngine.Plan none = DecideOn(NeuralMachine(provider), NeuralSettings(vendor, 0), 1280, 720, ask);
+                    Equal("no GPU: the ort node is the one it always was" + tag, golden, none.NeuralFilter);
+                    Check("no GPU: the device is cuda" + tag, none.NeuralDevice == "cuda");
+                }
+
+                UpscaleEngine.Plan mixed = DecideOn(NeuralMachine(provider, "renderD128", "0x8086", "renderD129", "0x10de"), NeuralSettings("auto", 0), 1280, 720, ask);
+                Equal("mixed box on auto is NVIDIA's: the ort node is the one it always was" + (provider ? " [provider file present]" : string.Empty), golden, mixed.NeuralFilter);
+
+                foreach (string vendor in new[] { "nvidia", "none" })
+                {
+                    UpscaleEngine.Plan intelOnly = DecideOn(NeuralMachine(provider, "renderD128", "0x8086"), NeuralSettings(vendor, 0), 1280, 720, ask);
+                    Equal("an Intel GPU the setting did not choose: the ort node is the one it always was [GpuVendor=" + vendor + "]", golden, intelOnly.NeuralFilter);
+                }
+            }
+
+            // Intel, the provider installed: OpenVINO, asked for on the node and said in the record.
+            UpscaleEngine.Plan ov = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel with the provider: the node asks for openvino", "format=gbrpf32le,ort=model=" + X2() + ":device=openvino,format=yuv420p", ov.NeuralFilter);
+            Check("Intel with the provider: the plan says openvino, with no note", ov.NeuralDevice == "openvino" && ov.NeuralDeviceNote == null);
+            Check("Intel with the provider: the chain carries it", UpscaleEngine.BuildChain(ov).Contains("ort=model=" + X2() + ":device=openvino,format=yuv420p"));
+            SessionRecord ovRecord = UpscaleEngine.Describe(null, ov, ov.Status, ov.Reason);
+            Check("Intel with the provider: the record says openvino", ovRecord.NeuralDevice == "openvino" && ovRecord.NeuralDeviceNote == null);
+            Check("Intel with the provider: the summary says OpenVINO on the Intel GPU, asked for, and not CUDA",
+                ovRecord.Summary.Contains("OpenVINO provider on the Intel GPU (asked for, not measured for this chain") && !ovRecord.Summary.Contains("ONNX Runtime CUDA") && !ovRecord.Summary.Contains("CPU provider"), ovRecord.Summary);
+
+            // Intel, no provider: the CPU, asked for explicitly, with the reason.
+            UpscaleEngine.Plan cpu = DecideOn(NeuralMachine(false, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel without the provider: the node asks for cpu", "format=gbrpf32le,ort=model=" + X2() + ":device=cpu,format=yuv420p", cpu.NeuralFilter);
+            Check("Intel without the provider: the plan says cpu, and why", cpu.NeuralDevice == "cpu" && cpu.NeuralDeviceNote != null && cpu.NeuralDeviceNote.Contains("OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed"), cpu.NeuralDeviceNote);
+            SessionRecord cpuRecord = UpscaleEngine.Describe(null, cpu, cpu.Status, cpu.Reason);
+            Check("Intel without the provider: the summary says no CUDA, the CPU provider, and why",
+                cpuRecord.Summary.Contains("this server's GPU is Intel, so no CUDA and the CPU provider (the OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed"), cpuRecord.Summary);
+            Check("Intel without the provider: the record carries the note", cpuRecord.NeuralDevice == "cpu" && cpuRecord.NeuralDeviceNote == cpu.NeuralDeviceNote);
+
+            // Mixed box, Intel chosen: the Intel path, whichever node the NVIDIA card has.
+            UpscaleEngine.Plan mixedIntel = DecideOn(NeuralMachine(true, "renderD128", "0x10de", "renderD129", "0x8086"), NeuralSettings("intel", 0), 1280, 720, ask);
+            Check("mixed box, intel chosen, provider present: openvino", mixedIntel.NeuralDevice == "openvino" && mixedIntel.NeuralFilter.Contains(":device=openvino,"));
+
+            // Nothing neural ran: no device, no note, nothing in the record.
+            int probeCalls = 0;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => { probeCalls++; return true; };
+            UpscaleEngine.Plan plain = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, "upscale", "1080");
+            Check("Intel, no neural level: no device and no note", !plain.NeuralApplied && plain.NeuralDevice == null && plain.NeuralDeviceNote == null);
+            Equal("Intel, no neural level, no routing: the OpenVINO probe is not asked", "0", probeCalls.ToString());
+            DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, a neural level named: the probe is asked", "1", probeCalls.ToString());
+            DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Equal("Intel, NeuralMaxSourceHeight set: the probe is asked", "2", probeCalls.ToString());
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
+            SessionRecord plainRecord = UpscaleEngine.Describe(null, plain, plain.Status, plain.Reason);
+            Check("Intel, no neural level: the record has no device", plainRecord.NeuralDevice == null && plainRecord.NeuralDeviceNote == null && plainRecord.NeuralRouting == null);
+
+            // The filter text takes only the two values it knows: anything else is not put on a command line.
+            string path = X2();
+            foreach (string device in new[] { "cuda", "CPU", "openvino ", "cpu,format=yuv420p", "x:y", string.Empty, null })
+            {
+                string node = ShaderLibrary.NeuralFilter("realesr-anime-x2", 720, 1080, out _, NeuralSettings("auto", 0), device);
+                Equal("NeuralFilter ignores the device '" + device + "'", golden, node);
+            }
+
+            Equal("NeuralFilter takes cpu", "format=gbrpf32le,ort=model=" + path + ":device=cpu,format=yuv420p", ShaderLibrary.NeuralFilter("realesr-anime-x2", 720, 1080, out _, NeuralSettings("auto", 0), "cpu"));
+            Equal("NeuralFilter takes openvino", "format=gbrpf32le,ort=model=" + path + ":device=openvino,format=yuv420p", ShaderLibrary.NeuralFilter("realesr-anime-x2", 720, 1080, out _, NeuralSettings("auto", 0), "openvino"));
+
+            // The CUDA-native levels never go through the ort filter, so they have no device.
+            UpscaleSettings rig = RigSettings("auto");
+            UpscaleEngine.Plan dlpp = DecideOn(NeuralMachine(false, "renderD128", "0x10de"), rig, 1280, 720, "upscale", "1080", "neural", "dlpp-2");
+            Check("NVIDIA, dlpp-2: CUDA-native, no ort device", dlpp.UsesCudaNeural && dlpp.NeuralDevice == null);
+
+            // The provider file is there, but the patched ffmpeg has to list the device too. The real probe runs
+            // here against a stub binary beside the model directory, with no seam: one that lists openvino, one that does not.
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            UpscaleEngine.ResetOrtProbe();
+            string openvinoNode = "format=gbrpf32le,ort=model=" + X2() + ":device=openvino,format=yuv420p";
+            string cpuNode = "format=gbrpf32le,ort=model=" + X2() + ":device=cpu,format=yuv420p";
+
+            StubFfmpeg(listsOpenVino: false);
+            UpscaleEngine.Plan cold = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, probe not answered yet: the node asks for cpu, not openvino", cpuNode, cold.NeuralFilter);
+            Check("Intel, provider present, probe not answered yet: the note says it is not confirmed",
+                cold.NeuralDevice == "cpu" && cold.NeuralDeviceNote != null && cold.NeuralDeviceNote.Contains("has not been confirmed"), cold.NeuralDeviceNote);
+            UpscaleEngine.WarmOrtProbe().Wait();
+
+            UpscaleEngine.Plan stale = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, binary without openvino: the node asks for cpu", cpuNode, stale.NeuralFilter);
+            Check("Intel, provider present, binary without openvino: the note says rebuild with ORT_EP=openvino",
+                stale.NeuralDevice == "cpu" && stale.NeuralDeviceNote != null && stale.NeuralDeviceNote.Contains("no openvino device") && stale.NeuralDeviceNote.Contains("ORT_EP=openvino"), stale.NeuralDeviceNote);
+            SessionRecord staleRecord = UpscaleEngine.Describe(null, stale, stale.Status, stale.Reason);
+            Check("Intel, binary without openvino: the summary says CPU provider and why", staleRecord.Summary.Contains("the CPU provider (the patched ffmpeg's ort filter has no openvino device"), staleRecord.Summary);
+            UpscaleEngine.Plan staleRouted = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Check("Intel, binary without openvino, 480, 360p: no network is chosen, and it says why",
+                staleRouted.Act && !staleRouted.NeuralApplied && staleRouted.NeuralRouting != null
+                && staleRouted.NeuralRouting.Contains("no neural level was chosen") && staleRouted.NeuralRouting.Contains("no openvino device") && staleRouted.NeuralRouting.Contains("far from real time"), staleRouted.NeuralRouting);
+            UpscaleEngine.Plan nvidiaStale = DecideOn(NeuralMachine(true, "renderD128", "0x10de"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("NVIDIA, binary without openvino: the node is the one it always was", golden, nvidiaStale.NeuralFilter);
+
+            StubFfmpeg(listsOpenVino: true);
+            UpscaleEngine.ResetOrtProbe();
+            UpscaleEngine.WarmOrtProbe().Wait();
+            UpscaleEngine.Plan fresh = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, binary lists openvino: the node asks for openvino", openvinoNode, fresh.NeuralFilter);
+            Check("Intel, provider present, binary lists openvino: no note", fresh.NeuralDevice == "openvino" && fresh.NeuralDeviceNote == null);
+
+            // Without the provider file the binary is not asked at all: the CPU, for the provider reason.
+            UpscaleEngine.Plan noProvider = DecideOn(NeuralMachine(false, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Check("Intel, no provider file, binary lists openvino: still cpu, for the provider reason", noProvider.NeuralDevice == "cpu" && noProvider.NeuralDeviceNote.Contains("OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed"));
+
+            // A binary that takes seconds to answer: the session is planned at once on the CPU, with
+            // the probe left running in the background, and the answer is used once it lands.
+            StubFfmpeg(listsOpenVino: true, delaySeconds: 5);
+            UpscaleEngine.ResetOrtProbe();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            UpscaleEngine.Plan slow = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            clock.Stop();
+            Check("Intel, slow probe, cold cache: the plan does not wait for the binary (" + clock.ElapsedMilliseconds + " ms)", clock.ElapsedMilliseconds < 2000);
+            Equal("Intel, slow probe, cold cache: the node asks for cpu", cpuNode, slow.NeuralFilter);
+            Check("Intel, slow probe, cold cache: the note says it is not confirmed", slow.NeuralDevice == "cpu" && slow.NeuralDeviceNote != null && slow.NeuralDeviceNote.Contains("has not been confirmed"), slow.NeuralDeviceNote);
+            UpscaleEngine.WarmOrtProbe().Wait();
+            UpscaleEngine.Plan slowDone = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, slow probe answered: the node asks for openvino", openvinoNode, slowDone.NeuralFilter);
+
+            ResetNeuralHarness();
+        }
+
+        // A stand-in patched ffmpeg beside the model directory (where PatchedFfmpegPath looks) whose
+        // `-h filter=ort` prints the device list with or without openvino, after an optional delay.
+        // Moved into place, not written in place, so a process is never started from a file that is
+        // still open for writing.
+        private static void StubFfmpeg(bool listsOpenVino, int delaySeconds = 0)
+        {
+            string path = Path.Combine(NeuralRig(), "ffmpeg");
+            string temp = path + ".tmp";
+            string script = "#!/bin/sh\n"
+                + (delaySeconds > 0 ? "sleep " + delaySeconds + "\n" : string.Empty)
+                + "echo 'Filter ort'\n"
+                + "echo '  device <int> ..FV...... which device to run on (from 0 to 2) (default cuda)'\n"
+                + "echo '     cuda            0'\n"
+                + "echo '     cpu             1'\n"
+                + (listsOpenVino ? "echo '     openvino        2'\n" : string.Empty)
+                + "exit 0\n";
+            File.WriteAllText(temp, script);
+            File.SetUnixFileMode(temp, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.Move(temp, path, overwrite: true);
+        }
+
+        private static void ResetNeuralHarness()
+        {
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.DrmVulkanProbeSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.IntelOnnxMeasured = false;
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            UpscaleEngine.ResetOrtProbe();
+            File.Delete(Path.Combine(NeuralRig(), "ffmpeg"));
+            UpscaleEngine.Settings = new UpscaleSettings();
+        }
+
+        // The auto-picked level is looked up once per directory per TTL, not stat'ed on every plan.
+        private static void AutoNeuralCache()
+        {
+            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
+            int stats = 0;
+            var present = new HashSet<string>(StringComparer.Ordinal);
+            long now = 1000;
+            ShaderLibrary.WeightFileExistsSource = p => { stats++; return present.Contains(p); };
+            ShaderLibrary.AutoNeuralClockSource = () => now;
+            ShaderLibrary.ResetAutoNeuralCache();
+            try
+            {
+                var cfg = new UpscaleSettings { NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                present.Add(ShaderLibrary.NeuralModelPath("realesr-general-x4", cfg));
+
+                string first = ShaderLibrary.AutoNeuralLevel(cfg);
+                int afterFirst = stats;
+                Check("auto neural cache: the first lookup stats the weights and picks the cheapest installed", first == "realesr-general-x4" && afterFirst > 0, first + " stats=" + afterFirst);
+
+                for (int i = 0; i < 50; i++)
+                {
+                    ShaderLibrary.AutoNeuralLevel(cfg);
+                }
+
+                Check("auto neural cache: 50 further lookups inside the TTL stat nothing", stats == afterFirst, "stats=" + stats + " first=" + afterFirst);
+
+                present.Add(ShaderLibrary.NeuralModelPath("realesr-anime-x2", cfg));
+                Equal("auto neural cache: a weight installed inside the TTL is not seen yet", "realesr-general-x4", ShaderLibrary.AutoNeuralLevel(cfg));
+
+                now += 31000;
+                Equal("auto neural cache: past the TTL it looks again and sees it", "realesr-anime-x2", ShaderLibrary.AutoNeuralLevel(cfg));
+                Check("auto neural cache: past the TTL it did stat again", stats > afterFirst);
+
+                int before = stats;
+                var other = new UpscaleSettings { NeuralModelDirectory = "/nonexistent/auto-neural-cache-other" };
+                Check("auto neural cache: another directory is its own entry (none installed there)", ShaderLibrary.AutoNeuralLevel(other) == null && stats > before);
+
+                // Through the engine: planning a small source repeatedly stats the weights once.
+                before = stats;
+                UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+                UpscaleEngine.DrmVulkanProbeSource = n => true;
+                UpscaleEngine.Av1QsvProbeSource = _ => true;
+                UpscaleEngine.OrtOpenVinoProbeSource = () => true;
+                SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
+                var routed = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto", NeuralMaxSourceHeight = 480, NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                // A session that names the level never goes through the auto pick, so its stat count is
+                // the cost of planning alone; an auto-picked session must cost exactly the same.
+                DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080", "neural", "realesr-anime-x2");
+                int named = stats - before;
+                bool flat = true;
+                UpscaleEngine.Plan p = null;
+                for (int i = 0; i < 20; i++)
+                {
+                    before = stats;
+                    p = DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080");
+                    flat &= stats - before == named;
+                }
+
+                Check("auto neural cache: an auto-picked Decide stats no more files than one that names the level", flat && p.NeuralLevel == "realesr-anime-x2" && p.NeuralRouting != null && p.NeuralRouting.Contains("was chosen"), "named=" + named + " last=" + (stats - before) + " " + p.NeuralRouting);
+            }
+            finally
+            {
+                ShaderLibrary.WeightFileExistsSource = null;
+                ShaderLibrary.AutoNeuralClockSource = null;
+                ShaderLibrary.ResetAutoNeuralCache();
+                UpscaleEngine.EncoderListSource = null;
+                UpscaleEngine.DrmVulkanProbeSource = null;
+                UpscaleEngine.Av1QsvProbeSource = null;
+                UpscaleEngine.OrtOpenVinoProbeSource = null;
+                UpscaleEngine.Settings = new UpscaleSettings();
+            }
+        }
+
+        // NeuralMaxSourceHeight: what it does for each source height, and that 0 does nothing.
+        private static void NeuralRouting()
+        {
+            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.DrmVulkanProbeSource = n => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
+            SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
+
+            Equal("the setting defaults to 0 in the patcher mirror", "0", new UpscaleSettings().NeuralMaxSourceHeight.ToString());
+            Equal("the setting defaults to 0 in the plugin configuration", "0", new Jellyfin.Plugin.Plus.Configuration.PluginConfiguration().NeuralMaxSourceHeight.ToString());
+            var json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            Equal("settings JSON without it keeps 0", "0", JsonSerializer.Deserialize<UpscaleSettings>("{\"Enabled\":true}", json).NeuralMaxSourceHeight.ToString());
+            Equal("settings JSON carries it across the boundary", "480", JsonSerializer.Deserialize<UpscaleSettings>("{\"NeuralMaxSourceHeight\":480}", json).NeuralMaxSourceHeight.ToString());
+
+            FakeGpuEnvironment nvidia() => NeuralMachine(false, "renderD128", "0x10de");
+            FakeGpuEnvironment intelOv() => NeuralMachine(true, "renderD128", "0x8086");
+            FakeGpuEnvironment intelNoOv() => NeuralMachine(false, "renderD128", "0x8086");
+
+            foreach (var machine in new (string Name, System.Func<FakeGpuEnvironment> Env, string Device)[] { ("NVIDIA", nvidia, "cuda"), ("Intel with OpenVINO", intelOv, "openvino") })
+            {
+                string m = machine.Name + ": ";
+                string dev = machine.Device;
+
+                // 0 is no routing at all: a small source is not given a network, and a network asked for runs at any height.
+                UpscaleEngine.Plan p = DecideOn(machine.Env(), NeuralSettings("auto", 0), 640, 360, "upscale", "1080");
+                Check(m + "0: a 360p source is given no neural level", !p.NeuralApplied && p.NeuralRouting == null && p.NeuralRequested == "off");
+                p = DecideOn(machine.Env(), NeuralSettings("auto", 0), 1920, 1080, "upscale", "2160", "neural", "realesr-anime-x2");
+                Check(m + "0: a 1080p source asked for a network runs it, with nothing said about routing", p.NeuralApplied && p.NeuralLevel == "realesr-anime-x2" && p.NeuralRouting == null);
+
+                // Below, at, and above the line, nothing asked for.
+                foreach (int height in new[] { 240, 360, 480 })
+                {
+                    p = DecideOn(machine.Env(), NeuralSettings("auto", 480), height * 16 / 9, height, "upscale", "1080");
+                    Check(m + "480: a " + height + "p source is given the neural level", p.Act && p.NeuralApplied && p.NeuralLevel == "realesr-anime-x2" && p.NeuralDevice == dev, p.Status + " " + p.Reason + " " + p.NeuralRouting);
+                    Check(m + "480: a " + height + "p source: it says it was chosen, and nobody is recorded as asking", p.NeuralRequested == "off" && p.NeuralRouting != null && p.NeuralRouting.Contains("neural realesr-anime-x2 was chosen (the cheapest installed weight)") && p.NeuralRouting.Contains("NeuralMaxSourceHeight 480"), p.NeuralRouting);
+                }
+
+                foreach (int height in new[] { 481, 540, 720, 1080 })
+                {
+                    p = DecideOn(machine.Env(), NeuralSettings("auto", 480), height * 16 / 9, height, "upscale", "2160");
+                    Check(m + "480: a " + height + "p source takes the shader path", p.Act && !p.NeuralApplied && p.NeuralFilter == null && p.NeuralRouting == null, p.Status);
+                }
+
+                // A network asked for by the session: runs at or below the line, is dropped above it, and says so.
+                p = DecideOn(machine.Env(), NeuralSettings("auto", 480), 640, 360, "upscale", "1080", "neural", "realesr-general-x4");
+                Check(m + "480: a 360p source that asked for general-x4 runs it, with nothing said (nothing changed)", p.NeuralApplied && p.NeuralLevel == "realesr-general-x4" && p.NeuralRouting == null);
+                p = DecideOn(machine.Env(), NeuralSettings("auto", 480), 1280, 720, "upscale", "1080", "neural", "realesr-anime-x2");
+                Check(m + "480: a 720p source that asked for anime-x2 does not run it", p.Act && !p.NeuralApplied && p.NeuralFilter == null);
+                Equal(m + "480: a 720p source that asked for anime-x2: the reason", "neural realesr-anime-x2 NOT run: the source is 720p, taller than NeuralMaxSourceHeight 480, so the shader path ran", p.NeuralRouting);
+                Equal(m + "480: a 720p source that asked for anime-x2: still recorded as asked for", "realesr-anime-x2", p.NeuralRequested);
+                SessionRecord r = UpscaleEngine.Describe(null, p, p.Status, p.Reason);
+                Check(m + "480: the record and its summary say it", r.NeuralLevel == "off" && r.NeuralRequested == "realesr-anime-x2" && r.NeuralDevice == null && r.Summary.Contains("neural realesr-anime-x2 NOT run: the source is 720p") && !r.Summary.Contains("Neural SR"), r.Summary);
+
+                // The dashboard default is a network too.
+                UpscaleSettings dash = NeuralSettings("auto", 480);
+                dash.NeuralLevel = "realesr-general-x4";
+                p = DecideOn(machine.Env(), dash, 640, 360, "upscale", "1080");
+                Check(m + "480, dashboard general-x4: a 360p source runs it", p.NeuralApplied && p.NeuralLevel == "realesr-general-x4" && p.NeuralRouting == null);
+                p = DecideOn(machine.Env(), dash, 1280, 720, "upscale", "1080");
+                Check(m + "480, dashboard general-x4: a 720p source does not", !p.NeuralApplied && p.NeuralRouting != null && p.NeuralRouting.Contains("neural realesr-general-x4 NOT run"));
+
+                // Not chosen for a viewer who said no, who turned the upscale off, or when there is no upscale to enhance.
+                p = DecideOn(machine.Env(), NeuralSettings("auto", 480), 640, 360, "upscale", "1080", "neural", "off");
+                Check(m + "480: a viewer who chose neural Off gets none", !p.NeuralApplied && p.NeuralRouting == null);
+                p = DecideOn(machine.Env(), NeuralSettings("auto", 480), 640, 360, "upscale", "off");
+                Check(m + "480: a viewer who chose upscale Off is not enhanced", !p.Act && !p.NeuralApplied && p.NeuralRouting == null);
+                p = DecideOn(machine.Env(), NeuralSettings("auto", 480), 640, 360, "upscale", "360");
+                Check(m + "480: no upscale to apply, no network chosen", !p.Act && !p.NeuralApplied && p.NeuralRouting == null, p.Status);
+
+                // A source stored sideways is judged upright: 854x480 turned a quarter is a 854-tall picture.
+                GpuDetector.UseEnvironment(machine.Env());
+                UpscaleEngine.Settings = NeuralSettings("auto", 480);
+                p = UpscaleEngine.Decide(SessionJobAt(854, 480, 90, "upscale", "1080"));
+                Check(m + "480: 854x480 stored sideways is an 854p picture and takes the shader path", p.SourceHeight == 854 && !p.NeuralApplied && p.NeuralRouting == null);
+
+                // The master switch wins.
+                UpscaleSettings off = NeuralSettings("auto", 480);
+                off.NeuralAllowed = false;
+                p = DecideOn(machine.Env(), off, 640, 360, "upscale", "1080");
+                Check(m + "480, neural not allowed: nothing is chosen", !p.NeuralApplied && p.NeuralRouting == null);
+
+                // No weights installed: said, not silent, and nothing fails.
+                p = DecideOn(machine.Env(), NeuralSettings("auto", 480, weights: false), 640, 360, "upscale", "1080");
+                Check(m + "480, no weights: nothing is chosen, and it says why", p.Act && !p.NeuralApplied && p.NeuralRouting != null && p.NeuralRouting.Contains("none has its weights installed"), p.NeuralRouting);
+
+                // The probe key exists only when the setting is on.
+                UpscaleEngine.Settings = NeuralSettings("auto", 480);
+                GpuDetector.UseEnvironment(machine.Env());
+                JsonElement on = Probe();
+                Check(m + "480: the probe carries NeuralMaxSourceHeight 480", on.TryGetProperty("NeuralMaxSourceHeight", out JsonElement v) && v.GetInt32() == 480);
+                UpscaleEngine.Settings = NeuralSettings("auto", 0);
+                JsonElement zero = Probe();
+                Check(m + "0: the probe has no NeuralMaxSourceHeight key", !zero.TryGetProperty("NeuralMaxSourceHeight", out _));
+            }
+
+            // Only the ONNX levels are routed: a CUDA-native level on NVIDIA runs at any height, and says nothing.
+            UpscaleSettings cudaRig = RigSettings("auto");
+            cudaRig.NeuralMaxSourceHeight = 480;
+            foreach (int height in new[] { 360, 1080 })
+            {
+                UpscaleEngine.Plan p = DecideOn(nvidia(), cudaRig, height * 16 / 9, height, "upscale", "2160", "neural", "dlpp-2");
+                Check("NVIDIA, 480: dlpp-2 on a " + height + "p source is not routed", p.UsesCudaNeural && p.NeuralApplied && p.NeuralRouting == null, p.Status + " " + p.Reason);
+            }
+
+            // A game upscaler in force on NVIDIA: no network is chosen on top of it.
+            UpscaleSettings game = NeuralSettings("auto", 480);
+            game.GameLevel = "dlss";
+            UpscaleEngine.Plan g = DecideOn(nvidia(), game, 640, 360, "upscale", "1080");
+            Check("NVIDIA, 480, a game upscaler as the default: no network is chosen beside it", !g.NeuralApplied && g.NeuralRouting == null);
+            g = DecideOn(nvidia(), NeuralSettings("auto", 480), 640, 360, "upscale", "1080", "game", "dlss");
+            Check("NVIDIA, 480, the session asks for dlss: no network is chosen beside it", !g.NeuralApplied && g.NeuralRouting == null);
+
+            // Intel without the provider: nothing is chosen for the viewer, said plainly; a named level still runs, on the CPU.
+            UpscaleEngine.Plan q = DecideOn(intelNoOv(), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Check("Intel without OpenVINO, 480, 360p: no network is chosen", q.Act && !q.NeuralApplied && q.NeuralFilter == null);
+            Check("Intel without OpenVINO: it says the provider is missing and that the CPU is not real time",
+                q.NeuralRouting != null && q.NeuralRouting.Contains("no neural level was chosen") && q.NeuralRouting.Contains("OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed") && q.NeuralRouting.Contains("far from real time"), q.NeuralRouting);
+            SessionRecord qr = UpscaleEngine.Describe(null, q, q.Status, q.Reason);
+            Check("Intel without OpenVINO: the summary carries it", qr.Summary.Contains("no neural level was chosen") && qr.NeuralRouting == q.NeuralRouting, qr.Summary);
+            q = DecideOn(intelNoOv(), NeuralSettings("auto", 480), 640, 360, "upscale", "1080", "neural", "realesr-anime-x2");
+            Check("Intel without OpenVINO, 480, 360p, anime-x2 asked for by name: it runs, on the CPU, with the reason",
+                q.NeuralApplied && q.NeuralDevice == "cpu" && q.NeuralFilter.Contains(":device=cpu,") && q.NeuralDeviceNote != null && q.NeuralRouting == null);
+            q = DecideOn(intelNoOv(), NeuralSettings("auto", 480), 1280, 720, "upscale", "1080", "neural", "realesr-anime-x2");
+            Check("Intel without OpenVINO, 480, 720p, anime-x2 asked for: dropped like any other server's", !q.NeuralApplied && q.NeuralRouting != null && q.NeuralRouting.Contains("NOT run: the source is 720p"));
+
+            // The Intel session, end to end: a 360p source, OpenVINO, the whole command line.
+            UpscaleEngine.Plan e2e = DecideOn(intelOv(), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            string chain = UpscaleEngine.BuildChain(e2e);
+            Check("Intel, 480, 360p: the chain runs the network on OpenVINO before the upload", chain.Contains("format=gbrpf32le,ort=model=" + X2() + ":device=openvino,format=yuv420p") && chain.IndexOf("ort=", StringComparison.Ordinal) < chain.IndexOf("hwupload", StringComparison.Ordinal), chain);
+            Check("Intel, 480, 360p: and never CUDA, nvenc or vaapi", !chain.Contains("cuda") && !chain.Contains("nvenc") && !chain.Contains("vaapi"), chain);
+
+            ResetNeuralHarness();
         }
 
         private static bool WaitUntil(Func<bool> condition)
