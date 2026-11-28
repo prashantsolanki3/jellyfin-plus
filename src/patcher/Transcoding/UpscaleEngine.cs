@@ -1871,7 +1871,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// Intel only. A short source (below IntelLowResMaxSourceHeight) with an FSRCNNX level runs the
         /// network to round_even(source * scale) and a bicubic scale finishes the job, because the
         /// network's fixed 2x output shrunk to a far larger target by libplacebo measured worse than
-        /// this (bench run22, +1.08 dB at 360p). Sets nothing, and so changes no chain, when the GPU is not
+        /// this (measured +1.08 dB at 360p). Sets nothing, and so changes no chain, when the GPU is not
         /// a detected Intel one, a neural or game pass ran (fsr2 and dlss hand libplacebo a target-size
         /// frame), the SR level is not an FSRCNNX one or the intermediate size would not be below the target.
         /// </summary>
@@ -3203,7 +3203,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>
         /// The reason a level is not run on a detected Intel GPU ("needs NVIDIA", or for fsr2 on a build made for
         /// Intel, its start-up check; "not measured on Intel" for the ONNX levels), or null when it is. The ONNX
-        /// levels stay withheld until the admin sets IntelNeuralAllowed (off by default): bench run22 measured
+        /// levels stay withheld until the admin sets IntelNeuralAllowed (off by default): the bench measured
         /// about 1.4 fps at 360p and 0.5 fps at 720p on an A380, even though PR 5's OpenVINO path is present.
         /// </summary>
         internal static string IntelWithholdReason(string axis, string level)
