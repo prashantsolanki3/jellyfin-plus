@@ -817,7 +817,9 @@
             }
 
             // The levels this server's GPU does not offer, as the server reports them (axis -> level
-            // -> reason): only an Intel server sends any. Nothing is said otherwise.
+            // -> the server's own reason: needs NVIDIA, or for fsr2 on a build made for Intel, a
+            // start-up check that has not passed): only an Intel server sends any. Nothing is said
+            // otherwise, and no reason is written here.
             function withheldText(w) {
                 if (!w) { return ''; }
                 var items = [];

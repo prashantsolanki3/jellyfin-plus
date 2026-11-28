@@ -25,6 +25,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             GpuDetector.Start();
             UpscaleEngine.WarmDevices();
             UpscalePatches.Apply(logger as ILogger);
+            UpscaleEngine.StartFsr2Probe();
 
             // Off this thread: the encoder list and the AV1 test encode are ffmpeg runs, and the
             // capability record and the transcode path only read what they leave behind.

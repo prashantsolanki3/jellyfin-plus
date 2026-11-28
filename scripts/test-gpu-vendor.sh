@@ -38,6 +38,11 @@
 #     device=openvino is asked for only when a stub patched ffmpeg's `-h filter=ort` lists it,
 #     else device=cpu with a rebuild note (the real probe runs, off the request path).
 #     The C side of the filter is scripts/test-vf-ort.sh (compile check and provider calls), not this.
+#   - (PR 6) the fsr2-nocuda marker counts only for a detected Intel GPU, and only with a passing one-frame
+#     fsr2 probe (a fake one here, never run on an NVIDIA or no-GPU box, retried after its TTL when it
+#     fails); with both fsr2 (not dlss or dlaa) is offered and runs on Intel and the record says the motion
+#     vectors are zero, without them all three stay withheld, and an NVIDIA machine is unchanged. The C
+#     side is scripts/test-gu-inputs.sh.
 #
 # Exit status: 0 every check passed, 1 a check failed, 2 the harness could not be built.
 set -uo pipefail
