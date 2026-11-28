@@ -11,16 +11,22 @@
  *   s      state.lastServerState (or null)
  *   act    { key: 'waiting'|'unavailable'|'off'|'active', label, why }  from activeState()
  *
- * Returns { show, key, text, title }. text is the full wording: the chip clips it with CSS and
- * puts the same words in its tooltip, so nothing is lost to the clipping.
+ *   link   linkProfile(): { noDirectPlay, enhanceOff, kbps } (optional). It is the CLIENT's own
+ *          decision, so it is worded as the client's (`note`), apart from the server's text.
+ *
+ * Returns { show, key, text, title, note }. text is the full wording: the chip clips it with CSS
+ * and puts the same words in its tooltip, so nothing is lost to the clipping. note is the slow-link
+ * reason ('' when the link changes nothing) and does not depend on `show`.
  */
+import { linkNote } from './link-profile.js';
 
 // The server says this when a record exists but no pass ran and there is nothing to add.
 var GENERIC = 'No enhancement';
 
-export function badgeModel(caps, s, act) {
+export function badgeModel(caps, s, act, link) {
+    var note = linkNote(link);
     if (!caps || !caps.full || !act) {
-        return { show: false, key: 'hidden', text: '', title: '' };
+        return { show: false, key: 'hidden', text: '', title: '', note: note };
     }
 
     var summary = s && typeof s.Summary === 'string' ? s.Summary.trim() : '';
@@ -38,5 +44,5 @@ export function badgeModel(caps, s, act) {
         text = act.label;
     }
 
-    return { show: true, key: act.key, text: text, title: title };
+    return { show: true, key: act.key, text: text, title: title, note: note };
 }

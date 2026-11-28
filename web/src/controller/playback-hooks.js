@@ -6,6 +6,8 @@ import { el } from '../lib/dom.js';
 import { player } from './live-apply.js';
 import { probeServer } from './probe.js';
 import { fetchServerState } from './live-block.js';
+import { linkProfile } from './link-probe.js';
+import { linkNote } from '../model/link-profile.js';
 import {
     closePanel, ensureStyle, renderPanel, panelEl, applyPanelPos, liveRows, FOCUSABLE, PANEL_ID, mountPanel
 } from '../view/panel-dom.js';
@@ -308,9 +310,14 @@ function maybeAnnotate(dialog) {
         dialog.__jellyfinPlusAnnotated = true;
         fetchServerState().then(function (s) {
             try {
-                if (!s) {
-                    return;
-                }
+                var makeRow = function (label, value) {
+                    var row = el(shape.rowTag, shape.rowClass);
+                    // textContent throughout: the record carries a media filename, and this
+                    // is a dialog built by somebody else.
+                    row.appendChild(el(shape.labelTag, shape.labelClass, 'Enhance - ' + label));
+                    row.appendChild(el(shape.valueTag, shape.valueClass, value));
+                    return row;
+                };
 
                 // The same rows the panel shows, from the SESSION RECORD: the sizes, the
                 // passes that ran, the ones asked for that did not, the bypass and why, the
@@ -320,14 +327,14 @@ function maybeAnnotate(dialog) {
                 // The stale-selection line is the one row that is about the panel rather than
                 // about the stream, and it says "the selections above", which is meaningless
                 // in a dialog that has none. It stays in the panel.
-                var rows = liveRows(function (label, value) {
-                    var row = el(shape.rowTag, shape.rowClass);
-                    // textContent throughout: the record carries a media filename, and this
-                    // is a dialog built by somebody else.
-                    row.appendChild(el(shape.labelTag, shape.labelClass, 'Enhance - ' + label));
-                    row.appendChild(el(shape.valueTag, shape.valueClass, value));
-                    return row;
-                }, ['Not this selection']);
+                var rows = s ? liveRows(makeRow, ['Not this selection']) : [];
+
+                // The client's own slow-link decision, named as such; it needs no server record.
+                var note = linkNote(linkProfile());
+                if (note) { rows.push(makeRow('Connection', note)); }
+                if (!rows.length) {
+                    return;
+                }
 
                 rows.forEach(function (row) { shape.host.appendChild(row); });
                 log('annotated playback info with', rows.length, 'rows');
