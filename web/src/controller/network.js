@@ -40,10 +40,11 @@ function markSuggestions(url) {
  */
 export function wireParams() {
     log('wireParams: start');
-    // Slow link (link-probe.js): every axis off, sent explicitly, whatever the panel holds - a
-    // missing axis makes the server fall back to its dashboard default and enhance anyway, and
-    // on a seek Jellyfin rebuilds the command from the segment request, so it must carry them too.
-    if (linkProfile().slow) {
+    // Thin link with no explicit Enhance choice (link-probe.js): every axis off, sent explicitly
+    // - a missing axis makes the server fall back to its dashboard default and enhance anyway,
+    // and on a seek Jellyfin rebuilds the command from the segment request, so it must carry
+    // them too. A viewer's own choice never reaches here: it is sent as picked.
+    if (linkProfile().enhanceOff) {
         var off = {};
         ['upscale', 'deblur', 'denoise', 'sr', 'deblock', 'neural', 'game'].forEach(function (k) { off[k] = 'off'; });
         if (state.swapFrom) {
@@ -322,23 +323,22 @@ function rewriteBody(bodyText) {
  * This is only done when the viewer actually asked for enhancement - otherwise direct play is
  * left alone, because forcing a transcode nobody asked for would burn GPU for nothing.
  */
-/* Rewrite PlaybackInfo when the viewer asked for enhancement OR the link is slow. */
+/* Rewrite PlaybackInfo when the viewer asked for enhancement OR the link rules out direct play. */
 function wantsRewrite() {
-    return anyEnhancement() || linkProfile().slow;
+    return anyEnhancement() || linkProfile().noDirectPlay;
 }
 
 function forceTranscodeUrl(url) {
     var link = linkProfile();
-    if (url && link.slow) {
-        // Slow link: no direct play and a bitrate cap; no forced transcode for enhancement,
-        // since enhancement is off on this link (wireParams).
-        var slow = slowUrl(url, link.kbps);
-        log('forceTranscodeUrl: slow link, ' + url + ' -> ' + slow);
-        return slow;
+    if (url && link.noDirectPlay) {
+        // Slow link: no direct play and a bitrate cap. Enhancement that is still on (a chosen
+        // stage, or a link with throughput to spare) also needs direct stream off.
+        url = slowUrl(url, link.kbps);
+        log('forceTranscodeUrl: slow link, -> ' + url);
     }
 
     if (!url || !anyEnhancement()) {
-        log('forceTranscodeUrl: start/end, nothing to do (no url or nothing enhancing)');
+        log('forceTranscodeUrl: start/end, nothing more to do (no url or nothing enhancing)');
         return url;
     }
 
@@ -358,31 +358,32 @@ function forceTranscodeUrl(url) {
 
 function forceTranscodeBody(bodyText) {
     var link = linkProfile();
-    if (link.slow) {
-        var slow = slowBody(bodyText, link.kbps);
+    var slow = null;
+    if (link.noDirectPlay) {
+        slow = slowBody(bodyText, link.kbps);
         log('forceTranscodeBody: slow link, body ' + (slow ? 'rewritten (no direct play, cap ' + link.kbps + ' kbps)' : 'unchanged'));
-        return slow;
+        if (slow) { bodyText = slow; }
     }
 
     if (!anyEnhancement()) {
-        return null;
+        return slow;
     }
 
     try {
         if (typeof bodyText !== 'string' || !bodyText) {
             log('forceTranscodeBody: end, no body text to rewrite');
-            return null;
+            return slow;
         }
 
         var body = JSON.parse(bodyText);
         if (!body || typeof body !== 'object') {
             log('forceTranscodeBody: end, body did not parse to an object');
-            return null;
+            return slow;
         }
 
         if (body.EnableDirectPlay === false && body.EnableDirectStream === false) {
             log('forceTranscodeBody: end, already forced (EnableDirectPlay/Stream already false)');
-            return null;
+            return slow;
         }
 
         body.EnableDirectPlay = false;
@@ -391,7 +392,7 @@ function forceTranscodeBody(bodyText) {
         return JSON.stringify(body);
     } catch (err) {
         log('forceTranscodeBody: end, could not rewrite PlaybackInfo request body', err);
-        return null;
+        return slow;
     }
 }
 

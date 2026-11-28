@@ -20,13 +20,17 @@ function pref() {
     try { return window.localStorage.getItem(PREF_KEY); } catch (e) { return null; }
 }
 
-/* The profile in force now: { slow, kbps }. Never throws. */
+/*
+ * The profile in force now: { noDirectPlay, enhanceOff, kbps }. Never throws.
+ * An Enhance stage other than Automatic is the viewer's explicit choice for this playback (the
+ * stage goes back to 'unset' on every new item, playback-hooks.js), and it is sent as picked.
+ */
 export function linkProfile() {
     try {
         var l = state.link;
-        return classify(l ? l.rtt : null, l ? l.mbps : null, pref());
+        return classify(l ? l.rtt : null, l ? l.mbps : null, pref(), state.stage !== 'unset');
     } catch (e) {
-        return { slow: false, kbps: 0 };
+        return { noDirectPlay: false, enhanceOff: false, kbps: 0 };
     }
 }
 
@@ -83,7 +87,8 @@ function probe() {
             state.link = { rtt: Math.round(ms), mbps: tp.mbps == null ? null : Math.round(tp.mbps * 10) / 10, at: Date.now() };
             var p = linkProfile();
             log('link probe: rtt ' + state.link.rtt + ' ms, ' + state.link.mbps + ' Mbps -> '
-                + (p.slow ? 'slow, cap ' + p.kbps + ' kbps' : 'fast'));
+                + (p.noDirectPlay ? 'no direct play, cap ' + p.kbps + ' kbps' : 'fast')
+                + (p.enhanceOff ? ', enhancement off' : ''));
         });
     }).catch(function (err) {
         log('link probe failed', err);
