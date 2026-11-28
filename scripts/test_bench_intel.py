@@ -15,7 +15,7 @@ Needs no GPU, ffmpeg, docker, network or Jellyfin. It runs the real scripts/benc
     the API rows PASS on a good server and FAIL on a failing one, the token stays off curl's command
     line, rows 1 and 12 read only the shim-log lines of this run, row 6 sets and restores the plugin
     configuration, row 5 reads the device of its own stream, the gates read HHMM as decimal;
-  - a row scores only files its own run wrote (rev-hxlit): a fresh run-<id> directory per run, a used id
+  - a row scores only files its own run wrote: a fresh run-<id> directory per run, a used id
     refused, any failed write a FAIL, a missing or old scored file a FAIL;
   - scripts/plugin-meta.sh holds the plugin GUID and target ABI once (Plugin.cs and manifest.json agree);
   - docker/intel/Dockerfile keeps its pins (base digest, SDK sha512), builds the Intel
@@ -54,7 +54,7 @@ RUN = f"{OUT}/run-plan"  # a dry run's fresh per-run directory (BENCH_RUN_ID=pla
 
 
 def shader(w, h):
-    # libplacebo writes yuv420p and the frame is downloaded as is: the RGBA tail it replaced cost ~18 dB (rev-8j46u)
+    # libplacebo writes yuv420p and the frame is downloaded as is: the RGBA tail it replaced cost ~18 dB
     return (f"format=yuv420p,hwupload,libplacebo=w={w}:h={h}:upscaler=ewa_lanczos:custom_shader_path={SHADER}:"
             f"{YUV_END}")
 
@@ -79,7 +79,7 @@ def shader_bicubic(mw, mh, w, h):
 
 # the 360p fixture is not on disk in a dry run, so the plan takes the nominal 640x360: 2x is 1280x720, 1.5x is 960x540
 ALTS = ("ewa", "x2-bicubic", "lowtarget")
-# the tail the bench and production used until rev-8j46u: every chain that carries it is a regression
+# the tail the bench and production used before the yuv420p fix: every chain that carries it is a regression
 RGBA_TAIL = "format=rgba,hwdownload,format=rgba"
 FSR2_CHAIN = ("format=yuv420p,format=gbrpf32le,fsr2=w=1920:h=1080,format=yuv420p,hwupload,"
               f"libplacebo=w=1920:h=1080:{YUV_END}")
@@ -124,7 +124,7 @@ TITLES = {
     8: "fsr2 without CUDA, moving content",
     9: "Hardware decode off/on",
     10: "QSV encode",
-    11: "Contention with one Plex hardware transcode",
+    11: "Contention with another hardware transcode on the same GPU",
     12: "Client, headless",
     13: "Client, human",
 }
@@ -141,7 +141,7 @@ MUST = {
     8: ["panning cut >= bicubic", "not a blocker"],
     9: ["H.264", "-hwaccel vaapi", "hwmap=derive_device=vulkan", "Conversion failed!", ">=30% lower", ">=50dB"],
     10: ["h264_qsv/hevc_qsv", "encoderSessions", "+-10 points", "visible to the bench pod"],
-    11: ["fps>=36", "Plex hardware transcode"],
+    11: ["fps>=36", "another hardware transcode runs on the same GPU"],
     12: ["target height", "QSV codec"],
     13: ["window.__jellyfinPlus.installed===true", "no stall over 2s"],
 }
@@ -155,7 +155,7 @@ THRESHOLD = {
     8: "plan: row 8 threshold: xpsnr(fsr2)>=xpsnr(bicubic)",
     9: "plan: row 9 threshold: cpu gain>=30% xpsnr(on,off)>=50dB no 'Conversion failed!'",
     10: "plan: row 10 threshold: |load - fdinfo| <= 10 points",
-    11: "plan: row 11 threshold: fps>=36 with BENCH_PLEX_TRANSCODING=1",
+    11: "plan: row 11 threshold: fps>=36 with BENCH_CONTENTION=1",
 }
 
 EXACT = [
@@ -223,6 +223,8 @@ def clean_env(extra=None, path=None):
     # no render node in sight: the script falls back to renderD128, so the plan goldens do not depend on the host's GPUs
     env["BENCH_SYSFS_DRM"] = "/nonexistent/sys-class-drm"
     env["BENCH_DRI_DIR"] = "/nonexistent/dev-dri"
+    # the script's own default is ./clips; the goldens are written against /clips (test_defaults pops this to prove ./clips)
+    env["BENCH_CLIPS"] = "/clips"
     env.update(extra or {})
     return env
 
@@ -313,6 +315,13 @@ def test_plan_and_refusals(tmp):
     rc, out6, _ = run(BENCH, ["--dry-run", "--rows", "9"], clean_env({"BENCH_CLIPS": clips}))
     check("an H.264 clip in the clips dir is the row 9 source and nothing is cut",
           rc == 0 and "row 9 prep cmd" not in out6 and f"-i {clips}/tears_1080p_h264.mkv " in out6 and "tears_1080p.mkv " not in out6, out6)
+
+    env = clean_env()
+    env.pop("BENCH_CLIPS")
+    rc, out7, _ = run(BENCH, ["--dry-run"], env)
+    check("BENCH_CLIPS defaults to ./clips and BENCH_OUT follows it",
+          rc == 0 and "clips: ./clips (tears); out: ./clips/bench-out;" in out7 and "-i ./clips/tears_360p.mkv " in out7
+          and " /clips" not in out7, out7)
 
     rc, out5, _ = run(BENCH, ["--list"])
     check("--list names 13 rows", rc == 0 and len(out5.splitlines()) == 13)
@@ -935,8 +944,16 @@ def test_mutants(tmp):
         ("row-gate-no-skip", 'record "$r" SKIP "$HOLD_WHY"; continue;', ':;', row_gate_failures),
         ("row-gate-budget-ignored", "if (( WAIT_SPENT_MIN >= BLOCK_WAIT_TOTAL_MAX_MIN )); then", "if false; then", row_gate_failures),
         ("row-gate-budget-not-counted", "WAIT_SPENT_MIN=$((WAIT_SPENT_MIN + 1))", ":", row_gate_failures),
-        ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
-        ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
+        ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Europe/Berlin date", window_failures),
+        ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-}"', 'BLOCK_WINDOWS=""', window_failures),
+        ("windows-default-set", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-}"', 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', window_failures),
+        ("tz-default-local", 'BLOCK_TZ="${BENCH_TZ:-UTC}"', 'BLOCK_TZ="${BENCH_TZ:-Europe/Berlin}"', window_failures),
+        ("empty-windows-refused", '[[ -n "$BLOCK_WINDOWS" ]] || return 0\n', '', window_failures),
+        ("empty-windows-read-date", '(( ${#BLOCK_LO[@]} > 0 )) || return 1\n', '', window_failures),
+        ("whitespace-windows-accepted", '[[ -n "$BLOCK_WINDOWS" ]] || return 0', '[[ -n "${BLOCK_WINDOWS// /}" ]] || return 0', window_failures),
+        ("contention-alias-ignored", 'CONTENTION="${BENCH_CONTENTION:-${BENCH_PLEX_TRANSCODING:-}}"', 'CONTENTION="${BENCH_CONTENTION:-}"', contention_failures),
+        ("contention-main-ignored", 'CONTENTION="${BENCH_CONTENTION:-${BENCH_PLEX_TRANSCODING:-}}"', 'CONTENTION="${BENCH_PLEX_TRANSCODING:-}"', contention_failures),
+        ("contention-always-on", '[[ "$CONTENTION" == 1 ]] ||', ':', contention_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
         ("run-fps-lost-failure", '|| { rc=$?; keep_log "$log"; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
         ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"',
@@ -1432,6 +1449,8 @@ def test_webinject_without_dpkg_package(tmp):
     check("--restore-conffile exits 0 when dpkg-query fails", rc == 0, f"rc={rc} err={err!r}")
 
 
+# the script has no blocked window by default: the clock cases name theirs
+GATE_WINDOWS = "0100-0700,1630-1830"
 GATE_CASES = [("0830", True), ("0900", True), ("0700", True), ("1200", True), ("1830", True),
               ("0158", False), ("0100", False), ("0130", False), ("1630", False), ("1700", False)]
 PSI_OK = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
@@ -1439,7 +1458,7 @@ PSI_HOT = PSI_OK.replace("avg60=0.00", "avg60=5.00", 1)
 
 
 # (BENCH_BLOCK_WINDOWS, clock, open?): half-open [start,end), bounds read as decimal (0830 and 0900 are
-# invalid octal), and the owner's real night window ends at 0415.
+# invalid octal), and a night window may end at 0415.
 WINDOW_CASES = [("0100-0415,1630-1830", "0414", False), ("0100-0415,1630-1830", "0415", True),
                 ("0100-0415,1630-1830", "0100", False), ("0100-0415,1630-1830", "0700", True),
                 ("0100-0415,1630-1830", "0059", True), ("0100-0415,1630-1830", "1629", True),
@@ -1475,7 +1494,7 @@ def gate_failures(script, tmp, tag):
     open(psi, "w").write(PSI_OK)
     open(hot, "w").write(PSI_HOT)
     for hm, ok in GATE_CASES:
-        got = gate_run(script, w, hm, psi)[0]
+        got = gate_run(script, w, hm, psi, GATE_WINDOWS)[0]
         if got != ("open" if ok else "closed"):
             bad.append(f"{hm}:{'open' if ok else 'closed'}-but-{got}")
     for windows, hm, ok in WINDOW_CASES:
@@ -1589,43 +1608,59 @@ def row_gate_failures(script, tmp, tag):
     res = results(out)
     if n != 0 or any(res.get(r, ("", ""))[0] != "SKIP" or "wait budget spent" not in res.get(r, ("", ""))[1] for r in (2, 3)):
         bad.append(f"budget-zero:{n}:{res}")
+
+    # 10. an empty window list: a clock that would sit inside a window never holds a row
+    rc, out, err, n = row_gate_run(script, w, "nowin", ["0200", "0200", "0200"], "2,3", windows="")
+    res = results(out)
+    if "waiting" in out or n != 0 or rc == 2 or any(res.get(r, ("SKIP",))[0] == "SKIP" for r in (2, 3)):
+        bad.append(f"nowin:{rc}:{n}:{res}")
     return bad
 
 
 BAD_WINDOWS = ["abc", "0100-0700,", ",0100-0700", "0100-0700,,1630-1830", "100-700", "0100", "0100-", "-0700",
                "2500-2600", "0160-0700", "0100-0760", "0100-2401", "2400-2400", "0700-0100", "0100-0100",
-               "01:00-07:00", "0100-0700 1630-1830", "0100-0700, 1630-1830", "0100-0700;1630-1830", "0100–0700"]
-BAD_TZ = ["Australia Melbourne", "Australia/Melbourne;date", "$(date)", "Aus*", "Australia\\Melbourne"]
+               "01:00-07:00", "0100-0700 1630-1830", "0100-0700, 1630-1830", "0100-0700;1630-1830", "0100–0700",
+               " ", "   "]
+BAD_TZ = ["Europe Berlin", "Europe/Berlin;date", "$(date)", "Eur*", "Europe\\Berlin"]
 
 
 def window_failures(script, tmp, tag):
     """What BENCH_BLOCK_WINDOWS and BENCH_TZ get wrong beyond the clock cases (empty = right): the plan
-    line, the zone handed to date, the refusal of malformed values in --dry-run and in a real run."""
+    line, the zone handed to date, no gate or date read without a window, the refusal of malformed
+    non-empty values in --dry-run and in a real run."""
     bad = []
     w = World(tmp, tag)
     psi = os.path.join(w.root, "psi")
     open(psi, "w").write(PSI_OK)
-    tail = "memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump"
+    tail = "memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no other hardware transcode"
+    none = "plan: gates: no blocked clock window; " + tail
 
     for extra, want in [
-        ({}, "plan: gates: window outside 01:00-07:00 and 16:30-18:30 Australia/Melbourne; " + tail),
-        ({"BENCH_BLOCK_WINDOWS": ""}, "plan: gates: window outside 01:00-07:00 and 16:30-18:30 Australia/Melbourne; " + tail),
-        ({"BENCH_BLOCK_WINDOWS": "0100-0415,1630-1830", "BENCH_TZ": "Australia/Adelaide"},
-         "plan: gates: window outside 01:00-04:15 and 16:30-18:30 Australia/Adelaide; " + tail),
-        ({"BENCH_BLOCK_WINDOWS": "0830-0900"}, "plan: gates: window outside 08:30-09:00 Australia/Melbourne; " + tail),
+        ({}, none),
+        ({"BENCH_BLOCK_WINDOWS": ""}, none),
+        ({"BENCH_BLOCK_WINDOWS": GATE_WINDOWS}, "plan: gates: window outside 01:00-07:00 and 16:30-18:30 UTC; " + tail),
+        ({"BENCH_BLOCK_WINDOWS": "0100-0415,1630-1830", "BENCH_TZ": "Europe/Berlin"},
+         "plan: gates: window outside 01:00-04:15 and 16:30-18:30 Europe/Berlin; " + tail),
+        ({"BENCH_BLOCK_WINDOWS": "0830-0900"}, "plan: gates: window outside 08:30-09:00 UTC; " + tail),
     ]:
         rc, out, err = run(script, ["--dry-run"], dict(w.env, **extra))
         if rc != 0 or not any(l.startswith(want) for l in out.splitlines()):
             bad.append(f"plan:{extra}:rc{rc}")
 
     log = os.path.join(w.root, "tz.log")
-    for extra, zone in [({}, "Australia/Melbourne"), ({"BENCH_TZ": "Australia/Adelaide"}, "Australia/Adelaide"),
-                        ({"BENCH_TZ": ""}, "Australia/Melbourne")]:
+    for extra, zone in [({}, "UTC"), ({"BENCH_TZ": "Europe/Berlin"}, "Europe/Berlin"), ({"BENCH_TZ": ""}, "UTC")]:
         open(log, "w").close()
-        got, err = gate_run(script, w, "0200", psi, FAKE_TZ_LOG=log, **extra)
+        got, err = gate_run(script, w, "0200", psi, GATE_WINDOWS, FAKE_TZ_LOG=log, **extra)
         zones = open(log).read().split()
         if got != "closed" or zones != [zone] or zone not in err:
             bad.append(f"tz:{extra}:{got}:{zones}")
+
+    # no window (unset or empty): the gate is open at any clock, `date` is never read, and a zone alone gates nothing
+    for windows, extra in [(None, {}), ("", {}), (None, {"BENCH_TZ": "Europe/Berlin"})]:
+        open(log, "w").close()
+        got, err = gate_run(script, w, "0200", psi, windows, FAKE_TZ_LOG=log, **extra)
+        if got != "open" or open(log).read().split():
+            bad.append(f"nowindow:{windows!r}:{extra}:{got}")
 
     for windows in BAD_WINDOWS:
         rc, out, err = run(script, ["--dry-run"], dict(w.env, BENCH_BLOCK_WINDOWS=windows))
@@ -1647,7 +1682,7 @@ def window_failures(script, tmp, tag):
 def runfps_failures(script, tmp, tag):
     """A failed ffmpeg run must reach the FAIL branch of rows 2 and 11; a good one must still pass row 11."""
     bad = []
-    w = World(tmp, tag, extra={"BENCH_JELLYFIN_TOKEN": "", "BENCH_PLEX_TRANSCODING": "1"})
+    w = World(tmp, tag, extra={"BENCH_JELLYFIN_TOKEN": "", "BENCH_CONTENTION": "1"})
     rc, out, err = w.run(["--rows", "2,11"], script=script, FAKE_FFMPEG_FAIL="1")
     res = results(out)
     for row in (2, 11):
@@ -1658,6 +1693,28 @@ def runfps_failures(script, tmp, tag):
     st, detail = results(out).get(11, ("", ""))
     if st != "PASS" or "fps=120" not in detail:
         bad.append(f"row11-good:{st}:{detail[:40]}")
+    return bad
+
+
+def contention_failures(script, tmp, tag):
+    """Row 11 runs when BENCH_CONTENTION=1 or its alias BENCH_PLEX_TRANSCODING=1 is set, and is SKIP naming the main
+    variable when neither is (empty = right)."""
+    bad = []
+    w = World(tmp, tag, extra={"BENCH_JELLYFIN_TOKEN": ""})
+    for label, extra, want in [
+        ("main", {"BENCH_CONTENTION": "1"}, "PASS"),
+        ("alias", {"BENCH_PLEX_TRANSCODING": "1"}, "PASS"),
+        ("both", {"BENCH_CONTENTION": "1", "BENCH_PLEX_TRANSCODING": "1"}, "PASS"),
+        ("main-empty-alias-set", {"BENCH_CONTENTION": "", "BENCH_PLEX_TRANSCODING": "1"}, "PASS"),
+        ("neither", {}, "SKIP"),
+        ("main-zero", {"BENCH_CONTENTION": "0"}, "SKIP"),
+    ]:
+        rc, out, err = w.run(["--rows", "11"], script=script, **extra)
+        st, detail = results(out).get(11, ("", ""))
+        if st != want:
+            bad.append(f"{label}:{st}:{detail[:60]}")
+        if want == "SKIP" and ("BENCH_CONTENTION=1" not in detail or "another hardware transcode" not in detail):
+            bad.append(f"{label}:skip-reason:{detail[:80]}")
     return bad
 
 
@@ -2039,7 +2096,7 @@ SHARED = ("results.jsonl", "tears_1080p_h264.mkv")
 
 
 def stale_output_failures(script, tmp, tag, full=True):
-    """rev-hxlit: run15 scored files an earlier run (run10) had left, and reported run10's deltas. A row scores only
+    """An earlier run once left files that a later run scored and reported as its own deltas. A row scores only
     what this run wrote: a fresh run-<id> directory per run (an existing one is refused), any non-zero exit of a
     file-writing ffmpeg is a FAIL, and a scored file that is missing, empty or older than the run start is a FAIL.
     full=False leaves rows 6 and 10 (the plugin-config and r10 files, ~8 s) to the one full run; the mutants skip them."""
@@ -2124,7 +2181,7 @@ def stale_output_failures(script, tmp, tag, full=True):
 
 
 def argv_failures(script, tmp, tag):
-    """rev-hxlit: run16 scored rows 2/3/4/8 at -27..-38 dB where a hand run of the same chains scored -0.47 dB, and nothing
+    """One run scored rows 2/3/4/8 at -27..-38 dB where a hand run of the same chains scored -0.47 dB, and nothing
     showed what the bench had run. A run logs every argv to $RUN_OUT/commands.log; the plan prints that same sequence at the
     master's own size; row 2's scorer compares $RUN_OUT/r2-shader.mkv with the 1080p master, in that order, by frame
     index, and the files it scores match the master's size and frame count (r2-inputs.txt)."""
@@ -2243,7 +2300,7 @@ def trace_failures(script, tmp, tag):
 
 
 def alt_failures(script, tmp, tag):
-    """rev-zlqhh: FSRCNNX 360p to 1080p lost 0.69 dB to bicubic (run20). Row 2 also scores ewa, FSRCNNX at 2x then bicubic and
+    """FSRCNNX 360p to 1080p lost 0.69 dB to bicubic. Row 2 also scores ewa, FSRCNNX at 2x then bicubic and
     FSRCNNX at 1.5x then bicubic on the same fixture, against the same bicubic control, and prints each delta and the best of
     all the paths. The alternatives are evidence: they never change the row's status (the +0.5 dB threshold on FSRCNNX does),
     one that cannot be scored says so and the others still run, and rows 3 and 4 have none."""
@@ -2319,7 +2376,7 @@ ROUTE_TEXT = "low-res route: fsrcnnx to 1.5x then bicubic"
 
 
 def lowres_failures(script, tmp, tag):
-    """rev-zlqhh: on Intel a source under 480p runs FSRCNNX to round_even(source x 1.5) and then bicubic to the target, and the
+    """On Intel a source under 480p runs FSRCNNX to round_even(source x 1.5) and then bicubic to the target, and the
     session record says so. Row 2 decides on that routed chain (the same thresholds), prints the old direct chain beside it
     without letting it decide, and FAILs when the plugin's session record for a 360p stream lacks the route part. A record the
     bench cannot read is `lowres_route=unverified`: the ffmpeg result stays and is never raised to PASS."""
@@ -2477,7 +2534,7 @@ def row10_fdinfo_failures(script, tmp, tag, which=("stock", "oidn")):
 
 
 def row10_reason_failures(script, tmp, tag):
-    """rev-qd0mh: the codec is judged against the encoder the session record names (a QSV encoder must produce its own
+    """The codec is judged against the encoder the session record names (a QSV encoder must produce its own
     codec; no encoder accepts h264 or hevc and says encoder=none), from the first line ffprobe prints; a process that exits
     between the /proc scan and the cmdline read prints nothing; a transcode that exited during the window is not
     measured; every FAIL names its reason."""
@@ -2550,7 +2607,9 @@ def test_gates_and_confirmation(tmp):
     bad = gate_failures(BENCH, tmp, "gates")
     check("the window and PSI gates read HHMM as decimal", not bad, str(bad))
     bad = window_failures(BENCH, tmp, "windows")
-    check("BENCH_BLOCK_WINDOWS and BENCH_TZ: plan line, zone, malformed values refused", not bad, str(bad))
+    check("BENCH_BLOCK_WINDOWS and BENCH_TZ: plan line, zone, empty = no window, malformed values refused", not bad, str(bad))
+    bad = contention_failures(BENCH, tmp, "contention")
+    check("row 11 runs with BENCH_CONTENTION=1 or its alias BENCH_PLEX_TRANSCODING=1 and is SKIP with neither", not bad, str(bad))
     bad = row_gate_failures(BENCH, tmp, "rowgate")
     check("a gated run waits before each row 2-11 while a window or PSI blocks, SKIPs past the cap, and leaves the start gate and other rows alone", not bad, str(bad))
 
@@ -2562,6 +2621,9 @@ def test_gates_and_confirmation(tmp):
     rc, out, err = w.run(["--help"])
     check("--help names --no-gates and its confirmation", rc == 0 and "--no-gates" in out and "BENCH_CONFIRM_NO_GATES" in out, out)
     check("--help names BENCH_BLOCK_WINDOWS and BENCH_TZ", "BENCH_BLOCK_WINDOWS" in out and "BENCH_TZ" in out, out)
+    check("--help names BENCH_CONTENTION, its alias, and the generic defaults",
+          "BENCH_CONTENTION=1" in out and "BENCH_PLEX_TRANSCODING=1" in out and "another hardware transcode is running on the same GPU" in out
+          and "./clips" in out and "UTC" in out and "no blocked window" in out, out)
     check("--help names BENCH_BLOCK_WAIT_MAX_MIN", "BENCH_BLOCK_WAIT_MAX_MIN" in out, out)
     check("--help names BENCH_BLOCK_WAIT_TOTAL_MAX_MIN and the Job deadline",
           "BENCH_BLOCK_WAIT_TOTAL_MAX_MIN" in out and "activeDeadlineSeconds" in out, out)

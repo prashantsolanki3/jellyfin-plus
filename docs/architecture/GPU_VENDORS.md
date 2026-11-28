@@ -305,7 +305,7 @@ plugin's `BuildChain` and the shim, which reads the render node's sysfs vendor i
 NVIDIA tail with the format named. It was `:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p`
 because ANV returned green frames for libplacebo's multi-planar YUV output (UAVG/VAVG 0 on an Arc A380,
 XPSNR y 5 dB). Measured in the Arc test pod on 2026-11-24 (720p to 1080p, 48 frames, luma XPSNR against
-the 1080p master, rev-8j46u): bicubic 43.17 dB; FSRCNNX straight to yuv420p 42.65 dB; libplacebo with no
+the 1080p master): bicubic 43.17 dB; FSRCNNX straight to yuv420p 42.65 dB; libplacebo with no
 shader and the RGBA tail 24.44 dB; FSRCNNX with the plain RGBA tail 27.59 dB, with the explicit bt709/tv
 tail 24.52 dB (identical with `setparams` bt709 tags at the head). The explicit tail's YAVG/UAVG were
 105.67/116.19 against 105.84/116.24 on the master, so the loss is not a colour matrix or range shift, and
@@ -516,7 +516,7 @@ and status are unchanged, and the dashboard's GPU line prints each as `Axis leve
 
 The ONNX neural levels (`realesr-anime-x2`, `realesr-anime-x4`, `realesr-general-x4`) are withheld on
 Intel as well, but with a different reason, "not measured on Intel" (`GpuWithheldUnmeasured`): they do not
-need CUDA, and PR 5 gives them an OpenVINO device, but on an A380 bench run22 measured about 1.4 fps at 360p
+need CUDA, and PR 5 gives them an OpenVINO device, but on an A380 the bench measured about 1.4 fps at 360p
 and 0.5 fps at 720p, so playback stutters. They stay withheld until the admin sets `IntelNeuralAllowed`
 (dashboard checkbox, default off, gated by the neural master switch; it replaces the hardcoded
 `UpscaleEngine.IntelOnnxMeasured`). Off, nothing changes: the same reason, `GpuWithheldUnmeasured` and
@@ -925,7 +925,7 @@ and link, that `-hwaccels` lists `vaapi` and `-encoders` lists `h264_qsv`, `hevc
 (the Intel verify step checks it), that 0006..0014 as skipped leave a tree the rest still patches
 (patch stacking was not run), that 0016 applies without 0006 to 0014, and 0008 and 0009 on a VA-API
 chain are all open until a build on an Intel server. A served segment on an Arc with 0008 and 0009
-applied is NOT VERIFIED; the revenant Arc end-to-end run settles it. The `libvpl-dev` check has run only
+applied is NOT VERIFIED; an end-to-end run on an Arc server settles it. The `libvpl-dev` check has run only
 against a stub `apt-cache`, and the `${arr[@]+...}` expansion only as a text check (no bash older than
 4.4 was available).
 
@@ -1015,14 +1015,14 @@ never `PASS`.
 | 8 | fsr2 without CUDA, moving content | xpsnr on the panning cut >= bicubic (a miss is a result, not a blocker) |
 | 9 | Hardware decode off/on | on: `-hwaccel vaapi`, `hwmap=derive_device=vulkan`, no `Conversion failed!`, cpu time per frame >= 30% lower, xpsnr(on,off) >= 50 dB |
 | 10 | QSV encode | `h264_qsv`/`hevc_qsv` chosen; served segment codec matches; `/Gpu/Load` within 10 points of the fdinfo figure |
-| 11 | Contention with one Plex hardware transcode | fps >= 36 while it runs (the caller asserts the Plex transcode) |
+| 11 | Contention with another hardware transcode on the same GPU | fps >= 36 while it runs (the caller asserts the other transcode with `BENCH_CONTENTION=1`; `BENCH_PLEX_TRANSCODING=1` is an alias) |
 | 12 | Client, headless | forced transcode at 480p, 720p, 1080p and 2160p: target height, a QSV codec, the expected filter in the log |
 | 13 | Client, human | always `MANUAL`: browser, hard reload, `window.__jellyfinPlus.installed===true`, 5 min at two levels plus one 2160p output, two seeks, no stall over 2 s |
 
-**Gates.** A real run refuses to start unless `BENCH_ASSERT_QUIET=1` (the pod cannot see vzdump or
-other transcodes: the caller must), outside the blocked windows (default 01:00 to 07:00 and 16:30 to
-18:30 Australia/Melbourne: drain, trivy, backups; set `BENCH_BLOCK_WINDOWS` to a comma list of
-`HHMM-HHMM`, start included and end not, and `BENCH_TZ` to the zone; a malformed value exits 2),
+**Gates.** A real run refuses to start unless `BENCH_ASSERT_QUIET=1` (the bench cannot see other
+transcodes or heavy host jobs: the caller must), outside the blocked windows (none by default; set
+`BENCH_BLOCK_WINDOWS` to a comma list of `HHMM-HHMM`, start included and end not, and `BENCH_TZ` to
+the zone, `UTC` by default; an empty list means no window and a malformed non-empty value exits 2),
 and with memory PSI `some avg60` under 1%. The clock window and PSI are checked again before each of
 rows 2 to 11: a row that would start inside a window, or with PSI high, waits in 60 s steps (`bench: row N
 waiting: ...`) for up to `BENCH_BLOCK_WAIT_MAX_MIN` minutes (default 240), then is recorded `SKIP` and
@@ -1041,12 +1041,12 @@ and the xpsnr calls. Before xpsnr runs, rows 2, 3, 4 and 8 write `r<row>-inputs.
 start_time, frame count and first pts of the candidate, the bicubic and the master) and FAIL, with both
 numbers, when a scored file's size or frame count differs from the master's. xpsnr then pairs frame k with
 frame k (both inputs renumbered with `setpts=N`), not by pts, and an infinite score (an identical pair) is
-999 dB, not 0. Scores from before this change paired by pts and are not comparable (run16 scored -27 dB
+999 dB, not 0. Scores from before this change paired by pts and are not comparable (one run scored -27 dB
 where a hand run of the same chains scored -0.47 dB).
 
-**Row 2, sources under 480p (rev-zlqhh).** run20 scored FSRCNNX 360p to 1080p at -0.69 dB against
+**Row 2, sources under 480p.** A bench run scored FSRCNNX 360p to 1080p at -0.69 dB against
 bicubic (3.0x), while 720p to 1080p (1.5x) scored +0.80 dB and 1080p to 2160p (2x) +0.73 dB. Figures
-from the bead, not from a record in the repo. The 2x network meets a 3x target by scaling its output
+from the run's notes, not from a record in the repo. The 2x network meets a 3x target by scaling its output
 up again, and the engine has no guard for that high ratio: the `SrMinScaleFactor` bypass in
 `UpscaleEngine.cs` only covers the low end. Row 2 therefore scores, on the same 360p fixture, against
 the same bicubic control and master and by frame index (frame k against frame k), after the FSRCNNX
@@ -1077,7 +1077,7 @@ then add an Intel-only source-height guard beside the `SrMinScaleFactor` bypass.
 
 | Run | `fsrcnnx` | `ewa` | `x2-bicubic` | `lowtarget` | `best` |
 |---|---|---|---|---|---|
-| run20 | -0.69 dB | not measured | not measured | not measured | not measured |
+| first run | -0.69 dB | not measured | not measured | not measured | not measured |
 
 **The low-res route (settings, Intel only).** The `lowtarget` path is now an engine route, set on the
 dashboard (Intel settings beside "Super-resolution minimum ratio"):
@@ -1095,7 +1095,7 @@ adds `,scale=<W>:<H>:flags=bicubic,format=<yuv420p or the decode surface format>
 shape of `chain_shader_bicubic` in `scripts/bench-intel.sh`. The session record carries `LowResRoute`
 ("low-res route: fsrcnnx to 1.5x then bicubic"), the summary repeats it and the flat session JSON gains the
 key; none of the three appears for a session that did not take the route, on any GPU. NVIDIA and no-GPU
-chains are byte-identical to before. Bench run22, per the owner's brief and not a record in this
+chains are byte-identical to before. A later bench run, not a record in this
 repo, scored this path at +1.08 dB over plain scaling at 360p; the `alt_lowtarget` figure above is still the
 measurement to record from an Arc run, and the live 1.5x behaviour of FSRCNNX's own 1.3x guard on a real
 Arc is not verified here.
@@ -1121,7 +1121,7 @@ row 5's detail carries the fallback reason (below).
 
 ### 5.9 Why row 5 reads `device=none` (diagnosis only, no fix)
 
-Checked in this order against the repository and the live test pod (`media/jellyfin-plus-test`, image
+Checked in this order against the repository and the live test pod (image
 `jellyfin-plus-intel:9e306b8`). No shell in the pod was available, so the in-pod answers are the ones row 5 now
 prints; the rest is read from files and the Deployment.
 
@@ -1130,7 +1130,7 @@ prints; the rest is read from files and the Deployment.
 | 1 | Is the OpenVINO EP in the ORT build? | Yes, by construction: the pinned `onnxruntime_openvino` 1.24.1 wheel carries it and the build stages and checks it. Not executed in the image. | `scripts/build-ffmpeg.sh:271-277` (wheel pin), `:679-680` (stages `libonnxruntime_providers_openvino.so`, `libopenvino_intel_gpu_plugin.so`), `:1056-1064` (build dies without `device=openvino` or the provider); `ffmpeg/vf_ort.c:244` calls `SessionOptionsAppendExecutionProvider_OpenVINO_V2` |
 | 2 | Are the GPU plugin and the OpenCL / Level Zero runtime in the image? | The GPU plugin yes. **No OpenCL ICD loader or compute runtime, no Level Zero loader**: nothing installs `ocl-icd-libopencl1`, `intel-opencl-icd` or `libze*` (`grep -ri 'intel-opencl-icd\|ocl-icd\|libOpenCL' docker/` finds nothing), and the ldd-derived list cannot see them because it skips the ORT libraries under the ffmpeg prefix and the plugin loads `libOpenCL.so.1` itself. Whether the Jellyfin base carries them is unchecked. | `docker/intel/Dockerfile:85-91` (the `continue` for `$P/*`), `:133-135` and `:140-145` (the only installs), `scripts/build-ffmpeg.sh:63-64` and `:1065` (say the OpenCL stack is the host's job); this file at the OpenCL bullet near line 669 and `docs/filters/NEURAL.md:272` (the plugin needs it) |
 | 3 | Which device does the session ask for? | `device=openvino` on the node, which the provider gets as `device_type=GPU` (`GPU.n` only when `device_id>0`, and the chain passes none). **But a stream never reaches that: on Intel the ONNX levels are withheld while the `IntelNeuralAllowed` setting is false (its default)**, the level becomes `off`, `NeuralApplied` is false and `NeuralDevice` stays null, which row 5 printed as `device=none`. `none` is a session that never ran ORT, not an ORT fallback (that reads `cpu`). | `src/patcher/Transcoding/UpscaleEngine.cs` `IntelWithholdReason` (withheld unless `Settings.IntelNeuralAllowed`), `:1553` (`Withhold` sets the level `off`), `:1640-1644` (`NeuralDevice` only when applied), `:693`; `ffmpeg/vf_ort.c:240-244`; `scripts/bench-intel.sh` `chain_ort` |
-| 4 | Can the process open `/dev/dri/renderD129`? | Unknown here. The pod runs as 1000:1000 with `supplementalGroups: [993]` and one `gpu.intel.com/i915`; the host has `renderD128` and `renderD129`. Whether 993 is the group that owns the node the plugin handed out is not checked. | Deployment `media/jellyfin-plus-test` (`kubectl get deployment`), ops `host_probe aihub gpu` (`by-path card0 card1 card2 renderD128 renderD129`) |
+| 4 | Can the process open `/dev/dri/renderD129`? | Unknown here. The pod runs as a non-root user with one supplemental group and one Intel GPU resource; the host has `renderD128` and `renderD129`. Whether that group owns the node the plugin handed out is not checked. | the test deployment (`kubectl get deployment`) and a host probe of `/dev/dri/by-path` (`card0 card1 card2 renderD128 renderD129`) |
 
 Row 5 now ends with the evidence instead of the fps alone, in the result detail and in `$BENCH_OUT/run-<id>/`:
 

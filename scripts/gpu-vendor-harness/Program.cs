@@ -196,7 +196,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("an AMD node is still listed", amd.Devices.Count == 1 && amd.Devices[0].Vendor == null);
 
             // NVIDIA without a render node (no nvidia_drm): an NVIDIA device in the container decides.
-            // /proc/driver/nvidia and nvidia-smi are the host's and no longer count (rev-ml3y9), so an
+            // /proc/driver/nvidia and nvidia-smi are the host's and no longer count, so an
             // Intel-only pod on a mixed host is Intel: the fake carries no such signal at all.
             var intelOnly = GpuDetector.Resolve("auto", Models, Machine("renderD128", "0x8086"));
             Equal("Intel-only pod on a host with the NVIDIA driver: intel", "intel", intelOnly.Vendor);
@@ -722,7 +722,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 UpscaleEngine.Settings.GpuResidentEncode = resident;
                 string tag = " [GpuResidentEncode=" + resident + "]";
                 // libplacebo names yuv420p as its output and the frame is downloaded as is: the RGBA
-                // download tail lost ~18 dB of luma XPSNR on the same input, with no shader (rev-8j46u).
+                // download tail lost ~18 dB of luma XPSNR on the same input, with no shader.
                 Equal("Intel BuildChain ends in a yuv420p download, never RGBA and never the CUDA hand-off" + tag,
                     "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=yuv420p,hwdownload,format=yuv420p",
                     UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
@@ -1248,7 +1248,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("Intel, only an ONNX level asked for: the reason says why", plan.Reason.Contains("neural realesr-anime-x2 not run: not measured on Intel"), plan.Reason);
 
             // The withhold stays until the admin sets IntelNeuralAllowed (default off), even though PR 5's path is present
-            // (provider file there, ffmpeg lists the device): bench run22 measured about 1.4 fps at 360p on an A380.
+            // (provider file there, ffmpeg lists the device): the bench measured about 1.4 fps at 360p on an A380.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.Settings = rig;
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));

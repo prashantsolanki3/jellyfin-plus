@@ -33,7 +33,7 @@ that it fixes the output. Check after the next Arc image build: bench row 8 (fsr
 `-filters` still lists `oidn ort`, and `ldd` shows no `not found`. The tables below describe the build as it
 was before this change.
 
-## fsr2 without CUDA on moving content (bead rev-cpmuj, bench row 8: -38.10 dB)
+## fsr2 without CUDA on moving content (bench row 8: -38.10 dB)
 
 With the libplacebo tail fixed (above), what is left is inside `fsr2`. Read from source; **not reproduced here** (no
 Arc, no clips in this session), so the cause is the likely one, not a measured one.
@@ -79,13 +79,13 @@ denoise plus a fixed Lanczos upsample (`vf_fsr2.c:40-46`), which is not expected
 wants the experiment: in the `GU_NO_NVOF` branch write `(jitter_x, jitter_y)` into `g->flow` when `pcpeak` is high and
 force `jitterOffset` to zero, then re-run row 8 and read `frames2+`. The served shim's stock path is untouched.
 
-Bead rev-hxlit, step 4. Research only: no Dockerfile or script changed. It blocks moving-video fsr2,
+Step 4. Research only: no Dockerfile or script changed. It blocks moving-video fsr2,
 because fsr2 exists only in the patched build (`/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg`) and bench row 8
 (`scripts/bench-intel.sh:199`, `chain_fsr2`) ends in a plain `hwupload,libplacebo,hwdownload` tail.
 
 ## What was measured, and what was not
 
-Measured in the Arc test pod (rev-hxlit comment of 2026-11-25 5:05 am IST; `vulkan=vk:0`, 96 frames, 360p to
+Measured in the Arc test pod (2026-11-25; `vulkan=vk:0`, 96 frames, 360p to
 1920x858, frame-index pairing; scoring the same files with either binary's `xpsnr` gives the same numbers):
 
 | Binary | `hwupload,libplacebo=...custom_shader_path=FSRCNNX...:format=yuv420p,hwdownload` |
@@ -120,7 +120,7 @@ PREFIX=/usr/lib/jellyfin-ffmpeg-oidn bash scripts/build-ffmpeg.sh` on the Jellyf
 | libplacebo | `v7.351.0`, static: `meson setup --prefix=/usr/local --libdir=lib/x86_64-linux-gnu --default-library=static -Dvulkan=enabled -Dshaderc=enabled -Ddemos=false` and nothing else | `:279`, `:600-604` |
 | ffmpeg configure | `--enable-vulkan --enable-libplacebo --enable-libshaderc --enable-vaapi --enable-libvpl --enable-libdrm` | `:929-939`, `:480` |
 
-The final stage also installs `libze1` (Debian) and the sha256-pinned `libze-intel-gpu1` deb from the same intel/compute-runtime release as the base's `intel-opencl-icd`: the OpenVINO GPU plugin reaches the Arc card through Level Zero, and bench run22 reported `level_zero_loader=MISSING`.
+The final stage also installs `libze1` (Debian) and the sha256-pinned `libze-intel-gpu1` deb from the same intel/compute-runtime release as the base's `intel-opencl-icd`: the OpenVINO GPU plugin reaches the Arc card through Level Zero, and an earlier bench run reported `level_zero_loader=MISSING`.
 
 The libplacebo clone is `--depth 1 -b v7.351.0 --recursive`, so its submodules (glad, the Vulkan registry,
 fast_float, xxhash) are whatever that tag pins. Stamp files skip the rebuild when the tag is unchanged.

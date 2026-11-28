@@ -91,7 +91,7 @@ def main():
         start = page.index(box)
         help_text = page[start:start + 1500]
         if "1.4 fps" not in help_text or "0.5 fps" not in help_text:
-            failures.append("IntelNeuralAllowed help text lacks the bench run22 numbers (1.4 fps, 0.5 fps)")
+            failures.append("IntelNeuralAllowed help text lacks the bench numbers (1.4 fps, 0.5 fps)")
 
     gate = tag_for(page, "NeuralAllowed")
     if gate is None or "IntelNeuralAllowed" not in (attr(gate, "data-gates") or "").split():

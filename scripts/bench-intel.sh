@@ -22,7 +22,7 @@
 # Inputs (all optional; the defaults are the image's own paths):
 #   BENCH_FFMPEG          patched ffmpeg                 /usr/lib/jellyfin-ffmpeg-oidn/ffmpeg
 #   BENCH_STOCK_FFMPEG    stock jellyfin-ffmpeg, rows 2-4 (as the shim) and the row 9 cut   /usr/lib/jellyfin-ffmpeg/ffmpeg
-#   BENCH_CLIPS           the lossless clips             /clips      <title>_<height>p.mkv, see below
+#   BENCH_CLIPS           the lossless clips             ./clips     <title>_<height>p.mkv, see below
 #   BENCH_OUT             results.jsonl and the row 9 H.264 cut; every other output goes in its run-<id> directory   $BENCH_CLIPS/bench-out
 #   BENCH_TRACE=1         echo every measured ffmpeg argv as `trace: row N: ...` on stderr (every run writes $BENCH_OUT/run-<id>/commands.log anyway)
 #   BENCH_RUN_ID          names this run's directory $BENCH_OUT/run-<id>, created fresh (an existing one is refused, exit 2)   <timestamp>-<pid>
@@ -38,14 +38,15 @@
 #   BENCH_RUN_TIMEOUT     seconds each measured ffmpeg may run (then TERM, KILL 10 s later; the row records FAIL timeout after Ns)   240
 #   BENCH_JELLYFIN_URL    the test Jellyfin              http://127.0.0.1:8096
 #   BENCH_JELLYFIN_TOKEN  an admin API token, sent as the MediaBrowser Authorization header   (none)
-#   BENCH_ASSERT_QUIET=1  the caller asserts no vzdump, no Plex or production Jellyfin transcode
-#   BENCH_PLEX_TRANSCODING=1  the caller asserts one Plex hardware transcode is running (row 11 only)
+#   BENCH_ASSERT_QUIET=1  the caller asserts no other hardware transcode or heavy host job is running
+#   BENCH_CONTENTION=1    the caller asserts another hardware transcode is running on the same GPU (row 11 only)
+#   BENCH_PLEX_TRANSCODING=1  an alias of BENCH_CONTENTION=1
 #   BENCH_CONFIRM_NO_GATES=1  required with --no-gates: the caller owns the quiet-box check the gates make
 #   BENCH_PSI_FILE        memory pressure file for the gate    /proc/pressure/memory
 #   BENCH_SHIM_LOG        the shim's log; rows 1 and 12 read only what is appended during the run   /var/log/jellyfin-upscale.log
 #   BENCH_NEURAL_LEVEL    the neural level row 6 asks for      realesr-anime-x2 (realesr-anime-x2|realesr-anime-x4|realesr-general-x4)
-#   BENCH_BLOCK_WINDOWS   the gate's blocked clock windows, HHMM-HHMM comma list, start included, end not   0100-0700,1630-1830
-#   BENCH_TZ              the zone those windows are read in    Australia/Melbourne
+#   BENCH_BLOCK_WINDOWS   the gate's blocked clock windows, HHMM-HHMM comma list, start included, end not   (empty: no blocked window)
+#   BENCH_TZ              the zone those windows are read in    UTC
 #   BENCH_BLOCK_WAIT_MAX_MIN  minutes a gated row 2-11 waits (60 s steps) for a blocked window or memory PSI to clear, then it is SKIP   240
 #   BENCH_BLOCK_WAIT_TOTAL_MAX_MIN  minutes of those waits, summed over all rows; once spent a row that would wait is SKIP "blocked window (wait budget spent)"   480
 #                         (keep it well under the run Job's activeDeadlineSeconds of 36000 s = 600 min: the rows themselves run inside that deadline too)
@@ -64,16 +65,16 @@ HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PATCHED_FFMPEG="${BENCH_FFMPEG:-/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg}"
 STOCK_FFMPEG="${BENCH_STOCK_FFMPEG:-/usr/lib/jellyfin-ffmpeg/ffmpeg}"
 PREFIX="$(dirname "$PATCHED_FFMPEG")"
-CLIPS="${BENCH_CLIPS:-/clips}"
+CLIPS="${BENCH_CLIPS:-./clips}"
 OUT="${BENCH_OUT:-$CLIPS/bench-out}"
-# Every output a row scores or reads back goes in a directory this run creates, so a file an earlier run left (run15 scored
-# run10's) can never be mistaken for this run's. Only results.jsonl (the history) and the row 9 H.264 cut (a derived input) live in $OUT.
+# Every output a row scores or reads back goes in a directory this run creates, so a file an earlier run left
+# can never be mistaken for this run's. Only results.jsonl (the history) and the row 9 H.264 cut (a derived input) live in $OUT.
 if [[ -n "${BENCH_RUN_ID:-}" ]]; then RUN_ID="$BENCH_RUN_ID"; else printf -v RUN_ID '%(%Y%m%dT%H%M%S)T-%d' -1 "$$"; fi
 RUN_OUT="$OUT/run-$RUN_ID"
 TITLE="${BENCH_TITLE:-tears}"
 
 # pick_render_node sets NODE and VK_DEV. The Arc is not always renderD128 (an RTX can take it), and deriving Vulkan from
-# DRM (vulkan=vk@dr) failed on renderD129 (run14), so the node is found at run time and Vulkan is opened by index or name.
+# DRM (vulkan=vk@dr) failed on renderD129, so the node is found at run time and Vulkan is opened by index or name.
 # A candidate is a sysfs render node that is also in this pod's /dev/dri: /sys/class/drm lists the host's cards.
 pick_render_node() {
     local sysdrm="${BENCH_SYSFS_DRM:-/sys/class/drm}" dri="${BENCH_DRI_DIR:-/dev/dri}" d name vendor intel="" first="" count=0
@@ -111,8 +112,9 @@ JF_TOKEN="${BENCH_JELLYFIN_TOKEN:-}"
 SHIM_LOG="${BENCH_SHIM_LOG:-/var/log/jellyfin-upscale.log}"
 PSI_FILE="${BENCH_PSI_FILE:-/proc/pressure/memory}"
 NEURAL_LEVEL="${BENCH_NEURAL_LEVEL:-realesr-anime-x2}"
-BLOCK_TZ="${BENCH_TZ:-Australia/Melbourne}"
-BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"
+BLOCK_TZ="${BENCH_TZ:-UTC}"
+BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-}"
+CONTENTION="${BENCH_CONTENTION:-${BENCH_PLEX_TRANSCODING:-}}"
 PROC="${BENCH_PROC:-/proc}"
 BLOCK_WAIT_MAX_MIN="${BENCH_BLOCK_WAIT_MAX_MIN:-240}"
 BLOCK_WAIT_TOTAL_MAX_MIN="${BENCH_BLOCK_WAIT_TOTAL_MAX_MIN:-480}"
@@ -140,7 +142,7 @@ row_title() {
         8)  echo "fsr2 without CUDA, moving content" ;;
         9)  echo "Hardware decode off/on" ;;
         10) echo "QSV encode" ;;
-        11) echo "Contention with one Plex hardware transcode" ;;
+        11) echo "Contention with another hardware transcode on the same GPU" ;;
         12) echo "Client, headless" ;;
         13) echo "Client, human" ;;
         *)  return 1 ;;
@@ -159,7 +161,7 @@ row_must() {
         8)  echo "xpsnr on the panning cut >= bicubic (SKIP when the patched ffmpeg has no fsr2 filter: the image ships without it, a result, not a blocker)" ;;
         9)  echo "on, an H.264 1080p source: -hwaccel vaapi, download and upload into libplacebo (the zero-copy hwmap=derive_device=vulkan is tried once and its failure recorded, not failed on), no 'Conversion failed!', video engine busy, cpu time per frame >=30% lower, xpsnr(on,off)>=50dB; off: command identical to a build without hardware decode" ;;
         10) echo "h264_qsv/hevc_qsv chosen; the served segment's codec matches; encoderSessions counts the session; /Gpu/Load (primed, read again >=5 s later) within +-10 points of the fdinfo figure when the transcode is visible to the bench pod, else MANUAL with the plugin's figure" ;;
-        11) echo "one stream holds fps>=36 while one Plex hardware transcode runs" ;;
+        11) echo "one stream holds fps>=36 while another hardware transcode runs on the same GPU" ;;
         12) echo "forced transcode at each target height: ffprobe shows the target height and a QSV codec; the transcode log carries the expected filter" ;;
         13) echo "browser, after a hard reload: Enhance menu, window.__jellyfinPlus.installed===true; 5 min at two levels plus one 2160p output, two seeks, no stall over 2s" ;;
         *)  return 1 ;;
@@ -196,12 +198,12 @@ INIT=(-init_hw_device "vulkan=vk:$VK_DEV" -filter_hw_device vk)
 
 # libplacebo writes yuv420p and the frame is downloaded as is, which is what production runs. The RGBA tail
 # (`format=rgba,hwdownload,format=rgba,...,format=yuv420p`) it replaced cost ~18 dB of luma XPSNR on the same input, with
-# no shader at all (rev-8j46u, measured 2026-11-24: 24.4 dB against 42.65 dB direct); the green frames it was added
+# no shader at all (measured 2026-11-24: 24.4 dB against 42.65 dB direct); the green frames it was added
 # for are no longer produced, and rows 2-4 fail on chroma XPSNR below $CHROMA_XPSNR_MIN dB if they come back.
 YUV_END="format=yuv420p,hwdownload,format=yuv420p"
 chain_shader() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$YUV_END"; }
 chain_bicubic() { echo "scale=$1:$2:flags=bicubic,format=yuv420p"; }
-# Row 2's alternatives to FSRCNNX straight to the target (rev-zlqhh: 360p to 1080p scored -0.69 dB against bicubic in run20,
+# Row 2's alternatives to FSRCNNX straight to the target (360p to 1080p scored -0.69 dB against bicubic,
 # 720p and 1080p inputs pass). Each ends at the master's size, as the scorer pairs frames by index. chain_ewa is libplacebo's
 # scaler with no shader. chain_shader_bicubic runs FSRCNNX to ALT_MID_W x ALT_MID_H (set by alt_setup), then scales to $1 x $2.
 ROW2_ALTS="ewa x2-bicubic lowtarget"
@@ -360,7 +362,11 @@ print_plan() {
     local r ow oh
     echo "plan: bench-intel: rows=${ROWS[*]} runs=$RUNS mode=dry-run"
     echo "plan: required filters: $(ffmpeg_required_filters intel)"
-    echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
+    if [[ -n "$BLOCK_TEXT" ]]; then
+        echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no other hardware transcode or heavy host job: the bench cannot see them)"
+    else
+        echo "plan: gates: no blocked clock window; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no other hardware transcode or heavy host job: the bench cannot see them)"
+    fi
     echo "plan: every measured ffmpeg runs under timeout --kill-after=10 ${RUN_TIMEOUT}s (BENCH_RUN_TIMEOUT); row 5 runs ${ORT_RUNS}x per clip, ${ORT_FRAMES} frames"
     echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; run dir: $RUN_OUT (fresh, refused if it exists); render node: $NODE"
     echo "plan: vulkan device: vk:$VK_DEV"
@@ -405,7 +411,7 @@ print_plan() {
             10) echo "plan: row 10 cmd: forced transcode through $JF_URL, ffprobe the segment codec, prime $JF_URL/JellyfinPlus/Gpu/Load, read it again ${LOAD_WAIT}s later and compare with the fdinfo figure when the transcode is visible to the bench pod"
                 echo "plan: row 10 threshold: |load - fdinfo| <= $LOAD_TOLERANCE points" ;;
             11) cmd_run "$(clip 1080)" "$(chain_shader 3840 2160)"; plan_cmd 11
-                echo "plan: row 11 threshold: fps>=$FPS_R11 with BENCH_PLEX_TRANSCODING=1" ;;
+                echo "plan: row 11 threshold: fps>=$FPS_R11 with BENCH_CONTENTION=1" ;;
             12) echo "plan: row 12 cmd: $JF_URL/Videos/<id>/master.m3u8 at 480p, 720p, 1080p and 2160p targets, first 3 segments, ffprobe" ;;
             13) echo "plan: row 13: MANUAL, the owner's browser check over a port-forward" ;;
         esac
@@ -472,9 +478,11 @@ BLOCK_HI=()
 BLOCK_TEXT=""
 
 # Fills BLOCK_LO/BLOCK_HI/BLOCK_TEXT from BLOCK_WINDOWS; a malformed list or zone is a refusal, never a gate left open.
+# An empty list is no blocked window at all (the default), not a malformed one.
 parse_block_windows() {
     local item lo hi i items
-    [[ "$BLOCK_TZ" =~ ^[A-Za-z0-9_+/:.-]+$ ]] || die "BENCH_TZ must be a time zone name such as Australia/Melbourne, got: $BLOCK_TZ"
+    [[ "$BLOCK_TZ" =~ ^[A-Za-z0-9_+/:.-]+$ ]] || die "BENCH_TZ must be a time zone name such as Europe/Berlin, got: $BLOCK_TZ"
+    [[ -n "$BLOCK_WINDOWS" ]] || return 0
     [[ "$BLOCK_WINDOWS" =~ ^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$ ]] \
         || die "BENCH_BLOCK_WINDOWS must be a comma list of HHMM-HHMM such as 0100-0415,1630-1830, got: $BLOCK_WINDOWS"
     IFS=, read -r -a items <<<"$BLOCK_WINDOWS"
@@ -492,6 +500,7 @@ parse_block_windows() {
 # Returns 0 when the clock is inside a blocked window, setting BLOCK_NOW (HHMM) and BLOCK_HIT (that window, HH:MM-HH:MM).
 in_block_window() {
     local hm i
+    (( ${#BLOCK_LO[@]} > 0 )) || return 1
     # 10#: HHMM has a leading zero, which bash reads as octal (0830 and 0900 are then errors)
     hm=$((10#$(TZ="$BLOCK_TZ" date +%H%M)))
     for i in "${!BLOCK_LO[@]}"; do
@@ -515,9 +524,9 @@ psi_hot() {
 
 check_gates() {
     [[ "${BENCH_ASSERT_QUIET:-}" == 1 ]] \
-        || die "gate: set BENCH_ASSERT_QUIET=1 once you have checked there is no vzdump, no Plex transcode and no production Jellyfin transcode"
+        || die "gate: set BENCH_ASSERT_QUIET=1 once you have checked no other hardware transcode or heavy host job is running"
     if in_block_window; then
-        die "gate: $BLOCK_NOW $BLOCK_TZ is inside a blocked window ($BLOCK_TEXT), drain, trivy or backup time"
+        die "gate: $BLOCK_NOW $BLOCK_TZ is inside a blocked window ($BLOCK_TEXT)"
     fi
     if psi_hot; then die "gate: memory PSI some avg60=$PSI_AVG60 >= 1%"; fi
 }
@@ -681,7 +690,7 @@ first_pts() {
 # score_inputs <row> <candidate> <bicubic> <master>: what the scorer is about to compare, written to
 # $RUN_OUT/r<row>-inputs.txt (size, pix_fmt, range, start_time, frame count, first pts of each file). xpsnr scores frame k
 # of one file against frame k of the other, so a candidate whose size or frame count differs from the master's would
-# score pairing error, not picture quality (run16 scored -27 dB for a picture a hand probe scored at -0.47 dB): that is
+# score pairing error, not picture quality (one run scored -27 dB for a picture a hand probe scored at -0.47 dB): that is
 # the row's FAIL, with both numbers, before any xpsnr runs. Returns 1 after recording it. A master ffprobe cannot read
 # has nothing to compare against: the file says `?` and the row goes on.
 score_inputs() {
@@ -1466,7 +1475,7 @@ row_10() {
 }
 
 row_11() {
-    [[ "${BENCH_PLEX_TRANSCODING:-}" == 1 ]] || { record 11 SKIP "set BENCH_PLEX_TRANSCODING=1 while one Plex hardware transcode runs"; return; }
+    [[ "$CONTENTION" == 1 ]] || { record 11 SKIP "set BENCH_CONTENTION=1 while another hardware transcode runs on the same GPU"; return; }
     local fps ow oh rc
     read -r ow oh <<<"$(master_dims "$(clip 2160)" 3840 2160)"
     fps=$(run_fps "$(clip 1080)" "$(chain_shader "$ow" "$oh")") || { rc=$?; record 11 FAIL "$(why "$rc" "ffmpeg failed")"; return; }
@@ -1539,7 +1548,7 @@ fi
 if [[ $GATES == 1 ]]; then
     check_gates
 elif [[ "${BENCH_CONFIRM_NO_GATES:-}" != 1 ]]; then
-    die "--no-gates skips the quiet-box checks (no vzdump, no Plex or production transcode, no memory pressure): set BENCH_CONFIRM_NO_GATES=1 to say you have made them"
+    die "--no-gates skips the quiet-box checks (no other hardware transcode or heavy host job, no memory pressure): set BENCH_CONFIRM_NO_GATES=1 to say you have made them"
 fi
 need "$PATCHED_FFMPEG"; need "$FFPROBE"; need curl; need jq; need awk; need timeout
 [[ -d "$CLIPS" ]] || die "no clips directory: $CLIPS"
